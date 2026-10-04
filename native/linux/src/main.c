@@ -44,8 +44,10 @@
 #include "core_bridge.h"
 
 /* Bounded per-session VTE scrollback (local-only trust + bounded growth:
- * an accumulate-forever buffer would leak memory over long agent runs). */
-#define SCROLLBACK_LINES 10000
+ * an accumulate-forever buffer would leak memory over long agent runs).
+ * Named for the widget (not SCROLLBACK_LINES: that is the core vt100
+ * emulator's retention over staap.h, a different buffer). */
+#define VTE_SCROLLBACK_LINES 10000
 /* Roster/status refresh rides on the same 50ms pump tick as the Swift shell. */
 #define PUMP_MS 50
 #define DEFAULT_COLS 80
@@ -1556,7 +1558,7 @@ static void build_ui(Shell *sh) {
     gtk_widget_set_vexpand(GTK_WIDGET(sh->term_scroll), TRUE);
     gtk_widget_set_hexpand(GTK_WIDGET(sh->term_scroll), TRUE);
     sh->term = VTE_TERMINAL(vte_terminal_new());
-    vte_terminal_set_scrollback_lines(sh->term, SCROLLBACK_LINES);
+    vte_terminal_set_scrollback_lines(sh->term, VTE_SCROLLBACK_LINES);
     vte_terminal_set_scroll_on_output(sh->term, TRUE);
     vte_terminal_set_scroll_on_keystroke(sh->term, TRUE);
     vte_terminal_set_cursor_blink_mode(sh->term, VTE_CURSOR_BLINK_ON);
