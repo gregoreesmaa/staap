@@ -999,13 +999,21 @@ namespace winrt::StaapWinUI::implementation
      * funnel every shell shares). Programmatic sync in RefreshRoster
      * runs under m_syncing so it never writes back; the fingerprint
      * carries expansion so the next tick syncs without rebuilding. */
-    void MainWindow::HistoryExpander_Toggled(IInspectable const &,
-                                             RoutedEventArgs const &) {
+    void MainWindow::HistoryExpander_Expanding(
+        IInspectable const &,
+        Microsoft::UI::Xaml::Controls::ExpanderExpandingEventArgs const &) {
+        WriteHistoryExpanded(true);
+    }
+    void MainWindow::HistoryExpander_Collapsed(
+        IInspectable const &,
+        Microsoft::UI::Xaml::Controls::ExpanderCollapsedEventArgs const &) {
+        WriteHistoryExpanded(false);
+    }
+    void MainWindow::WriteHistoryExpanded(bool expanded) {
         if (m_syncing || !m_core) {
             return;
         }
-        bridge_set_history_expanded(
-            m_core, HistoryExpander().IsExpanded() ? 1 : 0);
+        bridge_set_history_expanded(m_core, expanded ? 1 : 0);
         char *err = nullptr;
         if (bridge_core_save(m_core, &err) != 0) {
             free(err);

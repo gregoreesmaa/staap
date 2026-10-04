@@ -221,7 +221,7 @@ typedef struct {
     GtkSearchEntry *filter;
     /* History affordance (dumb renderer: membership + expansion live in
      * the core; this header only toggles and labels). Rows stay siblings
-     * in `list` (sorted last), like the gpui shell. */
+     * in `list` (sorted last), like the macOS shell. */
     GtkExpander *history_expander;
     VteTerminal *term;
     AdwWindowTitle *header_title;

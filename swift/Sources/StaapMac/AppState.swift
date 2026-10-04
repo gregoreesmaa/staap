@@ -72,7 +72,7 @@ final class AppState: ObservableObject {
     func rows(with status: RunStatus) -> [SessionRow] {
         rows.filter {
             statuses[$0.id] == status.rawValue
-                && isLive($0.id)
+                && core.isLive($0.id)
                 && (filter.isEmpty || core.rowMatches(index(of: $0.id), query: filter))
         }
     }

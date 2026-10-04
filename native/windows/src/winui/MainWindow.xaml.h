@@ -58,12 +58,20 @@ namespace winrt::StaapWinUI::implementation
             Windows::Foundation::IInspectable const &sender,
             Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const
                 &args);
-        /* History expander toggle (XAML-wired handler must be public):
+        /* History expander toggle (XAML-wired handlers must be public):
          * core-owned expansion + persist; programmatic sync in
-         * RefreshRoster runs under m_syncing so it never writes back. */
-        void HistoryExpander_Toggled(
+         * RefreshRoster runs under m_syncing so it never writes back.
+         * The Expander control fires distinct Expanding/Collapsed events
+         * with their own arg types, so one shared handler cannot bind
+         * both — both funnels below share WriteHistoryExpanded. */
+        void HistoryExpander_Expanding(
             Windows::Foundation::IInspectable const &sender,
-            Microsoft::UI::Xaml::RoutedEventArgs const &args);
+            Microsoft::UI::Xaml::Controls::ExpanderExpandingEventArgs const
+                &args);
+        void HistoryExpander_Collapsed(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::Controls::ExpanderCollapsedEventArgs const
+                &args);
         void SidebarThumb_DragDelta(
             Windows::Foundation::IInspectable const &sender,
             Microsoft::UI::Xaml::Controls::Primitives::DragDeltaEventArgs const
@@ -101,6 +109,7 @@ namespace winrt::StaapWinUI::implementation
             Microsoft::UI::Xaml::Controls::ListView const &list,
             std::vector<std::pair<std::wstring, std::wstring>> const &rows);
         void SelectRowById(std::wstring const &id);
+        void WriteHistoryExpanded(bool expanded);
         bool FirstRowId(std::wstring &id);
         void SetStatus(winrt::hstring const &text);
         void ForwardBytes(char const *data, std::size_t len);
