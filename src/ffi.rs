@@ -1586,6 +1586,52 @@ pub unsafe extern "C" fn staap_select_step(core: *mut StaapCore, forward: c_int)
     }
 }
 
+// --- History membership + expansion (core-owned, shells render) --------------
+
+/// True when roster row id `id` is historic (no live PTY attached —
+/// attached means active, even when the child already exited).
+/// Null-safe: null core/id yields false; unknown ids yield true.
+///
+/// # Safety
+/// `core` must be null or live; `id` must be null or a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn staap_is_history(core: *const StaapCore, id: *const c_char) -> bool {
+    if core.is_null() || id.is_null() {
+        return false;
+    }
+    match CStr::from_ptr(id).to_str() {
+        Ok(s) => (*core).reg.is_history(s),
+        Err(_) => false,
+    }
+}
+
+/// True when the History section renders expanded. Collapsed by default;
+/// null core yields false. Callers persist via [`staap_core_save`].
+///
+/// # Safety
+/// `core` must be null or a live pointer from [`staap_core_new`].
+#[no_mangle]
+pub unsafe extern "C" fn staap_history_expanded(core: *const StaapCore) -> bool {
+    if core.is_null() {
+        return false;
+    }
+    (*core).reg.app.history_expanded
+}
+
+/// Set the History expansion state (`expanded` nonzero = expanded).
+/// Null core is a no-op. Callers persist via [`staap_core_save`].
+///
+/// # Safety
+/// `core` must be null or live.
+#[no_mangle]
+pub unsafe extern "C" fn staap_set_history_expanded(core: *mut StaapCore, expanded: c_int) {
+    if core.is_null() {
+        return;
+    }
+    let expanded = expanded != 0;
+    (*core).reg.app.set_history_expanded(expanded);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2210,6 +2256,19 @@ mod tests {
             staap_set_filter(core, c"zzz-no-match".as_ptr());
             assert!(!staap_row_matches(core, 0, c"zzz-no-match".as_ptr()));
             staap_set_filter(core, std::ptr::null());
+            // History expansion round-trips through the core (collapsed
+            // by default; null-safe on both ends).
+            assert!(!staap_history_expanded(core));
+            assert!(!staap_history_expanded(std::ptr::null()));
+            staap_set_history_expanded(core, 1);
+            assert!(staap_history_expanded(core));
+            staap_set_history_expanded(std::ptr::null_mut(), 1);
+            staap_set_history_expanded(core, 0);
+            assert!(!staap_history_expanded(core));
+            // Unknown ids own no PTY: historic, null-safe.
+            assert!(staap_is_history(core, c"nope".as_ptr()));
+            assert!(!staap_is_history(std::ptr::null(), c"nope".as_ptr()));
+            assert!(!staap_is_history(core, std::ptr::null()));
             // Key encoding through the shared table.
             let mut buf = [0u8; 8];
             assert_eq!(

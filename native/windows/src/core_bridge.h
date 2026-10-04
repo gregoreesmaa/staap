@@ -118,6 +118,14 @@ size_t bridge_max_runs(void);
 /* True when the row id owns a live PTY in the registry. */
 int bridge_is_live(const StaapCore *core, const char *id);
 
+/* History membership + expansion (core-owned; the shell only renders):
+ * historic = no live PTY attached (attached means active, even when
+ * the child already exited). Expansion is collapsed by default;
+ * setters persist via bridge_core_save (callers save after toggling). */
+int bridge_is_history(const StaapCore *core, const char *id);
+int bridge_history_expanded(const StaapCore *core);
+void bridge_set_history_expanded(StaapCore *core, int expanded);
+
 /* Spawn a 2D-launch session attached to a new roster row, under the
  * shared cap. Returns 0 with the row id in `id_out` (up to `id_cap`
  * bytes incl. NUL); nonzero with `msg_out` set like bridge_core_save. */

@@ -98,6 +98,14 @@ impl RunRegistry {
         self.runs.contains_key(id)
     }
 
+    /// True when the row is historic: no live PTY attached. Attached =
+    /// active, even when the child already exited (active until closed);
+    /// detached rows (discovered sessions, closed runs, unknown ids) are
+    /// historic. This is the single membership rule every shell renders.
+    pub fn is_history(&self, id: &str) -> bool {
+        !self.is_live(id)
+    }
+
     pub fn live_count(&self) -> usize {
         self.runs.len()
     }
@@ -345,6 +353,23 @@ mod tests {
         reg.app.sessions[0].status = Status::Idle;
         reg.attach("a", live_run("sleep", &["5"]).pty);
         assert!(reg.needs_quit_confirm());
+    }
+
+    #[test]
+    fn history_means_no_live_pty_attached() {
+        let mut reg = RunRegistry::new(vec![sess("a", Status::Idle), sess("b", Status::Idle)]);
+        // Detached rows are historic.
+        assert!(reg.is_history("a"));
+        assert!(reg.is_history("b"));
+        // Attached rows are active.
+        reg.attach("a", live_run("sleep", &["5"]).pty);
+        assert!(!reg.is_history("a"));
+        assert!(reg.is_history("b"));
+        // Closing drops the PTY: the entry is gone (close removes it).
+        reg.close("a");
+        assert!(reg.is_history("a"));
+        // Unknown ids own no PTY: historic by definition.
+        assert!(reg.is_history("zzz"));
     }
 
     #[test]

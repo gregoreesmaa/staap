@@ -642,4 +642,32 @@ void staap_select(struct StaapCore *core, uintptr_t row);
  */
 void staap_select_step(struct StaapCore *core, int forward);
 
+/**
+ * True when roster row id `id` is historic (no live PTY attached —
+ * attached means active, even when the child already exited).
+ * Null-safe: null core/id yields false; unknown ids yield true.
+ *
+ * # Safety
+ * `core` must be null or live; `id` must be null or a valid C string.
+ */
+bool staap_is_history(const struct StaapCore *core, const char *id);
+
+/**
+ * True when the History section renders expanded. Collapsed by default;
+ * null core yields false. Callers persist via [`staap_core_save`].
+ *
+ * # Safety
+ * `core` must be null or a live pointer from [`staap_core_new`].
+ */
+bool staap_history_expanded(const struct StaapCore *core);
+
+/**
+ * Set the History expansion state (`expanded` nonzero = expanded).
+ * Null core is a no-op. Callers persist via [`staap_core_save`].
+ *
+ * # Safety
+ * `core` must be null or live.
+ */
+void staap_set_history_expanded(struct StaapCore *core, int expanded);
+
 #endif  /* STAAP_H */

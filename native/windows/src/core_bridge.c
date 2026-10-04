@@ -135,6 +135,18 @@ int bridge_is_live(const StaapCore *core, const char *id) {
     return staap_is_live(core, id) ? 1 : 0;
 }
 
+int bridge_is_history(const StaapCore *core, const char *id) {
+    return staap_is_history(core, id) ? 1 : 0;
+}
+
+int bridge_history_expanded(const StaapCore *core) {
+    return staap_history_expanded(core) ? 1 : 0;
+}
+
+void bridge_set_history_expanded(StaapCore *core, int expanded) {
+    staap_set_history_expanded(core, expanded);
+}
+
 int bridge_run_spawn(StaapCore *core, const char *cli, const char *cwd,
                      int yolo, unsigned cols, unsigned rows, char *id_out,
                      size_t id_cap, char **msg_out) {

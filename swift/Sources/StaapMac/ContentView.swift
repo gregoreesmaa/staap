@@ -90,7 +90,12 @@ struct ContentView: View {
                         }
                     }
                     if state.hasHistory {
-                        Section {
+                        DisclosureGroup(
+                            isExpanded: Binding(
+                                get: { state.historyExpanded },
+                                set: { _ in state.toggleHistory() }
+                            )
+                        ) {
                             ForEach(state.historyRows) { row in
                                 rowLabel(row)
                                     .tag(row.id)
@@ -101,7 +106,7 @@ struct ContentView: View {
                                         }
                                     }
                             }
-                        } header: {
+                        } label: {
                             HStack {
                                 Text("History (\(state.historyRows.count))")
                                 Spacer()
@@ -151,7 +156,8 @@ struct ContentView: View {
     }
 
     /// Shared group order (matches the other shells): Needs input →
-    /// Working → Idle. History (no live PTY) renders separately below.
+    /// Working → Idle over attached (live) rows only. History (no live
+    /// PTY) renders separately below, collapsed by default.
     /// Counts ride the header HStack (title + count), not the title.
     private var statusSections: [StatusSection] {
         [

@@ -72,6 +72,7 @@ final class AppState: ObservableObject {
     func rows(with status: RunStatus) -> [SessionRow] {
         rows.filter {
             statuses[$0.id] == status.rawValue
+                && core.isLive($0.id)
                 && (filter.isEmpty || core.rowMatches(index(of: $0.id), query: filter))
         }
     }
@@ -80,8 +81,9 @@ final class AppState: ObservableObject {
         rows.firstIndex(where: { $0.id == id }) ?? -1
     }
 
-    /// History rows: ids with no live PTY in the core registry.
-    func isHistory(_ id: String) -> Bool { !core.isLive(id) }
+    /// History membership (core-owned rule): ids with no live PTY in the
+    /// core registry. Attached means active, even when exited.
+    func isHistory(_ id: String) -> Bool { core.isHistory(id) }
 
     func status(of row: SessionRow) -> RunStatus {
         RunStatus(rawValue: statuses[row.id] ?? RunStatus.idle.rawValue) ?? .idle
@@ -97,15 +99,27 @@ final class AppState: ObservableObject {
     }
 
     /// History rows: ids with no live PTY (collapsed group at the end,
-    /// matching the other shells).
+    /// matching the other shells). Expansion lives in the core
+    /// (persisted via `save()`); the shell only renders it.
     var historyRows: [SessionRow] {
         rows.filter {
-            !core.isLive($0.id)
+            core.isHistory($0.id)
                 && (filter.isEmpty || core.rowMatches(index(of: $0.id), query: filter))
         }
     }
 
     var hasHistory: Bool { !historyRows.isEmpty }
+
+    /// History expansion, core-owned (collapsed by default).
+    var historyExpanded: Bool { core.historyExpanded }
+
+    /// Toggle History expansion and persist it (same funnel every shell
+    /// shares: core state + autosave, no shell-local expansion state).
+    func toggleHistory() {
+        core.setHistoryExpanded(!core.historyExpanded)
+        save()
+        reloadRoster()
+    }
 
     /// Non-color status marker for a row (shared core glyphs).
     func glyph(of row: SessionRow) -> String {

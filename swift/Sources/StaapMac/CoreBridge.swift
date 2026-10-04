@@ -143,6 +143,16 @@ import Foundation
 @_silgen_name("staap_select_step") private func staap_select_step(
     _ core: OpaquePointer?, _ forward: Int32
 )
+// History membership + expansion (core-owned; the shell only renders).
+@_silgen_name("staap_is_history") private func staap_is_history(
+    _ core: OpaquePointer?, _ id: UnsafePointer<CChar>?
+) -> Bool
+@_silgen_name("staap_history_expanded") private func staap_history_expanded(
+    _ core: OpaquePointer?
+) -> Bool
+@_silgen_name("staap_set_history_expanded") private func staap_set_history_expanded(
+    _ core: OpaquePointer?, _ expanded: Int32
+)
 @_silgen_name("staap_last_error") private func staap_last_error() -> UnsafePointer<CChar>
 @_silgen_name("staap_pty_free") private func staap_pty_free(_ pty: OpaquePointer?)
 
@@ -431,6 +441,21 @@ final class Core {
     /// Step selection next/prev within the filter matches.
     func selectStep(forward: Bool) {
         staap_select_step(handle, forward ? 1 : 0)
+    }
+
+    /// True when the row id is historic (no live PTY attached —
+    /// attached means active, even when the child already exited).
+    func isHistory(_ id: String) -> Bool {
+        id.withCString { staap_is_history(handle, $0) }
+    }
+
+    /// True when the History section renders expanded (collapsed by
+    /// default; persisted via `save()`).
+    var historyExpanded: Bool { staap_history_expanded(handle) }
+
+    /// Set the History expansion state (persist with `save()`).
+    func setHistoryExpanded(_ expanded: Bool) {
+        staap_set_history_expanded(handle, expanded ? 1 : 0)
     }
 
     /// Autodetected CLI catalog ([CliRow] in core order). Decodes to []

@@ -19,8 +19,9 @@
 //!   scrollbar bound to the shared panel handle; the header and the
 //!   footer are siblings of the scroller, so both stay pinned while
 //!   the list moves. Wheel/trackpad scroll needs no handle at all.
-//! - History holds exited live runs plus historic provider entries with
-//!   no live PTY ([`ShellView::is_history`]); its header row is the
+//! - History holds historic provider entries with no live PTY plus
+//!   closed runs ([`ShellView::is_history`]: attached means active,
+//!   even when the child already exited); its header row is the
 //!   expand affordance (click, `h`, or Enter on a hidden history
 //!   selection), with its own count and a state chevron, persisted
 //!   across restarts (issue #55).
@@ -82,14 +83,16 @@ fn panel_scroll() -> ScrollHandle {
 }
 
 impl ShellView {
-    /// History membership (issue #39): exited live runs plus historic
-    /// provider entries with no live PTY. Fresh runs awaiting spawn (no
-    /// PTY yet, no provider id) and live children stay in the active
-    /// groups; re-attaching a historic entry (live PTY again) returns it
-    /// to the active groups until its child exits.
+    /// History membership (issue #39, registry rule): attached means
+    /// active, even when the child already exited (active until the
+    /// entry is closed and its PTY dropped). Historic provider entries
+    /// with no live PTY render in History; re-attaching a historic
+    /// entry (live PTY again) returns it to the active groups. Fresh
+    /// runs awaiting spawn (no PTY yet, no provider id) stay in the
+    /// active groups.
     pub(crate) fn is_history(&self, session: &crate::app::ChatSession) -> bool {
         match self.runs.get(&session.id) {
-            Some(run) => run.exited(),
+            Some(_) => false,
             None => session.provider_session_id.is_some(),
         }
     }
@@ -615,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn history_holds_exited_and_historic_but_not_live_or_pending() {
+    fn history_holds_detached_but_not_live_exited_or_pending() {
         let mut view = mixed_shell();
         let id_of = |view: &ShellView, id: &str| {
             view.app
@@ -631,7 +634,8 @@ mod tests {
         assert!(!view.is_history(&id_of(&view, "live-working")));
         // Fresh run awaiting spawn (no PTY yet, no provider id): active.
         assert!(!view.is_history(&id_of(&view, "live-idle")));
-        // The live child exits: it moves into History.
+        // The live child exits: attached means active until closed, so it
+        // stays out of History.
         let live_id = "live-working".to_string();
         view.runs.insert(
             live_id.clone(),
@@ -647,18 +651,26 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(view.runs[&live_id].exited());
-        assert!(view.is_history(&id_of(&view, "live-working")));
+        assert!(!view.is_history(&id_of(&view, "live-working")));
+        // Closing the exited run removes its entry (close drops the PTY
+        // and the row together), so it leaves the roster entirely.
+        let pos = view
+            .app
+            .sessions
+            .iter()
+            .position(|s| s.id == live_id)
+            .expect("live run listed");
+        view.app.selected = pos;
+        view.close_run();
+        assert!(view.app.sessions.iter().all(|s| s.id != live_id));
         // Resuming the historic entry (live PTY again) returns it to the
         // active groups until its child exits.
         let pty = crate::embedded::EmbeddedPty::spawn("sleep", &["5".to_string()], 80, 24).unwrap();
         view.runs
             .insert("hist".to_string(), crate::gui::runs::Run::new(pty));
         assert!(!view.is_history(&id_of(&view, "hist")));
-        // Partition order follows the list order: drop the dead child
-        // (as a restart would) and the exited run leaves History; only
-        // the historic entry remains.
-        view.runs.remove(&live_id);
-        assert!(!view.is_history(&id_of(&view, "live-working")));
+        // Partition order follows the list order: dropping the dead PTY
+        // (as a close would) leaves only the historic entry behind.
         view.runs.remove("hist");
         assert_eq!(
             view.history_indices(),

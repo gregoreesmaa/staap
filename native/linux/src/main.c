@@ -8,7 +8,8 @@
  *
  * Parity wiring (same contract as the macOS/Windows shells):
  *   roster      core registry rows (staap_session_count/json live),
- *               grouped needs-input → working → idle → history
+ *               grouped needs-input → working → idle, history collapsed
+ *               in its own toggle below the list
  *   spawn       header New run (repeat-last) + ▾ picker → staap_run_spawn
  *   restart     header Restart / Ctrl+R → staap_run_restart (same id)
  *   close       header Close run / Ctrl+W → staap_run_close + autosave
@@ -43,8 +44,10 @@
 #include "core_bridge.h"
 
 /* Bounded per-session VTE scrollback (local-only trust + bounded growth:
- * an accumulate-forever buffer would leak memory over long agent runs). */
-#define SCROLLBACK_LINES 10000
+ * an accumulate-forever buffer would leak memory over long agent runs).
+ * Named for the widget (not SCROLLBACK_LINES: that is the core vt100
+ * emulator's retention over staap.h, a different buffer). */
+#define VTE_SCROLLBACK_LINES 10000
 /* Roster/status refresh rides on the same 50ms pump tick as the Swift shell. */
 #define PUMP_MS 50
 #define DEFAULT_COLS 80
@@ -218,6 +221,10 @@ typedef struct {
     GHashTable *row_widgets;   /* id -> GtkWidget* (badge label) */
     GtkListBox *list;
     GtkSearchEntry *filter;
+    /* History affordance (dumb renderer: membership + expansion live in
+     * the core; this header only toggles and labels). Rows stay siblings
+     * in `list` (sorted last), like the macOS shell. */
+    GtkExpander *history_expander;
     VteTerminal *term;
     AdwWindowTitle *header_title;
     GtkButton *spawn_btn;
@@ -351,12 +358,24 @@ static void reload_statuses(Shell *sh) {
 static gboolean row_matches(GtkListBoxRow *row, gpointer data) {
     Shell *sh = data;
     const char *q = gtk_editable_get_text(GTK_EDITABLE(sh->filter));
+    /* Collapsed History hides historic rows (core-owned membership +
+     * expansion; expanded history renders as the sorted tail). */
+    int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "staap-idx"));
+    if (idx >= 0 && !bridge_history_expanded(sh->core)) {
+        char *json = bridge_session_json(sh->core, (size_t)idx);
+        char *id = json_string(json ? json : "{}", "id");
+        bridge_string_free(json);
+        int historic = (id && bridge_is_history(sh->core, id)) ? 1 : 0;
+        free(id);
+        if (historic) {
+            return FALSE;
+        }
+    }
     if (!q || !*q) {
         return TRUE;
     }
     /* Core-owned filter rule (title/project/id, case-insensitive). The
      * row index rides on the widget; the core answers match/no-match. */
-    int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "staap-idx"));
     if (idx < 0) {
         return TRUE;
     }
@@ -1207,6 +1226,22 @@ static void on_filter_changed(GtkSearchEntry *entry, gpointer data) {
     gtk_list_box_invalidate_filter(sh->list);
 }
 
+/* History expander toggled: the single funnel for expand/collapse —
+ * core state + persist, then re-filter so historic rows show/hide.
+ * Guarded by handler block in refresh_roster for programmatic sync. */
+static void on_history_expanded(GtkExpander *expander, GParamSpec *pspec,
+                                gpointer data) {
+    (void)pspec;
+    Shell *sh = data;
+    bridge_set_history_expanded(
+        sh->core, gtk_expander_get_expanded(expander) ? 1 : 0);
+    char *err = NULL;
+    if (bridge_core_save(sh->core, &err) != 0) {
+        free(err);
+    }
+    gtk_list_box_invalidate_filter(sh->list);
+}
+
 /* Per-run close (parity with the `x` key everywhere): drop the selected
  * run's PTY + entry, persist, rebuild. */
 static void on_close_run(GtkButton *btn, gpointer data) {
@@ -1492,6 +1527,16 @@ static void build_ui(Shell *sh) {
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),
                                   GTK_WIDGET(sh->list));
     gtk_box_append(GTK_BOX(side_box), scroll);
+    /* History affordance below the list: the header is the expand
+     * toggle (membership + expansion live in the core); rows stay
+     * siblings in the list above, sorted last. Collapsed by default. */
+    sh->history_expander = GTK_EXPANDER(gtk_expander_new("History (0)"));
+    gtk_expander_set_expanded(sh->history_expander, FALSE);
+    gtk_widget_set_margin_start(GTK_WIDGET(sh->history_expander), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(sh->history_expander), 8);
+    g_signal_connect(sh->history_expander, "notify::expanded",
+                     G_CALLBACK(on_history_expanded), sh);
+    gtk_box_append(GTK_BOX(side_box), GTK_WIDGET(sh->history_expander));
     adw_overlay_split_view_set_sidebar(split, side_box);
 
     /* Terminal side: find revealer on top, VTE in a scrolled window. */
@@ -1513,7 +1558,7 @@ static void build_ui(Shell *sh) {
     gtk_widget_set_vexpand(GTK_WIDGET(sh->term_scroll), TRUE);
     gtk_widget_set_hexpand(GTK_WIDGET(sh->term_scroll), TRUE);
     sh->term = VTE_TERMINAL(vte_terminal_new());
-    vte_terminal_set_scrollback_lines(sh->term, SCROLLBACK_LINES);
+    vte_terminal_set_scrollback_lines(sh->term, VTE_SCROLLBACK_LINES);
     vte_terminal_set_scroll_on_output(sh->term, TRUE);
     vte_terminal_set_scroll_on_keystroke(sh->term, TRUE);
     vte_terminal_set_cursor_blink_mode(sh->term, VTE_CURSOR_BLINK_ON);
@@ -1578,8 +1623,9 @@ static void refresh_roster(Shell *sh) {
     const char *fq =
         gtk_editable_get_text(GTK_EDITABLE(sh->filter));
     GString *fp = g_string_new(NULL);
-    g_string_append_printf(fp, "%zu|%s|%zu|", n, fq ? fq : "",
-                           bridge_selected(sh->core));
+    g_string_append_printf(fp, "%zu|%s|%zu|%d|", n, fq ? fq : "",
+                           bridge_selected(sh->core),
+                           bridge_history_expanded(sh->core));
     for (size_t i = 0; i < n; i++) {
         char *json = bridge_session_json(sh->core, i);
         char *id = json_string(json ? json : "{}", "id");
@@ -1672,12 +1718,60 @@ static void refresh_roster(Shell *sh) {
         free(project);
         free(harness);
     }
-    /* Restore the core selection into the list. */
-    size_t sel = bridge_selected(sh->core);
-    GtkListBoxRow *at = gtk_list_box_get_row_at_index(sh->list, (int)sel);
-    if (at) {
-        gtk_list_box_select_row(sh->list, at);
+    /* Restore the core selection into the list by row id (never by
+     * position: the sort func + collapsed History mean visual position
+     * and core index diverge, so a positional select would highlight a
+     * different row than R/restart acts on). */
+    char *sel_json = NULL;
+    char *sel_id = NULL;
+    {
+        size_t sel = bridge_selected(sh->core);
+        sel_json = bridge_session_json(sh->core, sel);
+        sel_id = json_string(sel_json ? sel_json : "{}", "id");
     }
+    if (sel_id) {
+        GtkListBoxRow *at = NULL;
+        for (GtkWidget *child =
+                 gtk_widget_get_first_child(GTK_WIDGET(sh->list));
+             child && !at;
+             child = gtk_widget_get_next_sibling(child)) {
+            if (!GTK_IS_LIST_BOX_ROW(child)) {
+                continue;
+            }
+            const char *rid = g_object_get_data(G_OBJECT(child),
+                                                "staap-row-id");
+            if (rid && strcmp(rid, sel_id) == 0) {
+                at = GTK_LIST_BOX_ROW(child);
+            }
+        }
+        if (at) {
+            gtk_list_box_select_row(sh->list, at);
+        }
+    }
+    free(sel_id);
+    bridge_string_free(sel_json);
+    /* Sync the History affordance to the core (count label + expanded
+     * state; the toggle handler is blocked during the programmatic
+     * set so syncing never writes back). */
+    size_t history_n = 0;
+    for (size_t i = 0; i < n; i++) {
+        char *json = bridge_session_json(sh->core, i);
+        char *id = json_string(json ? json : "{}", "id");
+        bridge_string_free(json);
+        if (id && bridge_is_history(sh->core, id)) {
+            history_n++;
+        }
+        free(id);
+    }
+    char *history_label = g_strdup_printf("History (%zu)", history_n);
+    gtk_expander_set_label(sh->history_expander, history_label);
+    g_free(history_label);
+    g_signal_handlers_block_by_func(sh->history_expander,
+                                    on_history_expanded, sh);
+    gtk_expander_set_expanded(sh->history_expander,
+                              bridge_history_expanded(sh->core) ? TRUE : FALSE);
+    g_signal_handlers_unblock_by_func(sh->history_expander,
+                                      on_history_expanded, sh);
 }
 
 static void on_activate(GtkApplication *app, gpointer data) {

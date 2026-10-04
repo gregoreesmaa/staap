@@ -18,6 +18,12 @@ namespace StaapWinUI
         void Roster_SelectionChanged(
             Object sender,
             Microsoft.UI.Xaml.Controls.SelectionChangedEventArgs args);
+        void HistoryExpander_Expanding(
+            Object sender,
+            Microsoft.UI.Xaml.Controls.ExpanderExpandingEventArgs args);
+        void HistoryExpander_Collapsed(
+            Object sender,
+            Microsoft.UI.Xaml.Controls.ExpanderCollapsedEventArgs args);
         void SidebarThumb_DragDelta(
             Object sender,
             Microsoft.UI.Xaml.Controls.Primitives.DragDeltaEventArgs args);

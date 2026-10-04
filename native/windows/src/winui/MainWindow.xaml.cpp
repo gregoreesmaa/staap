@@ -19,8 +19,9 @@
 //               Clipboard -> bridge_run_write; Ctrl+C forwards ETX
 //   scroll      output TextBox in a ScrollViewer, per-run text retained
 //   search      sidebar search box (core-owned filter) filters every group
-//   history     collapsed group of rows with no live PTY, restored every
-//               launch; ended rows offer restart inline
+//   history     collapsed-by-default group of rows with no live PTY
+//               (core-owned membership + expansion, persisted),
+//               restored every launch; ended rows offer restart inline
 //   persist     automatic (throttled pump autosave + close hook)
 //
 // ConPTY note: no console is ever created on the WinUI side. The core's
@@ -269,6 +270,8 @@ namespace winrt::StaapWinUI::implementation
         fingerprint += '|';
         fingerprint += std::to_string(bridge_selected(m_core));
         fingerprint += '|';
+        fingerprint += bridge_history_expanded(m_core) ? 'E' : 'e';
+        fingerprint += '|';
         for (size_t i = 0; i < n; ++i) {
             char *json = bridge_session_json(m_core, i);
             std::string js = json ? json : "";
@@ -334,6 +337,10 @@ namespace winrt::StaapWinUI::implementation
         HistoryExpander().Header(box_value(winrt::hstring(
             L"History (" + std::to_wstring(history.size()) + L")")));
         m_syncing = true;
+        /* Sync the expander to the core-owned expansion state (collapsed
+         * by default); the toggle handler below ignores programmatic
+         * moves via m_syncing so syncing never writes back. */
+        HistoryExpander().IsExpanded(bridge_history_expanded(m_core) != 0);
         RebuildGroupList(NeedsInputList(), needs);
         RebuildGroupList(WorkingList(), working);
         RebuildGroupList(IdleList(), idle);
@@ -986,6 +993,32 @@ namespace winrt::StaapWinUI::implementation
         m_syncing = false;
         /* Write through to the core selection (SelectRowById mirrors). */
         SelectRowById(id);
+    }
+
+    /* History expander toggle: core-owned expansion + persist (same
+     * funnel every shell shares). Programmatic sync in RefreshRoster
+     * runs under m_syncing so it never writes back; the fingerprint
+     * carries expansion so the next tick syncs without rebuilding. */
+    void MainWindow::HistoryExpander_Expanding(
+        IInspectable const &,
+        Microsoft::UI::Xaml::Controls::ExpanderExpandingEventArgs const &) {
+        WriteHistoryExpanded(true);
+    }
+    void MainWindow::HistoryExpander_Collapsed(
+        IInspectable const &,
+        Microsoft::UI::Xaml::Controls::ExpanderCollapsedEventArgs const &) {
+        WriteHistoryExpanded(false);
+    }
+    void MainWindow::WriteHistoryExpanded(bool expanded) {
+        if (m_syncing || !m_core) {
+            return;
+        }
+        bridge_set_history_expanded(m_core, expanded ? 1 : 0);
+        char *err = nullptr;
+        if (bridge_core_save(m_core, &err) != 0) {
+            free(err);
+        }
+        m_fingerprint.clear();
     }
 
     /* Current sidebar width in pixels; 0 when the column is star/auto

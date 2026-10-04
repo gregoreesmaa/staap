@@ -684,8 +684,15 @@ impl App {
     /// into the config — the ShellView toggle funnel persists it, so
     /// the state survives restarts.
     pub fn toggle_history(&mut self) {
-        self.history_expanded = !self.history_expanded;
-        self.config.history_expanded = self.history_expanded;
+        self.set_history_expanded(!self.history_expanded);
+    }
+
+    /// Set the History expansion state, mirroring it into the config so
+    /// the state survives restarts (same funnel as [`Self::toggle_history`];
+    /// the FFI setter routes through here so the invariant has one home).
+    pub fn set_history_expanded(&mut self, expanded: bool) {
+        self.history_expanded = expanded;
+        self.config.history_expanded = expanded;
     }
 
     /// Replace the title filter, snapping the selection into the matches

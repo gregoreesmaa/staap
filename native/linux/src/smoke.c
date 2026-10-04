@@ -267,6 +267,35 @@ int main(int argc, char **argv) {
             bridge_core_free(core);
             return fail("unknown id is live");
         }
+        /* History contract (core-owned): unknown ids are historic;
+         * expansion is collapsed by default and round-trips. */
+        if (!bridge_is_history(core, "missing")) {
+            bridge_core_free(core);
+            return fail("unknown id is not history");
+        }
+        if (bridge_is_history(NULL, "missing")) {
+            bridge_core_free(core);
+            return fail("null core is history");
+        }
+        if (bridge_history_expanded(core)) {
+            bridge_core_free(core);
+            return fail("history starts expanded");
+        }
+        if (bridge_history_expanded(NULL)) {
+            bridge_core_free(core);
+            return fail("null core history expanded");
+        }
+        bridge_set_history_expanded(NULL, 1);
+        bridge_set_history_expanded(core, 1);
+        if (!bridge_history_expanded(core)) {
+            bridge_core_free(core);
+            return fail("history set expanded");
+        }
+        bridge_set_history_expanded(core, 0);
+        if (bridge_history_expanded(core)) {
+            bridge_core_free(core);
+            return fail("history set collapsed");
+        }
     }
 
     printf("SMOKE-OK sessions=%zu\n", n);

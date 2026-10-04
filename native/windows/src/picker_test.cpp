@@ -73,6 +73,17 @@ static void shared_helpers_come_from_core(void) {
     CHECK(core != nullptr, "core new");
     CHECK(bridge_max_runs() == 10, "cap is 10");
     CHECK(bridge_live_count(core) == 0, "no live runs");
+    /* History contract (core-owned): unknown ids are historic;
+     * expansion is collapsed by default and round-trips. */
+    CHECK(bridge_is_history(core, "missing") != 0, "unknown is history");
+    CHECK(bridge_is_history(nullptr, "missing") == 0, "null core no history");
+    CHECK(bridge_history_expanded(core) == 0, "history starts collapsed");
+    CHECK(bridge_history_expanded(nullptr) == 0, "null core not expanded");
+    bridge_set_history_expanded(nullptr, 1);
+    bridge_set_history_expanded(core, 1);
+    CHECK(bridge_history_expanded(core) != 0, "history set expanded");
+    bridge_set_history_expanded(core, 0);
+    CHECK(bridge_history_expanded(core) == 0, "history set collapsed");
     bridge_core_free(core);
 }
 
