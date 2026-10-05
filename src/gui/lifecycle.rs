@@ -379,9 +379,9 @@ mod tests {
         // ago, so it is the reap victim.
         let older = exited_ids[0].clone();
         let newer = exited_ids[1].clone();
-        view.runs.get_mut(&newer).unwrap().last_output = Instant::now();
+        view.runs.get_mut(&newer).unwrap().last_output = Some(Instant::now());
         view.runs.get_mut(&older).unwrap().last_output =
-            Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+            Some(Instant::now().checked_sub(Duration::from_secs(60)).unwrap());
         let sessions_before = view.app.sessions.len();
         assert!(view.request_new_run());
         // Room made under the cap: the victim's entry+PTY are gone, the
