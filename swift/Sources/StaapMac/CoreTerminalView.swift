@@ -26,6 +26,12 @@ struct CoreTerminalView: NSViewRepresentable {
         let view = TerminalView(frame: .zero, font: font)
         applyThemeColors(to: view, darkMode: darkMode)
         view.terminalDelegate = context.coordinator
+        // Fresh view per row: replay the full current text first, then
+        // only newer feeds (issue #106).
+        let initial = context.coordinator.initialText
+        if !initial.isEmpty {
+            view.feed(text: initial)
+        }
         context.coordinator.lastDarkMode = darkMode
         // Become key so keystrokes reach the child right away.
         DispatchQueue.main.async {
@@ -65,11 +71,18 @@ struct CoreTerminalView: NSViewRepresentable {
         private let state: AppState
         private let rowId: String
         fileprivate var lastFedSeq: UInt64 = 0
+        fileprivate var initialText = ""
         fileprivate var lastDarkMode = false
 
         init(state: AppState, rowId: String) {
             self.state = state
             self.rowId = rowId
+            // Replay baseline: the view is (re)created per row (see
+            // `.id(rowId)`), so it starts from the row's full current
+            // text and only drains newer pump feeds after that (#106).
+            let replay = state.replayText(for: rowId)
+            self.initialText = replay.text
+            self.lastFedSeq = replay.seq
         }
 
         /// Feed anything the pump produced since the last drain.
@@ -80,6 +93,13 @@ struct CoreTerminalView: NSViewRepresentable {
             else { return }
             lastFedSeq = seq
             view.feed(text: text)
+            // Place the caret where the child put it, not at the end of
+            // fed text (issue #104).
+            if let cursor = state.coreCursor(for: rowId) {
+                var cup = String(Character(UnicodeScalar(UInt8(27)))) + "["
+                cup += String(cursor.row + 1) + ";" + String(cursor.col + 1) + "H"
+                view.feed(text: cup)
+            }
         }
 
         // MARK: - TerminalViewDelegate

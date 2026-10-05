@@ -28,10 +28,10 @@ the Linux/Windows shells (native look, identical behavior).
 
 | Feature | Path |
 |---|---|
-| Roster | core registry rows (`staap_session_count` + `staap_session_json` live, `staap_pump_all` refreshes statuses/links), grouped Needs input → Working → Idle → History; single selection stored in the core (`staap_selected`/`staap_select`) |
-| Spawn | split-button 2D launch: `Repeat last session` (Cmd-N) replays the last folder × CLI + yolo via `staap_run_spawn` (null CLI/folder, attaches a real roster row under the shared cap); `Choose Folder, CLI, Options…` (Cmd-Shift-N) opens the picker sheet (folder field + recents from `staap_recent_json`, CLI radio over `staap_clis_json`, tri-state yolo, core preview `staap_spawn_preview`) → `staap_run_spawn` |
+| Roster | core registry rows (`staap_session_count` + `staap_session_json` live, `staap_pump_all` refreshes statuses/links), grouped Working → Idle (needs-input shares Idle, #105) → History; headers use the core `Title (n)` format; rows show glyph + project/harness/age + expandable parsed links; single selection stored in the core (`staap_selected`/`staap_select`) |
+| Spawn | split-button 2D launch: `Repeat last session` (Cmd-N) replays the last folder × CLI + yolo via `staap_run_spawn` (null CLI/folder, attaches a real roster row under the shared cap); `Choose Folder, CLI, Options…` (Cmd-Shift-N) opens the picker sheet (folder field + Choose panel + recents from `staap_recent_json`, CLI radio with status icons/install paths over `staap_clis_json`, yolo Default labeled on/off via `staap_yolo_default`, core preview `staap_spawn_preview`) → `staap_run_spawn` |
 | Restart / close | footer buttons / Cmd-R / Cmd-W + row context menus → `staap_run_restart` (same id, keeps title/links) / `staap_run_close` + autosave; ended rows offer restart inline in the detail pane |
-| Converse | keystrokes `send` -> `staap_run_write`; output `staap_run_pump` -> `staap_run_screen_text`/`staap_run_spans_json` -> `staap_feed_delta`/`staap_ansi_render` -> view feed |
+| Converse | keystrokes `send` -> `staap_run_write`; output `staap_run_pump` -> `staap_run_screen_text`/`staap_run_spans_json` -> `staap_feed_delta`/`staap_ansi_render` -> view feed; caret placed from `staap_run_cursor` (CUP after each feed); row switch recreates the view with a full replay |
 | Select / copy / paste / scroll | native SwiftTerm view and scrollback |
 | Search / filter | sidebar search field writes the core filter (`staap_set_filter`), rows match via `staap_row_matches`; terminal find via Cmd-F (SwiftTerm find bar) |
 | History | roster rows carry project, harness, last-active age (core strings); restored every launch; history group holds rows with no live PTY |
@@ -49,6 +49,8 @@ the Linux/Windows shells (native look, identical behavior).
 - New windows resize the view; the view reports its grid back and the
   shell forwards it with `staap_run_resize` (every attached run resizes on
   Linux; macOS/Windows resize the selected run's PTY).
+- Window drag: a 14pt clear strip above the terminal moves the window
+  (the hidden title bar leaves no grab area; issue #101).
 - Spawning runs the effective CLI (last-used, configured default, or
   first autodetected, with the stored per-agent flags — the core loads
   the user config, so native spawns honor it); without any CLI on PATH

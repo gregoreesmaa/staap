@@ -1,3 +1,4 @@
+import AppKit
 import ShellSupport
 import SwiftUI
 
@@ -80,12 +81,9 @@ struct ContentView: View {
                                         }
                                 }
                             } header: {
-                                HStack {
-                                    Text(section.title)
-                                    Spacer()
-                                    Text("\(section.rows.count)")
-                                        .foregroundStyle(.secondary)
-                                }
+                                // Core-owned "Working (1)" format (issue
+                                // #103): title and count ride one label.
+                                Text(sectionHeader(section))
                             }
                         }
                     }
@@ -151,53 +149,74 @@ struct ContentView: View {
 
     private struct StatusSection {
         var status: Int
-        var title: String
         var rows: [SessionRow]
     }
 
-    /// Shared group order (matches the other shells): Needs input →
-    /// Working → Idle over attached (live) rows only. History (no live
-    /// PTY) renders separately below, collapsed by default.
-    /// Counts ride the header HStack (title + count), not the title.
+    /// Shared group order (matches the core): Working, then Idle over
+    /// attached (live) rows only; needs-input rows share the Idle
+    /// section (issue #105). History (no live PTY) renders separately
+    /// below, collapsed by default. Headers use the core "Title (n)"
+    /// format (issue #103).
     private var statusSections: [StatusSection] {
         [
             StatusSection(
-                status: RunStatus.attention.rawValue, title: "Needs input",
-                rows: state.rows(with: .attention)
-            ),
-            StatusSection(
-                status: RunStatus.working.rawValue, title: "Working",
+                status: RunStatus.working.rawValue,
                 rows: state.rows(with: .working)
             ),
             StatusSection(
-                status: RunStatus.idle.rawValue, title: "Idle",
-                rows: state.rows(with: .idle)
+                status: RunStatus.idle.rawValue,
+                rows: state.rows(with: .attention) + state.rows(with: .idle)
             ),
         ]
     }
 
+    /// Core-owned section header ("Working (1)"), matching
+    /// `group_sections` exactly (issues #103/#105).
+    private func sectionHeader(_ section: StatusSection) -> String {
+        Core.sectionTitle(Int32(section.status)) + " (" + String(section.rows.count) + ")"
+    }
+
     private func rowLabel(_ row: SessionRow) -> some View {
-        HStack {
-            // Non-color marker (shared core glyphs) + color dot: rows are
-            // never color-only, matching the other shells.
-            Text(state.glyph(of: row))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            statusDot(state.status(of: row))
-            VStack(alignment: .leading) {
-                Text(row.title).lineLimit(1)
-                Text("\(row.project) · \(row.harness) · \(state.age(of: row))")
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                // Non-color marker (shared core glyphs) + color dot: rows are
+                // never color-only, matching the other shells.
+                Text(state.glyph(of: row))
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                statusDot(state.status(of: row))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(row.title).lineLimit(1)
+                    Text("\(row.project) · \(row.harness) · \(state.age(of: row))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer(minLength: 8)
+                if row.linkCount > 0 {
+                    Button {
+                        state.toggleLinks(row.id)
+                    } label: {
+                        Label(
+                            "\(row.linkCount) link\(row.linkCount == 1 ? "" : "s")",
+                            systemImage: state.expandedLinks.contains(row.id)
+                                ? "chevron.down" : "chevron.right"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Show the parsed links for this run")
+                }
             }
-            Spacer()
-            if row.linkCount > 0 {
-                Text("\(row.linkCount) link\(row.linkCount == 1 ? "" : "s")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            if state.expandedLinks.contains(row.id) {
+                linkList(row)
+                    .padding(.leading, 20)
             }
         }
+        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityLabel("\(row.title), \(state.statusName(of: row))")
     }
 
@@ -211,6 +230,35 @@ struct ContentView: View {
             .accessibilityHidden(true)
     }
 
+    /// Inline parsed-link list for an expanded row, with copy/open
+    /// actions per link (issue #103).
+    private func linkList(_ row: SessionRow) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(allLinks(row), id: \.self) { link in
+                Text(link)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .contextMenu {
+                        Button("Copy link") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(link, forType: .string)
+                        }
+                        if let url = URL(string: link), url.scheme != nil {
+                            Button("Open link") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                    }
+            }
+        }
+    }
+
+    private func allLinks(_ row: SessionRow) -> [String] {
+        (row.prLinks ?? []) + (row.relatedLinks ?? [])
+    }
+
     // MARK: - Detail
 
     @ViewBuilder
@@ -219,10 +267,22 @@ struct ContentView: View {
            let row = state.rows.first(where: { $0.id == id })
         {
             if state.hasLivePty(id) {
-                CoreTerminalView(
-                    state: state, rowId: id,
-                    darkMode: colorScheme == .dark
-                )
+                VStack(spacing: 0) {
+                    // Deadzone drag strip: the hidden title bar leaves
+                    // no grab area, and the terminal eats mouse events
+                    // for selection — this strip moves the window
+                    // instead (issue #101).
+                    WindowDragStrip().frame(height: 14)
+                    CoreTerminalView(
+                        state: state, rowId: id,
+                        darkMode: colorScheme == .dark
+                    )
+                    // Fresh view per selected row: without this the
+                    // representable reuses one TerminalView (and its
+                    // row-bound coordinator), so switching rows keeps
+                    // showing the previous session (issue #106).
+                    .id(id)
+                }
             } else {
                 // Ended run or historic entry: restart/resume on the same
                 // id (keeps title and links), or close it. Same recovery
@@ -261,15 +321,30 @@ struct ContentView: View {
     }
 }
 
+/// Deadzone drag strip above the terminal (issue #101): a clear strip
+/// that moves the window, so the hidden title bar still leaves a grab
+/// area above the full-height terminal.
+private struct WindowDragStrip: NSViewRepresentable {
+    func makeNSView(context _: Context) -> NSView {
+        DragView()
+    }
+
+    func updateNSView(_: NSView, context _: Context) {}
+
+    private final class DragView: NSView {
+        override var mouseDownCanMoveWindow: Bool { true }
+    }
+}
+
 /// 2D new-session sheet: working folder × agent CLI + one-shot yolo.
 ///
-/// - Folder: a text field (blank = inherit) plus the persisted recents
-///   for one-click refill. A missing folder refuses inline and stays
-///   open for a fix — the sheet never spawns into nothing.
+/// - Folder: Choose… (directory panel) or a text field (blank =
+///   inherit) plus the persisted recents for one-click refill. A
+///   missing folder refuses inline — the sheet never spawns into nothing.
 /// - CLI: a picker over the autodetected catalog; missing CLIs render
 ///   disabled with an install hint, never hidden.
-/// - Yolo: a tri-state toggle (default / on once / off once), safe by
-///   default; the footer previews the exact combination before Spawn.
+/// - Yolo: a tri-state toggle (labeled default on/off + on/off once),
+///   safe by default; the footer previews the exact combination.
 private struct NewSessionSheet: View {
     @ObservedObject var state: AppState
     @Binding var isPresented: Bool
@@ -285,8 +360,11 @@ private struct NewSessionSheet: View {
             Text("Start a new run").font(.title2)
             // Folder axis.
             Text("Where should it work?").font(.headline)
-            TextField("Blank = current folder", text: $folder)
-                .textFieldStyle(.roundedBorder)
+            HStack {
+                TextField("Blank = current folder", text: $folder)
+                    .textFieldStyle(.roundedBorder)
+                Button("Choose…") { chooseFolder() }
+            }
             if !recents.isEmpty {
                 Picker("Recent", selection: $folder) {
                     Text("Type a folder…").tag("")
@@ -303,19 +381,33 @@ private struct NewSessionSheet: View {
             Text("Who should do it?").font(.headline)
             Picker("Agent CLI", selection: $cliId) {
                 ForEach(clis, id: \.id) { cli in
-                    Text(cliLabel(cli)).tag(cli.id)
-                        .disabled(!cli.available)
+                    Label {
+                        VStack(alignment: .leading) {
+                            Text(cli.id)
+                            Text(cliDetail(cli))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: cli.available ? "checkmark.circle.fill" : "xmark.circle")
+                            .foregroundStyle(cli.available ? .green : .secondary)
+                    }
+                    .tag(cli.id)
+                    .disabled(!cli.available)
                 }
             }
             .pickerStyle(.radioGroup)
             // Yolo tri-state (safe default; per-run only).
             Text("Permission mode").font(.headline)
             Picker("Yolo", selection: $yolo) {
-                Text("Default").tag(NewSessionPicker.YoloChoice.useDefault)
+                Text(state.yoloDefaultLabel(cli: cliId)).tag(NewSessionPicker.YoloChoice.useDefault)
                 Text("On (once)").tag(NewSessionPicker.YoloChoice.forceOn)
                 Text("Off (once)").tag(NewSessionPicker.YoloChoice.forceOff)
             }
             .pickerStyle(.segmented)
+            Text("Default follows the per-agent config; On/Off apply once.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Text(previewText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -346,12 +438,28 @@ private struct NewSessionSheet: View {
         }
     }
 
+    /// Directory picker for the folder axis (issue #102): choosing in
+    /// the UI beats typing a path, and keeps first-run launches near
+    /// the two-click goal.
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let path = panel.url?.path {
+            folder = path
+        }
+    }
+
     private var recents: [String] { state.pickerRecents() }
 
-    private func cliLabel(_ cli: CliRow) -> String {
-        cli.available
-            ? "\(cli.id) — ready"
-            : "\(cli.id) — not installed"
+    /// Detail caption for a CLI row: install path when ready, install
+    /// hint when missing (issue #102).
+    private func cliDetail(_ cli: CliRow) -> String {
+        if cli.available {
+            return cli.path ?? cli.program
+        }
+        return "not installed"
     }
 
     /// One-line spawn preview through the shared core helper (single

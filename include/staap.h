@@ -470,6 +470,21 @@ char *staap_run_spans_json(const struct StaapCore *core, const char *id);
 bool staap_run_exited(const struct StaapCore *core, const char *id);
 
 /**
+ * Caret cell of an attached run's emulated screen (0-based row/col into
+ * `row_out`/`col_out`), so shells place the view cursor where the child
+ * put it instead of at the end of fed text (issue #104). Unknown ids and
+ * nulls leave the outputs untouched and report the error code.
+ *
+ * # Safety
+ * `core`/`id` follow the [`staap_is_live`] conventions; `row_out` and
+ * `col_out` must be null or point to writable `u16`s.
+ */
+int staap_run_cursor(const struct StaapCore *core,
+                     const char *id,
+                     uint16_t *row_out,
+                     uint16_t *col_out);
+
+/**
  * Encode one logical keypress into child bytes. `key`/`key_char` are
  * NUL-terminated UTF-8 (`key_char` may be null); `ctrl`/`alt` are 0/1.
  * On `Forward` the bytes are written to `bytes_out` (up to `cap` bytes)
@@ -566,6 +581,17 @@ char *staap_ansi_render(const char *json);
  * `cli`/`folder` must be null or valid C strings.
  */
 char *staap_spawn_preview(const char *cli, const char *folder, int yolo);
+
+/**
+ * Configured yolo default for `cli` (1 = on, 0 = off): what the picker's
+ * "Default" row resolves to, so shells can label it (issue #102). Null
+ * core/cli (or undecodable names) read safe-off, matching
+ * [`crate::config::Config::yolo_default_for`].
+ *
+ * # Safety
+ * `core` must be null or live; `cli` must be null or a valid C string.
+ */
+int staap_yolo_default(const struct StaapCore *core, const char *cli);
 
 /**
  * Tri-state yolo int from a segmented-control index (1 = force on,

@@ -8,8 +8,8 @@
  *
  * Parity wiring (same contract as the macOS/Windows shells):
  *   roster      core registry rows (staap_session_count/json live),
- *               grouped needs-input → working → idle, history collapsed
- *               in its own toggle below the list
+ *               grouped working → idle (needs-input shares idle,
+ *               issue #105), history collapsed in its own toggle
  *   spawn       header New run (repeat-last) + ▾ picker → staap_run_spawn
  *   restart     header Restart / Ctrl+R → staap_run_restart (same id)
  *   close       header Close run / Ctrl+W → staap_run_close + autosave
@@ -33,6 +33,8 @@
 #define _POSIX_C_SOURCE 200809L /* strdup under strict C11 */
 
 #include <ctype.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -281,7 +283,7 @@ static void apply_system_theme(Shell *sh) {
  * live-ness all come from the core now — no launch snapshot, no local
  * row cache). Rows carry their JSON + status + id as widget data; the
  * filter/sort callbacks read the same core state, so grouping is the
- * shared needs-input → working → idle → history order. */
+ * shared working → idle → history order (issue #105). */
 static void refresh_roster(Shell *sh);
 
 /* Subtitle: selection context + live-ness + attention count, all from
@@ -382,8 +384,9 @@ static gboolean row_matches(GtkListBoxRow *row, gpointer data) {
     return bridge_row_matches(sh->core, (size_t)idx, q) ? TRUE : FALSE;
 }
 
-/* Order: needs-input first, then working, then idle, history last;
- * recent first within. Statuses + ids come from the core registry. */
+/* Order: working first, then idle (needs-input shares idle, issue
+ * #105), history last; recent first within. Statuses + ids come
+ * from the core registry. */
 static int row_order(GtkListBoxRow *a, GtkListBoxRow *b, gpointer data) {
     Shell *sh = data;
     int ia = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(a), "staap-idx"));
@@ -412,8 +415,9 @@ static int row_order(GtkListBoxRow *a, GtkListBoxRow *b, gpointer data) {
     if (live_a && !live_b) {
         return -1;
     }
-    int pa = sa == 0 ? 0 : sa == 2 ? 1 : 2;
-    int pb = sb == 0 ? 0 : sb == 2 ? 1 : 2;
+    /* Issue #105: idle and needs-input share one section. */
+    int pa = sa == 2 ? 0 : 1;
+    int pb = sb == 2 ? 0 : 1;
     if (pa != pb) {
         return pa - pb;
     }
@@ -671,11 +675,32 @@ static void picker_on_changed(PickerUi *pu) {
     picker_refresh_preview(pu);
 }
 
+/* Rebuild the yolo options so "Default" names its resolved state for
+ * the selected CLI (issue #102). Keeps the current tri-state pick. */
+static void picker_refresh_yolo(PickerUi *pu) {
+    const char *cli = "muse";
+    for (size_t i = 0; i < pu->n_clis; i++) {
+        if (gtk_check_button_get_active(pu->cli_btns[i])) {
+            cli = pu->clis[i].id;
+            break;
+        }
+    }
+    guint sel = gtk_drop_down_get_selected(pu->yolo);
+    char def[32];
+    snprintf(def, sizeof def, "Default (%s)",
+             bridge_yolo_default(pu->sh->core, cli) ? "on" : "off");
+    const char *opts[] = { def, "On (once)", "Off (once)", NULL };
+    gtk_drop_down_set_model(pu->yolo,
+                            G_LIST_MODEL(gtk_string_list_new(opts)));
+    gtk_drop_down_set_selected(pu->yolo, sel);
+}
+
 static void picker_cli_toggled(GtkCheckButton *btn, gpointer data) {
     if (!gtk_check_button_get_active(btn)) {
         return; /* the newly activated sibling refreshes */
     }
     picker_on_changed(data);
+    picker_refresh_yolo(data);
 }
 
 static void picker_folder_changed(GtkEditable *entry, gpointer data) {
@@ -796,6 +821,30 @@ static void picker_closed(AdwDialog *dialog, gpointer data) {
     picker_free(data);
 }
 
+/* Directory picker for the folder axis (issue #102): choosing in the
+ * UI beats typing a path. */
+static void picker_choose_folder(GtkButton *btn, gpointer data) {
+    (void)btn;
+    PickerUi *pu = data;
+    GtkWindow *win =
+        GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(pu->folder)));
+    GtkFileChooserNative *dlg = gtk_file_chooser_native_new(
+        "Choose a folder", win, GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
+        "_Open", "_Cancel");
+    if (gtk_native_dialog_run(GTK_NATIVE_DIALOG(dlg))
+        == GTK_RESPONSE_ACCEPT) {
+        GFile *file = gtk_file_chooser_get_file(GTK_FILE_CHOOSER(dlg));
+        char *path = file ? g_file_get_path(file) : NULL;
+        if (path) {
+            gtk_editable_set_text(GTK_EDITABLE(pu->folder), path);
+            g_free(path);
+        }
+        if (file) {
+            g_object_unref(file);
+        }
+    }
+    g_object_unref(dlg);
+}
 /* Open the 2D picker dialog: folder entry + recents, CLI radio rows
  * (missing CLIs disabled with an install hint), yolo tri-state, and
  * the live `runs: ...` preview. Catalog + recents re-read on every
@@ -846,14 +895,21 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
     gtk_label_set_xalign(GTK_LABEL(folder_label), 0);
     gtk_widget_add_css_class(folder_label, "heading");
     gtk_box_append(GTK_BOX(box), folder_label);
+    GtkWidget *folder_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     pu->folder = GTK_ENTRY(gtk_entry_new());
+    gtk_widget_set_hexpand(GTK_WIDGET(pu->folder), TRUE);
     gtk_entry_set_placeholder_text(pu->folder, "Blank = current folder");
     if (pu->n_recents > 0) {
         gtk_editable_set_text(GTK_EDITABLE(pu->folder), pu->recents[0]);
     }
     g_signal_connect(pu->folder, "changed",
                      G_CALLBACK(picker_folder_changed), pu);
-    gtk_box_append(GTK_BOX(box), GTK_WIDGET(pu->folder));
+    gtk_box_append(GTK_BOX(folder_row), GTK_WIDGET(pu->folder));
+    GtkWidget *choose = gtk_button_new_with_label("Choose…");
+    g_signal_connect(choose, "clicked", G_CALLBACK(picker_choose_folder),
+                     pu);
+    gtk_box_append(GTK_BOX(folder_row), choose);
+    gtk_box_append(GTK_BOX(box), folder_row);
     if (pu->n_recents > 0) {
         GtkStringList *recent_list =
             GTK_STRING_LIST(gtk_string_list_new(NULL));
@@ -894,7 +950,8 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
         gtk_widget_set_sensitive(row, pu->clis[i].available ? TRUE : FALSE);
         gtk_widget_set_tooltip_text(
             row, pu->clis[i].available
-                     ? pu->clis[i].id
+                     ? (pu->clis[i].path ? pu->clis[i].path
+                        : pu->clis[i].id)
                      : "Install this CLI and ensure it is on PATH.");
         g_signal_connect(row, "toggled", G_CALLBACK(picker_cli_toggled),
                          pu);
@@ -943,6 +1000,8 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
     gtk_box_append(GTK_BOX(actions), spawn);
     gtk_box_append(GTK_BOX(box), actions);
 
+    /* Label "Default" with its resolved state for the preselected CLI. */
+    picker_refresh_yolo(pu);
     picker_refresh_preview(pu);
     adw_dialog_set_child(dialog, box);
     adw_dialog_present(dialog, GTK_WIDGET(win));
@@ -1074,6 +1133,19 @@ static gboolean on_key_pressed(GtkEventControllerKey *ctl, guint keyval,
 /* Pump: the shell's only repaint gate (mirrors AppState.pump). */
 /* ------------------------------------------------------------------ */
 
+/* Place the VTE cursor where the child put it (issue #104): fed snapshot
+ * text alone would leave it at the end of fed output. */
+static void feed_cursor_to_vte(Shell *sh, const char *id) {
+    uint16_t row = 0, col = 0;
+    if (bridge_run_cursor(sh->core, id, &row, &col) != 0) {
+        return;
+    }
+    char cup[32];
+    snprintf(cup, sizeof cup, "\x1b[%u;%uH", (unsigned)row + 1,
+             (unsigned)col + 1);
+    feed_to_vte(sh, cup);
+}
+
 static void feed_to_vte(Shell *sh, const char *feed) {
     vte_terminal_feed(sh->term, feed, (gssize)strlen(feed));
 }
@@ -1111,6 +1183,7 @@ static void show_selected_in_terminal(Shell *sh) {
         feed_to_vte(sh, feed);
         free(feed);
     }
+    feed_cursor_to_vte(sh, id);
     free(sh->fed_id);
     sh->fed_id = id;
     free(sh->fed_text);
@@ -1140,6 +1213,7 @@ static gboolean pump_tick(gpointer data) {
         if (feed && feed[0]) {
             feed_to_vte(sh, feed);
         }
+        feed_cursor_to_vte(sh, id);
         free(feed);
         free(sh->fed_id);
         sh->fed_id = id;

@@ -1181,6 +1181,47 @@ pub unsafe extern "C" fn staap_run_exited(core: *const StaapCore, id: *const c_c
     }
 }
 
+/// Caret cell of an attached run's emulated screen (0-based row/col into
+/// `row_out`/`col_out`), so shells place the view cursor where the child
+/// put it instead of at the end of fed text (issue #104). Unknown ids and
+/// nulls leave the outputs untouched and report the error code.
+///
+/// # Safety
+/// `core`/`id` follow the [`staap_is_live`] conventions; `row_out` and
+/// `col_out` must be null or point to writable `u16`s.
+#[no_mangle]
+pub unsafe extern "C" fn staap_run_cursor(
+    core: *const StaapCore,
+    id: *const c_char,
+    row_out: *mut u16,
+    col_out: *mut u16,
+) -> c_int {
+    if core.is_null() || id.is_null() {
+        set_error("staap_run_cursor: null core or id".to_string());
+        return StaapError::Null.code();
+    }
+    if row_out.is_null() || col_out.is_null() {
+        set_error("staap_run_cursor: null out pointer".to_string());
+        return StaapError::Null.code();
+    }
+    let cursor = match CStr::from_ptr(id).to_str() {
+        Ok(s) => match (*core).reg.runs.get(s) {
+            Some(run) => run.pty.view().screen.cursor_position(),
+            None => {
+                set_error("staap_run_cursor: unknown run id".to_string());
+                return StaapError::Spawn.code();
+            }
+        },
+        Err(_) => {
+            set_error("staap_run_cursor: id is not valid UTF-8".to_string());
+            return StaapError::Utf8.code();
+        }
+    };
+    *row_out = cursor.0;
+    *col_out = cursor.1;
+    StaapError::Ok.code()
+}
+
 // --- Shared shell helpers ----------------------------------------------------
 //
 // Thin `staap_*` wrappers over `shell` so C/Swift shells call one code path:
@@ -1440,6 +1481,24 @@ pub unsafe extern "C" fn staap_spawn_preview(
     match CString::new(crate::shell_shared::spawn_preview(&cli_s, &folder_s, yolo)) {
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Configured yolo default for `cli` (1 = on, 0 = off): what the picker's
+/// "Default" row resolves to, so shells can label it (issue #102). Null
+/// core/cli (or undecodable names) read safe-off, matching
+/// [`crate::config::Config::yolo_default_for`].
+///
+/// # Safety
+/// `core` must be null or live; `cli` must be null or a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn staap_yolo_default(core: *const StaapCore, cli: *const c_char) -> c_int {
+    if core.is_null() || cli.is_null() {
+        return 0;
+    }
+    match CStr::from_ptr(cli).to_str() {
+        Ok(s) => (*core).reg.app.config_yolo_default(s) as c_int,
+        Err(_) => 0,
     }
 }
 
@@ -2353,6 +2412,56 @@ mod tests {
                 StaapError::Ok.code()
             );
             assert_eq!(staap_session_count(core), before);
+            staap_core_free(core);
+        }
+    }
+
+    #[test]
+    fn registry_run_cursor_reports_caret_and_yolo_default_reads_config() {
+        // Issue #104: shells place the view cursor from this endpoint.
+        // Issue #102: the picker labels "Default" from this endpoint.
+        unsafe {
+            let core = staap_core_new();
+            assert!(!core.is_null());
+            // Null handles report errors and touch nothing.
+            let mut row = 9u16;
+            let mut col = 9u16;
+            assert_eq!(
+                staap_run_cursor(std::ptr::null(), std::ptr::null(), &mut row, &mut col),
+                StaapError::Null.code()
+            );
+            assert_eq!((row, col), (9, 9));
+            assert_eq!(staap_yolo_default(std::ptr::null(), std::ptr::null()), 0);
+            let owned: Vec<String> = vec![];
+            let direct = EmbeddedPty::spawn("cat", &owned, 80, 24).expect("cat spawns");
+            (*core).reg.attach("cursor-row", direct);
+            let cid = CString::new("cursor-row").unwrap();
+            // Fresh PTY: caret at the origin.
+            assert_eq!(
+                staap_run_cursor(core, cid.as_ptr(), &mut row, &mut col),
+                StaapError::Ok.code()
+            );
+            assert_eq!((row, col), (0, 0));
+            // Unknown id errors without touching the outputs.
+            let bad = CString::new("nope").unwrap();
+            assert_eq!(
+                staap_run_cursor(core, bad.as_ptr(), &mut row, &mut col),
+                StaapError::Spawn.code()
+            );
+            assert_eq!((row, col), (0, 0));
+            // Yolo default reads the config (off unless explicitly set).
+            let muse = CString::new("muse").unwrap();
+            assert_eq!(staap_yolo_default(core, muse.as_ptr()), 0);
+            let mut cfg = crate::config::Config::default();
+            cfg.agents.insert(
+                "muse".to_string(),
+                crate::config::AgentConfig {
+                    extra_args: vec![],
+                    yolo: true,
+                },
+            );
+            (*core).reg.app.set_config(cfg);
+            assert_eq!(staap_yolo_default(core, muse.as_ptr()), 1);
             staap_core_free(core);
         }
     }

@@ -6,8 +6,9 @@
 // access, and byte transport only.
 //
 // Parity wiring (same contract as the macOS/Linux shells):
-//   roster      core registry rows, grouped Needs input → Working →
-//               Idle → History, one shared selection across lists (#73)
+//   roster      core registry rows, grouped Working → Idle
+//               (needs-input shares Idle, issue #105) → History, one
+//               shared selection across lists (#73)
 //   spawn       New Session button / Ctrl+N -> bridge_run_spawn
 //               (repeat-last: null CLI/folder, zero yolo); picker button /
 //               Ctrl+Shift+N -> ContentDialog (folder x CLI + yolo) below
@@ -40,6 +41,9 @@
 #include "core_bridge.h"
 #include "json_mini.h"
 #include "picker.h"
+
+#include <shobjidl.h> // IInitializeWithWindow (folder picker owner)
+#include <microsoft.ui.xaml.window.h> // IWindowNative (picker owner HWND)
 
 #include <utility>
 
@@ -250,16 +254,16 @@ namespace winrt::StaapWinUI::implementation
      * selection, filter, and live-ness all come from the core registry —
      * spawning attaches a real row, so every run renders in the roster
      * (no shell-local terminals). Group order is fixed (issue #73):
-     * Needs input, Working, Idle, History — every row still shows its
-     * core status glyph, title, project/harness, restored every launch
-     * by staap_core_new. */
+     * Working, Idle (needs-input shares Idle, #105), History — every row
+     * still shows its core status glyph, title, and project/harness.
+     * Restored every launch by staap_core_new. */
     void MainWindow::RefreshRoster() {
         if (!m_core) {
             return;
         }
         using Rows = std::vector<std::pair<std::wstring, std::wstring>>;
         size_t n = bridge_session_count(m_core);
-        Rows needs;
+        Rows idle_attn;
         Rows working;
         Rows idle;
         Rows history;
@@ -308,30 +312,35 @@ namespace winrt::StaapWinUI::implementation
             if (!live) {
                 history.push_back(std::move(row));
             } else if (st == STAAP_STATUS_ATTENTION) {
-                needs.push_back(std::move(row));
+                idle_attn.push_back(std::move(row));
             } else if (st == STAAP_STATUS_WORKING) {
                 working.push_back(std::move(row));
             } else {
                 idle.push_back(std::move(row));
             }
         }
+        /* Issue #105: idle and needs-input share one section, with
+         * the attention rows first. */
+        for (auto &r : idle) {
+            idle_attn.push_back(std::move(r));
+        }
+        idle = std::move(idle_attn);
+
         if (fingerprint == m_fingerprint) {
             return;
         }
         m_fingerprint = fingerprint;
-        char *needs_hdr = bridge_section_title(STAAP_STATUS_ATTENTION);
         char *work_hdr = bridge_section_title(STAAP_STATUS_WORKING);
         char *idle_hdr = bridge_section_title(STAAP_STATUS_IDLE);
-        NeedsHeader().Text(winrt::hstring(
-            to_wide(needs_hdr ? needs_hdr : "Needs input") + L" (" +
-            std::to_wstring(needs.size()) + L")"));
+        /* Issue #105: the Needs-input group folds into Idle. */
+        NeedsHeader().Visibility(Visibility::Collapsed);
+        NeedsInputList().Visibility(Visibility::Collapsed);
         WorkingHeader().Text(winrt::hstring(
             to_wide(work_hdr ? work_hdr : "Working") + L" (" +
             std::to_wstring(working.size()) + L")"));
         IdleHeader().Text(winrt::hstring(
             to_wide(idle_hdr ? idle_hdr : "Idle") + L" (" +
             std::to_wstring(idle.size()) + L")"));
-        bridge_string_free(needs_hdr);
         bridge_string_free(work_hdr);
         bridge_string_free(idle_hdr);
         HistoryExpander().Header(box_value(winrt::hstring(
@@ -341,7 +350,6 @@ namespace winrt::StaapWinUI::implementation
          * by default); the toggle handler below ignores programmatic
          * moves via m_syncing so syncing never writes back. */
         HistoryExpander().IsExpanded(bridge_history_expanded(m_core) != 0);
-        RebuildGroupList(NeedsInputList(), needs);
         RebuildGroupList(WorkingList(), working);
         RebuildGroupList(IdleList(), idle);
         RebuildGroupList(HistoryList(), history);
@@ -730,10 +738,10 @@ namespace winrt::StaapWinUI::implementation
                                       RoutedEventArgs const &) {
         PickNewSessionAsync();
     }
-    /* 2D new-session dialog. Folder: a TextBox (blank = inherit) plus
-     * the persisted recents for one-click refill; a missing folder is
-     * reported in the status line with the fix named. CLI: a ComboBox
-     * over the autodetected catalog; missing CLIs render disabled with
+    /* 2D new-session dialog. Folder: Browse… (folder picker) or a
+     * TextBox (blank = inherit) plus the persisted recents; a missing
+     * folder is reported in the status line with the fix named. CLI:
+     * a ComboBox over the catalog; missing CLIs render disabled with
      * an install hint, never hidden. Yolo: a tri-state ComboBox
      * (Default / On once / Off once), safe by default; the preview line
      * names the exact combination before Spawn. */
@@ -782,6 +790,12 @@ namespace winrt::StaapWinUI::implementation
             }
         }
 
+        // Owner window for the folder picker (issue #102).
+        HWND hwnd{ nullptr };
+        if (auto native = this->try_as<IWindowNative>()) {
+            native->get_WindowHandle(&hwnd);
+        }
+
         TextBox folderBox;
         folderBox.PlaceholderText(L"Blank = current folder");
         folderBox.Text(to_wide(recents.empty() ? "" : recents[0]));
@@ -817,6 +831,11 @@ namespace winrt::StaapWinUI::implementation
                 (ci >= 0 && static_cast<size_t>(ci) < clis.size())
                     ? clis[static_cast<size_t>(ci)].id
                     : "muse";
+            /* Label "Default" with its resolved state (issue #102). */
+            std::string def_label = "Default (";
+            def_label += bridge_yolo_default(m_core, cli.c_str()) ? "on" : "off";
+            def_label += ")";
+            yoloBox.Items().SetAt(0, box_value(to_wide(def_label)));
             std::string folder = to_utf8(folderBox.Text());
             /* Core-owned preview + yolo mapping (single copies). */
             int yolo = bridge_yolo_value(yoloBox.SelectedIndex());
@@ -863,7 +882,30 @@ namespace winrt::StaapWinUI::implementation
             return h;
         };
         panel.Children().Append(head(L"Where should it work?"));
-        panel.Children().Append(folderBox);
+        StackPanel folderRow;
+        folderRow.Orientation(Orientation::Horizontal);
+        folderRow.Spacing(8);
+        folderBox.MinWidth(260);
+        Button browse;
+        browse.Content(box_value(L"Browse…"));
+        browse.Click([folderBox, hwnd](IInspectable const &,
+                                       RoutedEventArgs const &)
+                       -> fire_and_forget {
+            // Issue #102: pick the folder in the UI instead of typing it.
+            if (!hwnd) {
+                co_return;
+            }
+            winrt::Windows::Storage::Pickers::FolderPicker picker;
+            picker.FileTypeFilter().Append(L"*");
+            auto init = picker.as<IInitializeWithWindow>();
+            winrt::check_hresult(init->Initialize(hwnd));
+            if (auto picked = co_await picker.PickSingleFolderAsync()) {
+                folderBox.Text(picked.Path());
+            }
+        });
+        folderRow.Children().Append(folderBox);
+        folderRow.Children().Append(browse);
+        panel.Children().Append(folderRow);
         if (!recents.empty()) {
             panel.Children().Append(recentBox);
         }

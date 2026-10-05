@@ -89,6 +89,13 @@ import Foundation
 @_silgen_name("staap_run_spans_json") private func staap_run_spans_json(
     _ core: OpaquePointer?, _ id: UnsafePointer<CChar>?
 ) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("staap_run_cursor") private func staap_run_cursor(
+    _ core: OpaquePointer?, _ id: UnsafePointer<CChar>?,
+    _ row: UnsafeMutablePointer<UInt16>?, _ col: UnsafeMutablePointer<UInt16>?
+) -> Int32
+@_silgen_name("staap_yolo_default") private func staap_yolo_default(
+    _ core: OpaquePointer?, _ cli: UnsafePointer<CChar>?
+) -> Int32
 @_silgen_name("staap_run_exited") private func staap_run_exited(
     _ core: OpaquePointer?, _ id: UnsafePointer<CChar>?
 ) -> Bool
@@ -356,6 +363,21 @@ final class Core {
 
     func runExited(id: String) -> Bool {
         id.withCString { staap_run_exited(handle, $0) }
+    }
+
+    /// Caret cell of an attached run (0-based row/col), for placing the
+    /// view cursor after a feed (issue #104). Nil when the core errors.
+    func runCursor(id: String) -> (row: Int, col: Int)? {
+        var row: UInt16 = 0
+        var col: UInt16 = 0
+        let rc = id.withCString { staap_run_cursor(handle, $0, &row, &col) }
+        guard rc == 0 else { return nil }
+        return (Int(row), Int(col))
+    }
+
+    /// Configured yolo default for `cli` (issue #102: labels "Default").
+    func yoloDefault(_ cli: String) -> Bool {
+        cli.withCString { staap_yolo_default(handle, $0) } != 0
     }
 
     // MARK: - Shared shell helpers (one copy in the core)

@@ -314,16 +314,19 @@ pub fn section_title(status: Status) -> &'static str {
     }
 }
 
-/// Group already-sorted sessions into status sections, in [`Status`] order
-/// (attention, idle, working). Returns `(status, indices)` pairs, skipping
-/// empty buckets; within a bucket the slice order is preserved.
+/// Group already-sorted sessions into status sections: working, then
+/// idle (issue #105 folds needs-input into Idle, attention first via the
+/// sort). Returns `(status, indices)` pairs, skipping empty buckets;
+/// within a bucket the slice order is preserved.
 pub fn status_sections(sessions: &[ChatSession]) -> Vec<(Status, Vec<usize>)> {
     let mut out: Vec<(Status, Vec<usize>)> = Vec::new();
-    for status in [Status::Attention, Status::Idle, Status::Working] {
+    for status in [Status::Working, Status::Idle] {
         let ids: Vec<usize> = sessions
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.status == status)
+            .filter(|(_, s)| {
+                s.status == status || (status == Status::Idle && s.status == Status::Attention)
+            })
             .map(|(i, _)| i)
             .collect();
         if !ids.is_empty() {
@@ -334,6 +337,22 @@ pub fn status_sections(sessions: &[ChatSession]) -> Vec<(Status, Vec<usize>)> {
 }
 
 /// Basename of the current working directory, for labeling user runs.
+/// Last path component of a session folder (`~/projects/baseui`
+/// labels the run `baseui`); `None` when the path has no usable tail.
+fn dir_name(path: &str) -> Option<String> {
+    path.split(['/', '\\'])
+        .filter(|p| !p.is_empty())
+        .next_back()
+        .map(|s| s.to_string())
+}
+
+/// Project label for a new run: the chosen folder's tail when the
+/// picker named one (issue #103: the row must say `baseui-backoffice`,
+/// not the app's own directory), else the process working directory.
+fn project_name_for(cwd: Option<&str>) -> String {
+    cwd.and_then(dir_name).unwrap_or_else(current_dir_name)
+}
+
 fn current_dir_name() -> String {
     std::env::current_dir()
         .ok()
@@ -970,8 +989,10 @@ impl App {
             // never mint an id that collides with a persisted row.
             id: new_session_id(),
             title: animal_name(n),
-            project: current_dir_name(),
-            status: Status::Working,
+            project: project_name_for(selection.cwd.as_deref()),
+            // A fresh run has produced no output yet, so it reads Idle
+            // until the pump sees activity (issues #103/#105).
+            status: Status::Idle,
             harness: cli.clone(),
             last_active: now_secs(),
             pr_links: vec![],
@@ -1274,6 +1295,26 @@ mod tests {
     }
 
     #[test]
+    fn start_launch_labels_project_from_folder_and_starts_idle() {
+        use crate::launch::LaunchSelection;
+        // Issue #103: the row shows the chosen folder's tail (not the
+        // app's own directory), and a fresh run reads Idle until the
+        // pump sees output (issues #103/#105).
+        let mut app = App::new(vec![]);
+        app.start_launch(&LaunchSelection::new(
+            "claude".to_string(),
+            Some("/Users/greg/projects/baseui-backoffice".to_string()),
+            false,
+        ));
+        let row = app.sessions.last().unwrap();
+        assert_eq!(row.project, "baseui-backoffice");
+        assert_eq!(row.status, Status::Idle);
+        assert_eq!(dir_name("C:\\projects\\baseui").as_deref(), Some("baseui"));
+        assert_eq!(dir_name("/").as_deref(), None);
+        assert_eq!(dir_name("").as_deref(), None);
+    }
+
+    #[test]
     fn new_runs_get_animal_titles_until_first_prompt() {
         assert_eq!(animal_name(1), "otter");
         assert_eq!(animal_name(2), "fox");
@@ -1399,26 +1440,37 @@ mod tests {
     }
 
     #[test]
-    fn sections_group_by_status_in_sort_order_skipping_empty() {
+    fn sections_group_needs_input_into_idle_working_first() {
         let v = vec![
             sess("w1", Status::Working, 9),
             sess("i1", Status::Idle, 1),
             sess("a1", Status::Attention, 1),
             sess("w2", Status::Working, 2),
         ];
-        // NB: not sorted; sections still bucket in Attention/Idle/Working
-        // order and preserve slice order within a bucket.
+        // NB: not sorted; sections still bucket Working, then Idle
+        // (needs-input folds into Idle — issue #105), preserving slice
+        // order within a bucket.
         let sections = status_sections(&v);
-        assert_eq!(sections.len(), 3);
-        assert_eq!(sections[0].0, Status::Attention);
-        assert_eq!(sections[0].1, vec![2]);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].0, Status::Working);
+        assert_eq!(sections[0].1, vec![0, 3]);
         assert_eq!(sections[1].0, Status::Idle);
-        assert_eq!(sections[1].1, vec![1]);
-        assert_eq!(sections[2].0, Status::Working);
-        assert_eq!(sections[2].1, vec![0, 3]);
+        assert_eq!(sections[1].1, vec![1, 2]);
+        // No standalone Needs-input section remains (glyphs + badge persist).
         assert_eq!(section_title(Status::Attention), "Needs input");
         assert_eq!(section_title(Status::Idle), "Idle");
         assert_eq!(section_title(Status::Working), "Active");
+        // Sorted input lists attention first inside the merged Idle bucket.
+        let mut sorted = vec![
+            sess("w1", Status::Working, 9),
+            sess("i1", Status::Idle, 1),
+            sess("a1", Status::Attention, 1),
+            sess("w2", Status::Working, 2),
+        ];
+        sort_sessions(&mut sorted);
+        let sections = status_sections(&sorted);
+        assert_eq!(sections[1].0, Status::Idle);
+        assert_eq!(sections[1].1, vec![0, 1]);
         // Empty buckets are skipped.
         let only_idle = vec![sess("i", Status::Idle, 1)];
         let sections = status_sections(&only_idle);
