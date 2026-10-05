@@ -822,27 +822,38 @@ static void picker_closed(AdwDialog *dialog, gpointer data) {
 }
 
 /* Directory picker for the folder axis (issue #102): choosing in the
- * UI beats typing a path. */
+ * UI beats typing a path. GtkFileDialog is async (GTK 4.10+), so
+ * the folder lands through its callback; the entry is reffed for
+ * the flight so a picker closed meanwhile cannot dangle, and a
+ * detached entry (closed picker) is left alone. */
+static void picker_choose_folder_done(GObject *src, GAsyncResult *res,
+                                      gpointer data) {
+    GtkEntry *folder = GTK_ENTRY(data);
+    GError *err = NULL;
+    GFile *file = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src),
+                                                       res, &err);
+    g_clear_error(&err);
+    if (file && gtk_widget_get_root(GTK_WIDGET(folder))) {
+        char *path = g_file_get_path(file);
+        if (path) {
+            gtk_editable_set_text(GTK_EDITABLE(folder), path);
+            g_free(path);
+        }
+    }
+    if (file) {
+        g_object_unref(file);
+    }
+    g_object_unref(folder);
+}
 static void picker_choose_folder(GtkButton *btn, gpointer data) {
     (void)btn;
     PickerUi *pu = data;
     GtkWindow *win =
         GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(pu->folder)));
-    GtkFileChooserNative *dlg = gtk_file_chooser_native_new(
-        "Choose a folder", win, GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
-        "_Open", "_Cancel");
-    if (gtk_native_dialog_run(GTK_NATIVE_DIALOG(dlg))
-        == GTK_RESPONSE_ACCEPT) {
-        GFile *file = gtk_file_chooser_get_file(GTK_FILE_CHOOSER(dlg));
-        char *path = file ? g_file_get_path(file) : NULL;
-        if (path) {
-            gtk_editable_set_text(GTK_EDITABLE(pu->folder), path);
-            g_free(path);
-        }
-        if (file) {
-            g_object_unref(file);
-        }
-    }
+    GtkFileDialog *dlg = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dlg, "Choose a folder");
+    gtk_file_dialog_select_folder(dlg, win, NULL, picker_choose_folder_done,
+                                  g_object_ref(pu->folder));
     g_object_unref(dlg);
 }
 /* Open the 2D picker dialog: folder entry + recents, CLI radio rows
@@ -1132,6 +1143,8 @@ static gboolean on_key_pressed(GtkEventControllerKey *ctl, guint keyval,
 /* ------------------------------------------------------------------ */
 /* Pump: the shell's only repaint gate (mirrors AppState.pump). */
 /* ------------------------------------------------------------------ */
+
+static void feed_to_vte(Shell *sh, const char *feed);
 
 /* Place the VTE cursor where the child put it (issue #104): fed snapshot
  * text alone would leave it at the end of fed output. */

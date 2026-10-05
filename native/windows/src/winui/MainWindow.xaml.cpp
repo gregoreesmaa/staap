@@ -745,6 +745,22 @@ namespace winrt::StaapWinUI::implementation
      * an install hint, never hidden. Yolo: a tri-state ComboBox
      * (Default / On once / Off once), safe by default; the preview line
      * names the exact combination before Spawn. */
+    /* Issue #102: folder picker coroutine. Kept outside the Click
+     * lambda because XAML event delegates take void handlers, not
+     * coroutines. */
+    static fire_and_forget BrowseFolderAsync(TextBox folderBox, HWND hwnd) {
+        if (!hwnd) {
+            co_return;
+        }
+        winrt::Windows::Storage::Pickers::FolderPicker picker;
+        picker.FileTypeFilter().Append(L"*");
+        auto init = picker.as<IInitializeWithWindow>();
+        winrt::check_hresult(init->Initialize(hwnd));
+        if (auto picked = co_await picker.PickSingleFolderAsync()) {
+            folderBox.Text(picked.Path());
+        }
+    }
+
     fire_and_forget MainWindow::PickNewSessionAsync() {
         auto lifetime = get_strong();
         if (!m_core) {
@@ -889,19 +905,9 @@ namespace winrt::StaapWinUI::implementation
         Button browse;
         browse.Content(box_value(L"Browse…"));
         browse.Click([folderBox, hwnd](IInspectable const &,
-                                       RoutedEventArgs const &)
-                       -> fire_and_forget {
+                                       RoutedEventArgs const &) {
             // Issue #102: pick the folder in the UI instead of typing it.
-            if (!hwnd) {
-                co_return;
-            }
-            winrt::Windows::Storage::Pickers::FolderPicker picker;
-            picker.FileTypeFilter().Append(L"*");
-            auto init = picker.as<IInitializeWithWindow>();
-            winrt::check_hresult(init->Initialize(hwnd));
-            if (auto picked = co_await picker.PickSingleFolderAsync()) {
-                folderBox.Text(picked.Path());
-            }
+            BrowseFolderAsync(folderBox, hwnd);
         });
         folderRow.Children().Append(folderBox);
         folderRow.Children().Append(browse);
