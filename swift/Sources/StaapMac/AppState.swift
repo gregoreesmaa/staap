@@ -28,6 +28,9 @@ final class AppState: ObservableObject {
     }
 
     @Published var pendingError: String?
+    /// Row ids whose parsed links render expanded (issue #103: "1 link"
+    /// opens the actual URLs instead of only counting them).
+    @Published var expandedLinks: Set<String> = []
     /// 2D-launch picker sheet visibility (set by the menu, the caret,
     /// or Cmd-Shift-N; the sheet resets it on dismiss).
     @Published var pickerOpen = false
@@ -229,6 +232,33 @@ final class AppState: ObservableObject {
     func pickerRecents() -> [String] { core.recentFolders() }
 
     func hasLivePty(_ id: String) -> Bool { core.isLive(id) }
+
+    /// Toggle the inline link list for a row (issue #103).
+    func toggleLinks(_ id: String) {
+        if expandedLinks.contains(id) {
+            expandedLinks.remove(id)
+        } else {
+            expandedLinks.insert(id)
+        }
+    }
+
+    /// Full current text + feed sequence for a row: a (re)created
+    /// terminal view replays this so switching rows never shows a stale
+    /// session (issue #106).
+    func replayText(for rowId: String) -> (text: String, seq: UInt64) {
+        (fedText[rowId, default: ""], feeds[rowId]?.seq ?? 0)
+    }
+
+    /// Caret cell for a row, for placing the view cursor after a feed
+    /// (issue #104). Nil when the core cannot answer.
+    func coreCursor(for rowId: String) -> (row: Int, col: Int)? {
+        core.runCursor(id: rowId)
+    }
+
+    /// "Default (on/off)" label for the picker's yolo row (issue #102).
+    func yoloDefaultLabel(cli: String) -> String {
+        core.yoloDefault(cli) ? "Default (on)" : "Default (off)"
+    }
 
     func sendToPty(rowId: String, bytes: [UInt8]) {
         do {

@@ -385,7 +385,15 @@ pub fn snapshot_rows(screen: &vt100::Screen) -> Vec<Vec<SnapSpan>> {
                 });
                 cur = style;
             }
-            buf.push_str(&cell.contents());
+            // Never-written grid cells carry no contents; render the gap
+            // as a space so cursor-addressed words keep their separation
+            // (issue #104: "Runningthetest" in the spans-fed shells).
+            let text = cell.contents();
+            if text.is_empty() {
+                buf.push(' ');
+            } else {
+                buf.push_str(&text);
+            }
         }
         if open {
             spans.push(SnapSpan {
@@ -1089,6 +1097,21 @@ mod tests {
         assert!(contents.contains("middle"));
         let cell = screen.cell(4, 9).expect("addressed cell exists");
         assert!(cell.contents().contains("m"));
+    }
+
+    #[test]
+    fn snapshot_rows_preserves_spaces_between_addressed_words() {
+        // Issue #104: a TUI writes words at addressed columns, leaving
+        // never-written gaps between them. The spans snapshot must render
+        // those gaps as spaces, or shells show "Runningthetest".
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"\x1b[1;1H\xe2\x97\x8f\x1b[1;3HRunning\x1b[1;11Hthe");
+        let rows = snapshot_rows(parser.screen());
+        let line: String = rows[0].iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            line.starts_with("\u{25cf} Running the"),
+            "gaps stay spaces, got {line:?}"
+        );
     }
 
     #[test]

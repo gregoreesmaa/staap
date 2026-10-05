@@ -27,6 +27,7 @@
 #define STAAP_CORE_BRIDGE_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "staap.h"
 
@@ -158,6 +159,11 @@ char *bridge_run_screen_text(const StaapCore *core, const char *id);
 char *bridge_run_spans_json(const StaapCore *core, const char *id);
 int bridge_run_exited(const StaapCore *core, const char *id);
 
+/* Caret cell of an attached run, 0-based (issue #104). Returns 0 on
+ * success with `*row_out`/`*col_out` set; nonzero leaves them alone. */
+int bridge_run_cursor(const StaapCore *core, const char *id,
+                      uint16_t *row_out, uint16_t *col_out);
+
 /* Single shared key table: encode one logical key name + typed char
  * into child bytes. Returns the byte count in `bytes_out` (up to `cap`
  * bytes), 0 when the native control keeps the key, -1 on null key. */
@@ -175,6 +181,9 @@ char *bridge_spawn_preview(const char *cli, const char *folder, int yolo);
 
 /* Tri-state yolo int from a segmented-control index. */
 int bridge_yolo_value(int selected);
+
+/* Configured yolo default for `cli` (1 = on, 0 = off; issue #102). */
+int bridge_yolo_default(const StaapCore *core, const char *cli);
 
 /* Human age (`just now`, `5m ago`, ...), status glyph, section header.
  * Malloc'd; free with bridge_string_free(). */

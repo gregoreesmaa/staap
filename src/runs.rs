@@ -25,7 +25,10 @@ use crate::shell_shared::MAX_LIVE_RUNS;
 /// (unchanged screens skip re-scanning — same rule as `gui::runs::Run`).
 pub struct LiveRun {
     pub pty: EmbeddedPty,
-    pub last_output: Instant,
+    /// When the child last produced output (`None` until the first pump
+    /// observes any: a fresh run reads Idle, not Working — issues
+    /// #103/#105).
+    pub last_output: Option<Instant>,
     pub attention: bool,
 }
 
@@ -33,7 +36,7 @@ impl LiveRun {
     pub fn new(pty: EmbeddedPty) -> Self {
         Self {
             pty,
-            last_output: Instant::now(),
+            last_output: None,
             attention: false,
         }
     }
@@ -43,7 +46,7 @@ impl LiveRun {
     pub fn pump(&mut self) -> bool {
         let exited_before = self.pty.view().exited;
         if self.pty.pump() {
-            self.last_output = Instant::now();
+            self.last_output = Some(Instant::now());
             true
         } else {
             self.pty.view().exited != exited_before
@@ -110,12 +113,12 @@ impl RunRegistry {
         self.runs.len()
     }
 
-    /// Attach a spawned PTY to a roster row (records output recency,
-    /// clears any sticky error — same success rule as
+    /// Attach a spawned PTY to a roster row (clears any sticky error —
+    /// same success rule as
     /// `gui::spawn::note_spawn_success`).
     pub fn attach(&mut self, id: &str, pty: EmbeddedPty) {
-        let mut run = LiveRun::new(pty);
-        run.last_output = Instant::now();
+        let run = LiveRun::new(pty);
+        // Recency stays None until the pump observes output (issues #103/#105).
         self.runs.insert(id.to_string(), run);
         self.app.clear_error();
     }
@@ -203,7 +206,7 @@ impl RunRegistry {
             let age = self
                 .runs
                 .get(&id)
-                .map(|run| now.duration_since(run.last_output));
+                .and_then(|run| run.last_output.map(|t| now.duration_since(t)));
             let status = classify_with_attention(attention, age, exited);
             if let Some(s) = self.app.sessions.iter_mut().find(|s| s.id == id) {
                 if s.status != status {
@@ -229,8 +232,8 @@ impl RunRegistry {
                 continue;
             }
             let run = &self.runs[&s.id];
-            let age = now2.duration_since(run.last_output);
-            let status = classify_with_attention(run.attention, Some(age), run.exited());
+            let age = run.last_output.map(|t| now2.duration_since(t));
+            let status = classify_with_attention(run.attention, age, run.exited());
             if s.status != status {
                 s.status = status;
                 decayed = true;
@@ -320,6 +323,18 @@ mod tests {
             vec!["https://github.com/acme/app/pull/42".to_string()]
         );
         assert_eq!(s.status, Status::Attention);
+    }
+
+    #[test]
+    fn registry_fresh_run_reads_idle_until_output() {
+        // Issues #103/#105: a just-attached run has produced no output
+        // yet, so the pump must leave it Idle (never Working).
+        let mut reg = RunRegistry::new(vec![sess("a", Status::Idle)]);
+        reg.attach("a", live_run("sleep", &["5"]).pty);
+        for _ in 0..10 {
+            reg.pump_all();
+        }
+        assert_eq!(reg.app.sessions[0].status, Status::Idle);
     }
 
     #[test]

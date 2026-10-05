@@ -783,7 +783,6 @@ mod tests {
         .unwrap();
         view.runs
             .insert(id.clone(), super::super::runs::Run::new(pty));
-        view.runs.get_mut(&id).unwrap().last_output = std::time::Instant::now();
         for _ in 0..50 {
             view.refresh();
             std::thread::sleep(std::time::Duration::from_millis(20));
