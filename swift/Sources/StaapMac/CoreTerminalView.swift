@@ -150,10 +150,43 @@ struct CoreTerminalView: NSViewRepresentable {
         let now = Date()
         guard now.timeIntervalSince(lastProbeLog) > 2 else { return }
         lastProbeLog = now
-        let line = "staap caret-probe row=\(rowId) core=(\(core.row),\(core.col)) view=(\(loc.y),\(loc.x)) drawnRow=\(drawnRow) grid=\(term.cols)x\(term.rows) fed=\(fed)\n"
+        // Raw frame numbers validate the drawnRow math; sync flags a
+        // transient mid-block sample (displays pause inside DEC 2026).
+        let sync = term.synchronizedOutputActive
+        let scroll = view.scrollPosition
+        // Text-shift check: the view's visible tail vs the core snapshot
+        // tail. A parse divergence lands text on different rows than the
+        // core thinks while both carets still agree.
+        let yDisp = term.getTopVisibleRow()
+        let vtext = term.getText(start: Position(col: 0, row: yDisp), end: Position(col: term.cols, row: yDisp + term.rows))
+        let snapLines = stripProbeSGR(state.replayText(for: rowId).text).split(separator: "\n", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+        let viewLines = vtext.split(separator: "\n", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+        let tail = min(min(snapLines.count, viewLines.count), term.rows)
+        let snapTail = snapLines.suffix(tail).joined(separator: "|")
+        let viewTail = viewLines.suffix(tail).joined(separator: "|")
+        let line = "staap caret-probe row=\(rowId) core=(\(core.row),\(core.col)) view=(\(loc.y),\(loc.x)) drawnRow=\(drawnRow) grid=\(term.cols)x\(term.rows) fed=\(fed) sync=\(sync) frameRatio=\(frame.minY)/\(frame.height)/\(view.bounds.height) flipped=\(view.isFlipped) scroll=\(scroll) textMatch=\(snapTail == viewTail) snap=\(String(snapTail.prefix(160))) view=\(String(viewTail.prefix(160)))\n"
         if let data = line.data(using: .utf8) {
             try? FileHandle.standardError.write(contentsOf: data)
         }
+    }
+
+    /// SGR-only strip for the probe's snapshot tail (the styled render
+    /// carries `ESC [ params m` runs; plain snapshots pass through).
+    private func stripProbeSGR(_ s: String) -> String {
+        var out = ""
+        out.reserveCapacity(s.count)
+        var i = s.startIndex
+        while i < s.endIndex {
+            if s[i] == "\u{1B}", let nxt = s.index(i, offsetBy: 1, limitedBy: s.endIndex), nxt < s.endIndex, s[nxt] == "[" {
+                var j = s.index(after: nxt)
+                while j < s.endIndex, s[j] != "m" { j = s.index(after: j) }
+                i = j < s.endIndex ? s.index(after: j) : j
+            } else {
+                out.append(s[i])
+                i = s.index(after: i)
+            }
+        }
+        return out
     }
 
     /// CRLF normalization for full replays (mirrors the shared feed
