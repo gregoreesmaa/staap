@@ -99,17 +99,32 @@ def find_window(rgb, w, h):
 
 
 def find_divider(gray, w, h, win_left):
-    """Find the sidebar split divider: a mid-bright column spanning height."""
+    """Find the sidebar split divider: a vertical edge spanning height.
+
+    Modern sidebar chrome is a faint hairline (a brightness step, not a
+    dark line), so score columns by sustained horizontal gradient first
+    and keep the old mid-bright scan as a fallback.
+    """
     lo = win_left + 120
     hi = min(win_left + 700, w - 10)
     if hi <= lo:
         fail_infra("window too narrow for a sidebar band")
     data = list(gray.getdata())
-    best_x, best_score = -1, 0.0
     y0, y1 = 120, h - 30
     if y1 <= y0:
         fail_infra("screenshot too short")
     span = y1 - y0
+    best_x, best_score = -1, 0.0
+    for x in range(lo + 1, hi - 1):
+        edge = 0
+        for y in range(y0, y1):
+            if abs(data[y * w + x - 1] - data[y * w + x + 1]) >= 4:
+                edge += 1
+        score = edge / span
+        if score > best_score:
+            best_score, best_x = score, x
+    if best_score >= 0.45:
+        return best_x, best_score
     for x in range(lo, hi):
         mid = 0
         for y in range(y0, y1):
@@ -124,24 +139,73 @@ def find_divider(gray, w, h, win_left):
     return best_x, best_score
 
 
-def text_lines(band, density, repair_ratio):
-    """Bright runs as (y0, y1, min_x) triples.
+def window_bottom(gray, w, x0, x1, y0, y1):
+    """Bottom edge of the app window: first sustained drop to desktop.
 
-    Detached dots and descenders rejoin first: gaps at or below a
-    fraction of the row pitch are glyph fragments, not line breaks.
+    Keeps the dock (and anything below the window) out of the sidebar
+    band. Relative to the window interior, so light and dark chrome
+    both work; falls back to the full height when no edge is found.
+    """
+    data = list(gray.getdata())
+    width = max(1, x1 - x0)
+
+    def row_mean(y):
+        return sum(data[y * w + x] for x in range(x0, x1)) / width
+
+    # Reference from the window interior (first 100 rows are always
+    # chrome + sidebar), halved as the edge threshold so light and
+    # dark chrome both work; absolute 60 caps it on bright themes.
+    ref_rows = [row_mean(y) for y in range(y0, min(y0 + 100, y1))]
+    ref_rows.sort()
+    threshold = min(60.0, ref_rows[len(ref_rows) // 2] * 0.5)
+    dark_run = 0
+    for y in range(y0 + 100, y1):
+        if row_mean(y) < threshold:
+            dark_run += 1
+            if dark_run >= 20:
+                return y - dark_run + 1
+        else:
+            dark_run = 0
+    return y1
+
+
+def text_lines(band, density, repair_ratio, light_bg):
+    """Text runs as (y0, y1, min_x) triples.
+
+    The band background sets the polarity: dark glyphs on a light
+    sidebar, bright glyphs on a dark one. Detached dots and descenders
+    rejoin first: gaps at or below a fraction of the row pitch are
+    glyph fragments, not line breaks.
     """
     w, h = band.size
     data = list(band.getdata())
+
+    def is_text(v):
+        # Thresholds sit between the sidebar chrome and the glyphs:
+        # light sidebar (~242, hairline above it) vs primary/secondary/
+        # tertiary glyphs (at or below ~200); dark sidebar vs glyphs
+        # above 100. Both polarities keep headers left of the row inset.
+        return v < 200 if light_bg else v > 100
+
     rows = []
     for y in range(h):
-        bright = 0
-        min_x = w
         base = y * w
-        for x in range(w):
-            if data[base + x] > 100:
-                bright += 1
-                if x < min_x:
-                    min_x = x
+        runs = []
+        x = 0
+        while x < w:
+            if is_text(data[base + x]):
+                s = x
+                while x < w and is_text(data[base + x]):
+                    x += 1
+                runs.append((s, x - s))
+            else:
+                x += 1
+        # Window chrome touching the band edge (frame/shadow) is not
+        # text: drop runs starting at x=0 so they neither trigger rows
+        # nor drag min_x to the edge.
+        runs = [r for r in runs if r[0] > 0]
+        bright = sum(r[1] for r in runs)
+        min_x = runs[0][0] if runs else w
         if bright / w >= density:
             rows.append((y, min_x))
     raw = []
@@ -189,10 +253,16 @@ def main():
     y0 = win_top + 70
     if x1 - x0 < 80:
         fail_infra("sidebar band too narrow (%dpx)" % (x1 - x0))
-    band = gray.crop((x0, y0, x1, h - 10))
+    bottom = window_bottom(gray, w, x0, x1, y0, h - 10)
+    band = gray.crop((x0, y0, x1, bottom))
     inset_cut = ROW_INSET_RATIO * band.size[0]
 
-    lines = text_lines(band, args.density, args.repair_ratio)
+    # Sidebar polarity follows the system appearance: the band mean
+    # says whether glyphs read dark-on-light or light-on-dark.
+    pixels = list(band.getdata())
+    light_bg = sum(pixels) / max(1, len(pixels)) > 128
+
+    lines = text_lines(band, args.density, args.repair_ratio, light_bg)
     if len(lines) < 2:
         print("sidebar_shot_check FAIL: only %d text line(s) in sidebar "
               "(window=(%d,%d) divider=%d)" % (len(lines), win_left,

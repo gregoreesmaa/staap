@@ -1,3 +1,4 @@
+import ShellSupport
 import SwiftUI
 
 /// macOS shell over the core staticlib (issue #62).
@@ -17,13 +18,13 @@ struct StaapMacApp: App {
         let state = AppState(core: core)
         _appState = StateObject(wrappedValue: state)
         delegate.state = state
-        // Screenshot-seed spawns (CI mock captures): --shot-spawn=N
-        // attaches N real runs up front so captures show live rows.
-        if let raw = CommandLine.arguments.first(where: { $0.hasPrefix("--shot-spawn=") }),
-           let count = Int(raw.dropFirst("--shot-spawn=".count)), count > 0
-        {
+        // Screenshot-seed spawns (CI mock captures): --shot-spawn N or
+        // --shot-spawn=N attaches N real runs up front so captures
+        // show live rows (shared ShellSupport parsing).
+        let shotCount = shotSpawnCount(CommandLine.arguments)
+        if shotCount > 0 {
             MainActor.assumeIsolated {
-                for _ in 0 ..< count {
+                for _ in 0 ..< shotCount {
                     state.repeatLastSession()
                 }
             }
