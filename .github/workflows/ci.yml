@@ -142,8 +142,11 @@ jobs:
           # Structural pixel check over the capture: three live Working rows
           # must render as distinct two-line rows (no merged/overprinted
           # lines). Reference-free; prints diagnostics and an annotated PNG.
-          python3 -m pip install --quiet pillow
-          python3 swift/Tests/sidebar_shot_check.py dist/macos-mock.png \
+          # macos-latest python is externally managed (PEP 668), so the
+          # check runs in a project-local venv, not the system interpreter.
+          python3 -m venv .venv-shot
+          .venv-shot/bin/pip install --quiet pillow
+          .venv-shot/bin/python swift/Tests/sidebar_shot_check.py dist/macos-mock.png \
             --expect-rows 3 --annotate dist/macos-mock-annotated.png
       - name: upload annotated check
         if: always()
