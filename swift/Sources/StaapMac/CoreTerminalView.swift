@@ -1,4 +1,5 @@
 import AppKit
+import ShellSupport
 import SwiftTerm
 import SwiftUI
 
@@ -99,11 +100,10 @@ struct CoreTerminalView: NSViewRepresentable {
         }
 
         /// Feed anything the pump produced since the last drain, then place
-        /// the same-tick caret. The cursor rides with its snapshot (both
-        /// captured in one pump tick): feeding text alone leaves the caret
-        /// at the end of the stream, which is a line off for cursor-addressed
-        /// programs, and a live read ticks later crosses the snapshot it
-        /// positions. Static screens re-place only on moves.
+        /// the same-tick caret. Chunks arrive pre-anchored (absolute CUP
+        /// plus delta) or as position-independent resyncs, so a
+        /// cursor-addressed caret mid-screen cannot shift the grid.
+        /// Static screens re-place only on moves.
         func drainFeed(into view: TerminalView) {
             let seq = state.feedSeq(for: rowId)
             var fed = false
@@ -116,7 +116,7 @@ struct CoreTerminalView: NSViewRepresentable {
             }
             guard let cursor = state.coreCursor(for: rowId) else { return }
             if fed || cursor.row != lastPlacedRow || cursor.col != lastPlacedCol {
-                view.feed(text: cup(cursor))
+                view.feed(text: cupPosition(row: cursor.row, col: cursor.col))
                 lastPlacedRow = cursor.row
                 lastPlacedCol = cursor.col
             }
@@ -128,12 +128,6 @@ struct CoreTerminalView: NSViewRepresentable {
         fileprivate static func normalized(_ text: String) -> String {
             text.replacingOccurrences(of: "\r\n", with: "\n")
                 .replacingOccurrences(of: "\n", with: "\r\n")
-        }
-
-        /// Absolute CUP (1-based) for a 0-based core caret cell.
-        private func cup(_ cursor: (row: Int, col: Int)) -> String {
-            String(Character(UnicodeScalar(UInt8(27)))) + "["
-                + String(cursor.row + 1) + ";" + String(cursor.col + 1) + "H"
         }
 
         /// Poll the feed cache on the main runloop so the terminal stays

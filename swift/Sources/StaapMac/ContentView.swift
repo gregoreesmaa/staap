@@ -124,6 +124,14 @@ struct ContentView: View {
                 // No row animations: the roster re-sorts live and a torn
                 // insert/delete crossfade paints two rows as one.
                 .transaction { $0.animation = nil }
+                // Fresh List on membership/order changes: cell reuse can
+                // leave a stale cell painting the previous row behind the
+                // new one (overprinted titles, frozen while live rows
+                // move). Recreating the List exactly when the visible row
+                // sequence changes drops every reused cell, so a ghost can
+                // never stick; in-place updates keep the instance and the
+                // scroll position.
+                .id(rosterSequenceID)
                 // No sidebar footer: Restart/Close ride the New Session
                 // menu, row context menus, keyboard shortcuts, and the
                 // detail pane (Windows parity — no headings, no footer).
@@ -161,6 +169,18 @@ struct ContentView: View {
     private struct StatusSection {
         var status: Int
         var rows: [SessionRow]
+    }
+
+    /// Visible row sequence: membership plus order, for the List’s
+    /// structural identity. Sections and the (maybe collapsed) history
+    /// read the same filtered rows the List renders, so the key moves
+    /// exactly when cells would have to move.
+    private var rosterSequenceID: String {
+        let active = statusSections.flatMap { $0.rows.map(\.id) }
+            .joined(separator: ",")
+        let history = state.historyExpanded
+            ? state.historyRows.map(\.id).joined(separator: ",") : "-"
+        return active + "|" + history
     }
 
     /// Shared group order (matches the core): Working, then Idle over

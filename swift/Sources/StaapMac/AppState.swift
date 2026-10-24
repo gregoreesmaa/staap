@@ -401,12 +401,26 @@ final class AppState: ObservableObject {
             if let feed = Core.feedDelta(old: shown, new: current),
                !feed.isEmpty
             {
-                // Accumulate, never overwrite: the view drains at its own
-                // cadence and an overwritten delta is lost output (the grid
-                // drifts and the cursor lands a line off). Concatenated
-                // deltas compose: a later clear+replay resets whatever
-                // came before (see FeedBacklog).
-                feeds[id, default: FeedBacklog()].push(feed)
+                // A relative delta assumes the view cursor sits at
+                // the end of the shown text. A cursor-addressed
+                // caret (fullscreen TUIs) rests mid-screen instead:
+                // feeding the delta from there prints from the
+                // wrong cell and every line below lands a row off.
+                // Re-anchor first with an absolute CUP (exact for
+                // the ASCII tails the fast path runs on; anything
+                // else resyncs, which is position-independent).
+                // Accumulate, never overwrite: the view drains at
+                // its own cadence and an overwritten delta is lost
+                // output. Concatenated deltas compose: a later
+                // clear+replay resets whatever came before
+                // (see FeedBacklog).
+                if let end = snapshotEnd(shown) {
+                    feeds[id, default: FeedBacklog()].push(
+                        cupPosition(row: end.row, col: end.col) + feed)
+                } else {
+                    feeds[id, default: FeedBacklog()].push(
+                        resyncFeed(current: current))
+                }
             }
             fedText[id] = current
             // Same-tick caret for the exact snapshot above: the view
