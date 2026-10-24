@@ -137,6 +137,15 @@ jobs:
           path: |
             dist/macos-mock.png
             dist/shot-app.log
+      - name: shot-check unit tests (overlap gate logic)
+        run: |
+          # Regression suite for the overlap check itself: synthetic
+          # captures pin divider finding, polarity, window cropping,
+          # and row grouping, so the gate cannot silently rot. Uses
+          # the same project-local venv (PEP 668 system python).
+          python3 -m venv .venv-shot
+          .venv-shot/bin/pip install --quiet pillow
+          .venv-shot/bin/python -m unittest discover -s swift/Tests -p "test_*.py"
       - name: sidebar overlap check (live mock rows)
         run: |
           # Structural pixel check over the capture: three live Working rows

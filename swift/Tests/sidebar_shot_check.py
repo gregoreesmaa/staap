@@ -233,6 +233,55 @@ def text_lines(band, density, repair_ratio, light_bg):
     return [(a, b, m) for a, b, m in lines]
 
 
+def analyze_lines(lines, join_ratio, inset_cut):
+    """Group text lines into sidebar rows.
+
+    Returns (multis, others, grouped, pitch, join, tall_single) where
+    multis are two-line rows (or tall singles: a title/subtitle pair
+    bridged by a descender) and others are 3+-line groups, i.e.
+    vertically overprinted rows. Every group is kept for annotation.
+    """
+    gaps = [lines[i + 1][0] - lines[i][1] for i in range(len(lines) - 1)]
+    pitch = sorted(gaps)[3 * len(gaps) // 4]
+    join = max(2.0, join_ratio * pitch)
+    tall = tall_single_for(lines)
+
+    grouped = []
+    cur = [lines[0]]
+    for ln in lines[1:]:
+        if ln[0] - cur[-1][1] < join:
+            cur.append(ln)
+        else:
+            grouped.append(cur)
+            cur = [ln]
+    grouped.append(cur)
+
+    multis = [g for g in grouped
+              if (len(g) == 2 and is_row(g, inset_cut))
+              or is_tall_single(g, inset_cut, tall)]
+    others = [g for g in grouped
+              if len(g) >= 3 and is_row(g, inset_cut)]
+    return multis, others, grouped, pitch, join, tall
+
+
+def is_row(g, inset_cut):
+    return min(ln[2] for ln in g) >= inset_cut
+
+
+def tall_single_for(lines):
+    # Tall-blob reference: the first three lines are always chrome
+    # (button, filter, first header) at single-line height, so their
+    # median anchors the row height no matter how many rows follow.
+    chrome = sorted(ln[1] - ln[0] + 1 for ln in lines[:3])
+    return 1.7 * chrome[len(chrome) // 2]
+
+
+def is_tall_single(g, inset_cut, tall_single):
+    return (len(g) == 1
+            and g[0][1] - g[0][0] + 1 >= tall_single
+            and is_row(g, inset_cut))
+
+
 def main():
     ap = argparse.ArgumentParser(description="sidebar overlap check")
     ap.add_argument("png")
@@ -269,37 +318,8 @@ def main():
               "(window=(%d,%d) divider=%d)" % (len(lines), win_left,
                                                win_top, divider))
         sys.exit(1)
-    gaps = [lines[i + 1][0] - lines[i][1] for i in range(len(lines) - 1)]
-    pitch = sorted(gaps)[3 * len(gaps) // 4]
-    join = max(2.0, args.join_ratio * pitch)
-
-    grouped = []
-    cur = [lines[0]]
-    for ln in lines[1:]:
-        if ln[0] - cur[-1][1] < join:
-            cur.append(ln)
-        else:
-            grouped.append(cur)
-            cur = [ln]
-    grouped.append(cur)
-
-    def is_row(g):
-        return min(ln[2] for ln in g) >= inset_cut
-
-    # Tall-blob reference: the first three lines are always chrome
-    # (button, filter, first header) at single-line height, so their
-    # median anchors the row height no matter how many rows follow.
-    chrome = sorted(ln[1] - ln[0] + 1 for ln in lines[:3])
-    tall_single = 1.7 * chrome[len(chrome) // 2]
-
-    def is_tall_single(g):
-        return (len(g) == 1
-                and g[0][1] - g[0][0] + 1 >= tall_single
-                and is_row(g))
-
-    multis = [g for g in grouped
-              if (len(g) == 2 and is_row(g)) or is_tall_single(g)]
-    others = [g for g in grouped if len(g) >= 3 and is_row(g)]
+    multis, others, grouped, pitch, join, tall_single = analyze_lines(
+        lines, args.join_ratio, inset_cut)
 
     print("sidebar_shot_check: window=(%d,%d) divider=%d(score %.2f) "
           "band=%dx%d lines=%d groups=%d multis=%d others=%d "
@@ -310,15 +330,16 @@ def main():
     for g in grouped:
         print("  group y=%d..%d nlines=%d row=%s" % (y0 + g[0][0],
                                                      y0 + g[-1][1], len(g),
-                                                     is_row(g)))
+                                                     is_row(g, inset_cut)))
 
     if args.annotate:
         out = img.convert("RGB")
         draw = ImageDraw.Draw(out)
         for g in grouped:
-            if ((len(g) == 2 and is_row(g)) or is_tall_single(g)):
+            if ((len(g) == 2 and is_row(g, inset_cut))
+                    or is_tall_single(g, inset_cut, tall_single)):
                 color = (80, 200, 80)
-            elif len(g) >= 3 and is_row(g):
+            elif len(g) >= 3 and is_row(g, inset_cut):
                 color = (230, 70, 70)
             else:
                 color = (220, 180, 60)

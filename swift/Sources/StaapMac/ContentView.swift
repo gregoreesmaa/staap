@@ -176,11 +176,10 @@ struct ContentView: View {
     /// read the same filtered rows the List renders, so the key moves
     /// exactly when cells would have to move.
     private var rosterSequenceID: String {
-        let active = statusSections.flatMap { $0.rows.map(\.id) }
-            .joined(separator: ",")
-        let history = state.historyExpanded
-            ? state.historyRows.map(\.id).joined(separator: ",") : "-"
-        return active + "|" + history
+        rosterSequenceKey(
+            active: statusSections.flatMap { $0.rows.map(\.id) },
+            history: state.historyExpanded
+                ? state.historyRows.map(\.id) : nil)
     }
 
     /// Shared group order (matches the core): Working, then Idle over
