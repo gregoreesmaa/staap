@@ -390,7 +390,7 @@ final class AppState: ObservableObject {
                 // drifts and the cursor lands a line off). Concatenated
                 // deltas compose: a later clear+replay resets whatever
                 // came before (see FeedBacklog).
-                feeds[rowId, default: FeedBacklog()].push(feed)
+                feeds[id, default: FeedBacklog()].push(feed)
             }
             fedText[id] = current
         }
