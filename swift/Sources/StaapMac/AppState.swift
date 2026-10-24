@@ -45,6 +45,7 @@ final class AppState: ObservableObject {
     private var grid = (cols: defaultCols, rows: defaultRows)
     private var timer: Timer?
     private var saveTick = 0
+    private var pumpTick = 0
 
     init(core: Core) {
         self.core = core
@@ -249,12 +250,6 @@ final class AppState: ObservableObject {
         (fedText[rowId, default: ""], feeds[rowId]?.seq ?? 0)
     }
 
-    /// Caret cell for a row, for placing the view cursor after a feed
-    /// (issue #104). Nil when the core cannot answer.
-    func coreCursor(for rowId: String) -> (row: Int, col: Int)? {
-        core.runCursor(id: rowId)
-    }
-
     /// "Default (on/off)" label for the picker's yolo row (issue #102).
     func yoloDefaultLabel(cli: String) -> String {
         core.yoloDefault(cli) ? "Default (on)" : "Default (off)"
@@ -315,11 +310,17 @@ final class AppState: ObservableObject {
 
     private func pump() {
         // The core registry feeds every live run (statuses, links, and
-        // re-sort inside) — the roster now actually moves, unlike the
-        // old launch-snapshot rows.
+        // re-sort inside).
         let dirty = core.pumpAll()
-        // Mirror new/changed rows (spawn attaches rows in the core now).
-        reloadRoster()
+        pumpTick += 1
+        // Rebuild the roster only when something visible changed (or once
+        // a second for age strings): reassigning `rows` on every 50 ms
+        // tick re-diffs a 500+ row List constantly, which ghosts and
+        // overlaps sidebar rows. Spawns, restarts, and closes reload
+        // explicitly at their call sites.
+        if dirty || pumpTick % 20 == 0 {
+            reloadRoster()
+        }
         for row in rows {
             let id = row.id
             guard core.isLive(id) else { continue }

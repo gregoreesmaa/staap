@@ -85,7 +85,10 @@ struct CoreTerminalView: NSViewRepresentable {
             self.lastFedSeq = replay.seq
         }
 
-        /// Feed anything the pump produced since the last drain.
+        /// Feed anything the pump produced since the last drain. The view
+        /// keeps its default cursor tracking the fed stream: no custom
+        /// CUP placement (core grid coordinates sat one line low and
+        /// skipped spaces on this grid).
         func drainFeed(into view: TerminalView) {
             let seq = state.feedSeq(for: rowId)
             guard seq != lastFedSeq,
@@ -93,13 +96,6 @@ struct CoreTerminalView: NSViewRepresentable {
             else { return }
             lastFedSeq = seq
             view.feed(text: text)
-            // Place the caret where the child put it, not at the end of
-            // fed text (issue #104).
-            if let cursor = state.coreCursor(for: rowId) {
-                var cup = String(Character(UnicodeScalar(UInt8(27)))) + "["
-                cup += String(cursor.row + 1) + ";" + String(cursor.col + 1) + "H"
-                view.feed(text: cup)
-            }
         }
 
         // MARK: - TerminalViewDelegate

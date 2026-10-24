@@ -45,6 +45,14 @@ struct ContentView: View {
                 .help("Repeat the last session, or pick folder × CLI + yolo")
                 .padding(8)
                 Divider()
+                // Filter sits above the list, not inside it: as a List
+                // row it picked up row styling and lost focus on every
+                // roster reload (Windows parity: no sidebar heading).
+                TextField("Search sessions", text: $state.filter)
+                    .textFieldStyle(.roundedBorder)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                Divider()
                 List(selection: Binding(
                     get: { state.selection },
                     set: { id in
@@ -53,9 +61,6 @@ struct ContentView: View {
                         }
                     }
                 )) {
-                    // No sidebar heading above the filter (Windows parity).
-                    TextField("Search sessions", text: $state.filter)
-                        .textFieldStyle(.roundedBorder)
                     if state.filteredRows.isEmpty {
                         Text("No sessions match.").foregroundStyle(.secondary)
                     }
@@ -65,7 +70,6 @@ struct ContentView: View {
                                 ForEach(section.rows) { row in
                                     rowLabel(row)
                                         .tag(row.id)
-                                        .badge(state.hasLivePty(row.id) ? "live" : nil)
                                         .contextMenu {
                                             if state.hasLivePty(row.id) {
                                                 Button("Close run") {
@@ -94,15 +98,19 @@ struct ContentView: View {
                                 set: { _ in state.toggleHistory() }
                             )
                         ) {
-                            ForEach(state.historyRows) { row in
-                                rowLabel(row)
-                                    .tag(row.id)
-                                    .contextMenu {
-                                        Button("Restart / resume") {
-                                            state.selection = row.id
-                                            state.restartSelected()
+                            // Hundreds of history rows: build them only
+                            // while expanded (hidden rows still diff).
+                            if state.historyExpanded {
+                                ForEach(state.historyRows) { row in
+                                    rowLabel(row)
+                                        .tag(row.id)
+                                        .contextMenu {
+                                            Button("Restart / resume") {
+                                                state.selection = row.id
+                                                state.restartSelected()
+                                            }
                                         }
-                                    }
+                                }
                             }
                         } label: {
                             HStack {
@@ -215,8 +223,9 @@ struct ContentView: View {
                     .padding(.leading, 20)
             }
         }
+        // No infinity frame: in a sidebar List it desyncs the
+        // selection pill and overlaps neighboring rows.
         .padding(.vertical, 4)
-        .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityLabel("\(row.title), \(state.statusName(of: row))")
     }
 
