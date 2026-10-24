@@ -164,7 +164,12 @@ struct CoreTerminalView: NSViewRepresentable {
         let tail = min(min(snapLines.count, viewLines.count), term.rows)
         let snapTail = snapLines.suffix(tail).joined(separator: "|")
         let viewTail = viewLines.suffix(tail).joined(separator: "|")
-        let line = "staap caret-probe row=\(rowId) core=(\(core.row),\(core.col)) view=(\(loc.y),\(loc.x)) drawnRow=\(drawnRow) grid=\(term.cols)x\(term.rows) fed=\(fed) sync=\(sync) frameRatio=\(frame.minY)/\(frame.height)/\(view.bounds.height) flipped=\(view.isFlipped) scroll=\(scroll) textMatch=\(snapTail == viewTail) snap=\(String(snapTail.prefix(160))) view=\(String(viewTail.prefix(160)))\n"
+        // View-identity census: a stale/detached view would explain a live
+        // grid with a frozen caret frame (no window, never composited).
+        let inWindow = view.window != nil
+        let noSuperview = view.superview == nil
+        let subviewFrames = String(view.subviews.map { "\($0.frame)" }.joined(separator: ";").prefix(200))
+        let line = "staap caret-probe row=\(rowId) core=(\(core.row),\(core.col)) view=(\(loc.y),\(loc.x)) drawnRow=\(drawnRow) grid=\(term.cols)x\(term.rows) fed=\(fed) sync=\(sync) frameRatio=\(frame.minY)/\(frame.height)/\(view.bounds.height) flipped=\(view.isFlipped) scroll=\(scroll) textMatch=\(snapTail == viewTail) inWindow=\(inWindow) noSuperview=\(noSuperview) subviews=\(subviewFrames) snap=\(String(snapTail.prefix(80))) view=\(String(viewTail.prefix(80)))\n"
         if let data = line.data(using: .utf8) {
             try? FileHandle.standardError.write(contentsOf: data)
         }
