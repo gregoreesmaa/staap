@@ -46,6 +46,10 @@ final class AppState: ObservableObject {
     private var timer: Timer?
     private var saveTick = 0
     private var pumpTick = 0
+    /// Fingerprint of the last published roster; reloads that change
+    /// nothing visible skip the assignment so the sidebar List sits
+    /// still (constant re-diffs leave stale ghosts and torn animations).
+    private var lastRosterFingerprint: String?
 
     init(core: Core) {
         self.core = core
@@ -138,19 +142,41 @@ final class AppState: ObservableObject {
 
     private func reloadRoster() {
         var loaded: [SessionRow] = []
+        var fresh: [String: Int] = [:]
         for i in 0 ..< core.sessionCount {
             if let row = core.sessionRow(i) {
                 loaded.append(row)
-                statuses[row.id] = Int(core.status(i))
+                fresh[row.id] = Int(core.status(i))
             }
         }
-        rows = loaded
         // Mirror the core selection (filter snaps it on the core side).
         let sel = core.selected
-        if sel < rows.count {
-            selection = rows[sel].id
-        } else if !rows.isEmpty, selection == nil {
-            selection = rows.first?.id
+        var newSelection = selection
+        if sel < loaded.count {
+            newSelection = loaded[sel].id
+        } else if newSelection == nil {
+            newSelection = loaded.first?.id
+        }
+        // Ages only move by the minute: bucket the clock so the
+        // fingerprint (and the List) sits still between minutes.
+        let minute = Int(Date.now.timeIntervalSince1970 / 60)
+        var fingerprint = ""
+        fingerprint.reserveCapacity(loaded.count * 64)
+        for row in loaded {
+            fingerprint += row.id + "\u{1F}" + row.title + "\u{1F}"
+                + row.project + "\u{1F}" + row.harness + "\u{1F}"
+                + String(row.lastActive) + "\u{1F}"
+                + String(row.linkCount) + "\u{1F}"
+                + String(fresh[row.id, default: -1]) + "\n"
+        }
+        fingerprint += (core.historyExpanded ? "H" : "h")
+            + (newSelection ?? "-") + String(minute)
+        guard fingerprint != lastRosterFingerprint else { return }
+        lastRosterFingerprint = fingerprint
+        rows = loaded
+        statuses = fresh
+        if selection != newSelection {
+            selection = newSelection
         }
     }
 
@@ -248,6 +274,14 @@ final class AppState: ObservableObject {
     /// session (issue #106).
     func replayText(for rowId: String) -> (text: String, seq: UInt64) {
         (fedText[rowId, default: ""], feeds[rowId]?.seq ?? 0)
+    }
+
+    /// Caret cell for a row (0-based), for placing the view cursor on
+    /// a static screen. Nil when the core cannot answer. Never fed
+    /// while output streams: snapshot and cursor cross in two reads,
+    /// so a streamed CUP dangles a line low.
+    func coreCursor(for rowId: String) -> (row: Int, col: Int)? {
+        core.runCursor(id: rowId)
     }
 
     /// "Default (on/off)" label for the picker's yolo row (issue #102).

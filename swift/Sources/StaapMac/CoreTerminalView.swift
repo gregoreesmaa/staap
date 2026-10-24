@@ -85,17 +85,29 @@ struct CoreTerminalView: NSViewRepresentable {
             self.lastFedSeq = replay.seq
         }
 
-        /// Feed anything the pump produced since the last drain. The view
-        /// keeps its default cursor tracking the fed stream: no custom
-        /// CUP placement (core grid coordinates sat one line low and
-        /// skipped spaces on this grid).
+        /// Feed anything the pump produced since the last drain. While
+        /// output streams, the caret rides the end of the fed stream: a
+        /// core-grid CUP read at that moment is already stale (snapshot
+        /// and cursor cross in two separate reads) and dangles a line
+        /// low, so it is skipped. On a static screen the snapshot and
+        /// the caret agree, so the view cursor is placed exactly —
+        /// keeping it off the bottom-right corner.
         func drainFeed(into view: TerminalView) {
             let seq = state.feedSeq(for: rowId)
-            guard seq != lastFedSeq,
-                  let text = state.takeFeed(for: rowId, after: lastFedSeq)
-            else { return }
-            lastFedSeq = seq
-            view.feed(text: text)
+            if seq != lastFedSeq,
+               let text = state.takeFeed(for: rowId, after: lastFedSeq)
+            {
+                lastFedSeq = seq
+                view.feed(text: text)
+            } else if let cursor = state.coreCursor(for: rowId) {
+                view.feed(text: cup(cursor))
+            }
+        }
+
+        /// Absolute CUP (1-based) for a 0-based core caret cell.
+        private func cup(_ cursor: (row: Int, col: Int)) -> String {
+            String(Character(UnicodeScalar(UInt8(27)))) + "["
+                + String(cursor.row + 1) + ";" + String(cursor.col + 1) + "H"
         }
 
         // MARK: - TerminalViewDelegate

@@ -223,9 +223,9 @@ struct ContentView: View {
                     .padding(.leading, 20)
             }
         }
-        // No infinity frame: in a sidebar List it desyncs the
-        // selection pill and overlaps neighboring rows.
-        .padding(.vertical, 4)
+        // Stock sidebar row height: custom vertical padding and
+        // full-width frames desync the row background from its
+        // content (ghost pills, overprinted neighbors).
         .accessibilityLabel("\(row.title), \(state.statusName(of: row))")
     }
 
