@@ -411,7 +411,15 @@ pub fn screen_rows(
                 });
                 cur = style;
             }
-            buf.push_str(&cell.contents());
+            // Never-written grid cells carry no contents; render the gap
+            // as a space so cursor-addressed words keep their separation
+            // (issue #104: "Runningthetest" in the spans-fed shells).
+            let text = cell.contents();
+            if text.is_empty() {
+                buf.push(' ');
+            } else {
+                buf.push_str(&text);
+            }
         }
         if open {
             spans.push(TermSpan {
@@ -501,6 +509,20 @@ mod tests {
         let row9: String = rows[9].iter().map(|s| s.text.as_str()).collect();
         assert!(row0.contains("top-left"), "row0 was {row0:?}");
         assert!(row9.contains("mid"), "row9 was {row9:?}");
+    }
+
+    #[test]
+    fn screen_rows_preserves_spaces_between_addressed_words() {
+        // Same contract as the core spans snapshot (issue #104): gaps
+        // between cursor-addressed words render as spaces.
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"\x1b[1;1H\xe2\x97\x8f\x1b[1;3HRunning\x1b[1;11Hthe");
+        let rows = screen_rows(parser.screen(), None, Rgb8(255, 255, 255), false);
+        let line: String = rows[0].iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            line.starts_with("\u{25cf} Running the"),
+            "gaps stay spaces, got {line:?}"
+        );
     }
 
     #[test]

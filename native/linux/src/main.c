@@ -8,7 +8,8 @@
  *
  * Parity wiring (same contract as the macOS/Windows shells):
  *   roster      core registry rows (staap_session_count/json live),
- *               grouped needs-input → working → idle → history
+ *               grouped working → idle (needs-input shares idle,
+ *               issue #105), history collapsed in its own toggle
  *   spawn       header New run (repeat-last) + ▾ picker → staap_run_spawn
  *   restart     header Restart / Ctrl+R → staap_run_restart (same id)
  *   close       header Close run / Ctrl+W → staap_run_close + autosave
@@ -32,6 +33,8 @@
 #define _POSIX_C_SOURCE 200809L /* strdup under strict C11 */
 
 #include <ctype.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -43,8 +46,10 @@
 #include "core_bridge.h"
 
 /* Bounded per-session VTE scrollback (local-only trust + bounded growth:
- * an accumulate-forever buffer would leak memory over long agent runs). */
-#define SCROLLBACK_LINES 10000
+ * an accumulate-forever buffer would leak memory over long agent runs).
+ * Named for the widget (not SCROLLBACK_LINES: that is the core vt100
+ * emulator's retention over staap.h, a different buffer). */
+#define VTE_SCROLLBACK_LINES 10000
 /* Roster/status refresh rides on the same 50ms pump tick as the Swift shell. */
 #define PUMP_MS 50
 #define DEFAULT_COLS 80
@@ -218,6 +223,10 @@ typedef struct {
     GHashTable *row_widgets;   /* id -> GtkWidget* (badge label) */
     GtkListBox *list;
     GtkSearchEntry *filter;
+    /* History affordance (dumb renderer: membership + expansion live in
+     * the core; this header only toggles and labels). Rows stay siblings
+     * in `list` (sorted last), like the macOS shell. */
+    GtkExpander *history_expander;
     VteTerminal *term;
     AdwWindowTitle *header_title;
     GtkButton *spawn_btn;
@@ -274,7 +283,7 @@ static void apply_system_theme(Shell *sh) {
  * live-ness all come from the core now — no launch snapshot, no local
  * row cache). Rows carry their JSON + status + id as widget data; the
  * filter/sort callbacks read the same core state, so grouping is the
- * shared needs-input → working → idle → history order. */
+ * shared working → idle → history order (issue #105). */
 static void refresh_roster(Shell *sh);
 
 /* Subtitle: selection context + live-ness + attention count, all from
@@ -351,20 +360,33 @@ static void reload_statuses(Shell *sh) {
 static gboolean row_matches(GtkListBoxRow *row, gpointer data) {
     Shell *sh = data;
     const char *q = gtk_editable_get_text(GTK_EDITABLE(sh->filter));
+    /* Collapsed History hides historic rows (core-owned membership +
+     * expansion; expanded history renders as the sorted tail). */
+    int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "staap-idx"));
+    if (idx >= 0 && !bridge_history_expanded(sh->core)) {
+        char *json = bridge_session_json(sh->core, (size_t)idx);
+        char *id = json_string(json ? json : "{}", "id");
+        bridge_string_free(json);
+        int historic = (id && bridge_is_history(sh->core, id)) ? 1 : 0;
+        free(id);
+        if (historic) {
+            return FALSE;
+        }
+    }
     if (!q || !*q) {
         return TRUE;
     }
     /* Core-owned filter rule (title/project/id, case-insensitive). The
      * row index rides on the widget; the core answers match/no-match. */
-    int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "staap-idx"));
     if (idx < 0) {
         return TRUE;
     }
     return bridge_row_matches(sh->core, (size_t)idx, q) ? TRUE : FALSE;
 }
 
-/* Order: needs-input first, then working, then idle, history last;
- * recent first within. Statuses + ids come from the core registry. */
+/* Order: working first, then idle (needs-input shares idle, issue
+ * #105), history last; recent first within. Statuses + ids come
+ * from the core registry. */
 static int row_order(GtkListBoxRow *a, GtkListBoxRow *b, gpointer data) {
     Shell *sh = data;
     int ia = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(a), "staap-idx"));
@@ -393,8 +415,9 @@ static int row_order(GtkListBoxRow *a, GtkListBoxRow *b, gpointer data) {
     if (live_a && !live_b) {
         return -1;
     }
-    int pa = sa == 0 ? 0 : sa == 2 ? 1 : 2;
-    int pb = sb == 0 ? 0 : sb == 2 ? 1 : 2;
+    /* Issue #105: idle and needs-input share one section. */
+    int pa = sa == 2 ? 0 : 1;
+    int pb = sb == 2 ? 0 : 1;
     if (pa != pb) {
         return pa - pb;
     }
@@ -652,11 +675,32 @@ static void picker_on_changed(PickerUi *pu) {
     picker_refresh_preview(pu);
 }
 
+/* Rebuild the yolo options so "Default" names its resolved state for
+ * the selected CLI (issue #102). Keeps the current tri-state pick. */
+static void picker_refresh_yolo(PickerUi *pu) {
+    const char *cli = "muse";
+    for (size_t i = 0; i < pu->n_clis; i++) {
+        if (gtk_check_button_get_active(pu->cli_btns[i])) {
+            cli = pu->clis[i].id;
+            break;
+        }
+    }
+    guint sel = gtk_drop_down_get_selected(pu->yolo);
+    char def[32];
+    snprintf(def, sizeof def, "Default (%s)",
+             bridge_yolo_default(pu->sh->core, cli) ? "on" : "off");
+    const char *opts[] = { def, "On (once)", "Off (once)", NULL };
+    gtk_drop_down_set_model(pu->yolo,
+                            G_LIST_MODEL(gtk_string_list_new(opts)));
+    gtk_drop_down_set_selected(pu->yolo, sel);
+}
+
 static void picker_cli_toggled(GtkCheckButton *btn, gpointer data) {
     if (!gtk_check_button_get_active(btn)) {
         return; /* the newly activated sibling refreshes */
     }
     picker_on_changed(data);
+    picker_refresh_yolo(data);
 }
 
 static void picker_folder_changed(GtkEditable *entry, gpointer data) {
@@ -777,6 +821,41 @@ static void picker_closed(AdwDialog *dialog, gpointer data) {
     picker_free(data);
 }
 
+/* Directory picker for the folder axis (issue #102): choosing in the
+ * UI beats typing a path. GtkFileDialog is async (GTK 4.10+), so
+ * the folder lands through its callback; the entry is reffed for
+ * the flight so a picker closed meanwhile cannot dangle, and a
+ * detached entry (closed picker) is left alone. */
+static void picker_choose_folder_done(GObject *src, GAsyncResult *res,
+                                      gpointer data) {
+    GtkEntry *folder = GTK_ENTRY(data);
+    GError *err = NULL;
+    GFile *file = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src),
+                                                       res, &err);
+    g_clear_error(&err);
+    if (file && gtk_widget_get_root(GTK_WIDGET(folder))) {
+        char *path = g_file_get_path(file);
+        if (path) {
+            gtk_editable_set_text(GTK_EDITABLE(folder), path);
+            g_free(path);
+        }
+    }
+    if (file) {
+        g_object_unref(file);
+    }
+    g_object_unref(folder);
+}
+static void picker_choose_folder(GtkButton *btn, gpointer data) {
+    (void)btn;
+    PickerUi *pu = data;
+    GtkWindow *win =
+        GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(pu->folder)));
+    GtkFileDialog *dlg = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dlg, "Choose a folder");
+    gtk_file_dialog_select_folder(dlg, win, NULL, picker_choose_folder_done,
+                                  g_object_ref(pu->folder));
+    g_object_unref(dlg);
+}
 /* Open the 2D picker dialog: folder entry + recents, CLI radio rows
  * (missing CLIs disabled with an install hint), yolo tri-state, and
  * the live `runs: ...` preview. Catalog + recents re-read on every
@@ -827,14 +906,21 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
     gtk_label_set_xalign(GTK_LABEL(folder_label), 0);
     gtk_widget_add_css_class(folder_label, "heading");
     gtk_box_append(GTK_BOX(box), folder_label);
+    GtkWidget *folder_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     pu->folder = GTK_ENTRY(gtk_entry_new());
+    gtk_widget_set_hexpand(GTK_WIDGET(pu->folder), TRUE);
     gtk_entry_set_placeholder_text(pu->folder, "Blank = current folder");
     if (pu->n_recents > 0) {
         gtk_editable_set_text(GTK_EDITABLE(pu->folder), pu->recents[0]);
     }
     g_signal_connect(pu->folder, "changed",
                      G_CALLBACK(picker_folder_changed), pu);
-    gtk_box_append(GTK_BOX(box), GTK_WIDGET(pu->folder));
+    gtk_box_append(GTK_BOX(folder_row), GTK_WIDGET(pu->folder));
+    GtkWidget *choose = gtk_button_new_with_label("Choose…");
+    g_signal_connect(choose, "clicked", G_CALLBACK(picker_choose_folder),
+                     pu);
+    gtk_box_append(GTK_BOX(folder_row), choose);
+    gtk_box_append(GTK_BOX(box), folder_row);
     if (pu->n_recents > 0) {
         GtkStringList *recent_list =
             GTK_STRING_LIST(gtk_string_list_new(NULL));
@@ -875,7 +961,8 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
         gtk_widget_set_sensitive(row, pu->clis[i].available ? TRUE : FALSE);
         gtk_widget_set_tooltip_text(
             row, pu->clis[i].available
-                     ? pu->clis[i].id
+                     ? (pu->clis[i].path ? pu->clis[i].path
+                        : pu->clis[i].id)
                      : "Install this CLI and ensure it is on PATH.");
         g_signal_connect(row, "toggled", G_CALLBACK(picker_cli_toggled),
                          pu);
@@ -924,6 +1011,8 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
     gtk_box_append(GTK_BOX(actions), spawn);
     gtk_box_append(GTK_BOX(box), actions);
 
+    /* Label "Default" with its resolved state for the preselected CLI. */
+    picker_refresh_yolo(pu);
     picker_refresh_preview(pu);
     adw_dialog_set_child(dialog, box);
     adw_dialog_present(dialog, GTK_WIDGET(win));
@@ -1055,6 +1144,21 @@ static gboolean on_key_pressed(GtkEventControllerKey *ctl, guint keyval,
 /* Pump: the shell's only repaint gate (mirrors AppState.pump). */
 /* ------------------------------------------------------------------ */
 
+static void feed_to_vte(Shell *sh, const char *feed);
+
+/* Place the VTE cursor where the child put it (issue #104): fed snapshot
+ * text alone would leave it at the end of fed output. */
+static void feed_cursor_to_vte(Shell *sh, const char *id) {
+    uint16_t row = 0, col = 0;
+    if (bridge_run_cursor(sh->core, id, &row, &col) != 0) {
+        return;
+    }
+    char cup[32];
+    snprintf(cup, sizeof cup, "\x1b[%u;%uH", (unsigned)row + 1,
+             (unsigned)col + 1);
+    feed_to_vte(sh, cup);
+}
+
 static void feed_to_vte(Shell *sh, const char *feed) {
     vte_terminal_feed(sh->term, feed, (gssize)strlen(feed));
 }
@@ -1092,6 +1196,7 @@ static void show_selected_in_terminal(Shell *sh) {
         feed_to_vte(sh, feed);
         free(feed);
     }
+    feed_cursor_to_vte(sh, id);
     free(sh->fed_id);
     sh->fed_id = id;
     free(sh->fed_text);
@@ -1121,6 +1226,7 @@ static gboolean pump_tick(gpointer data) {
         if (feed && feed[0]) {
             feed_to_vte(sh, feed);
         }
+        feed_cursor_to_vte(sh, id);
         free(feed);
         free(sh->fed_id);
         sh->fed_id = id;
@@ -1204,6 +1310,22 @@ static void on_filter_changed(GtkSearchEntry *entry, gpointer data) {
      * the same core state. */
     bridge_set_filter(
         sh->core, gtk_editable_get_text(GTK_EDITABLE(sh->filter)));
+    gtk_list_box_invalidate_filter(sh->list);
+}
+
+/* History expander toggled: the single funnel for expand/collapse —
+ * core state + persist, then re-filter so historic rows show/hide.
+ * Guarded by handler block in refresh_roster for programmatic sync. */
+static void on_history_expanded(GtkExpander *expander, GParamSpec *pspec,
+                                gpointer data) {
+    (void)pspec;
+    Shell *sh = data;
+    bridge_set_history_expanded(
+        sh->core, gtk_expander_get_expanded(expander) ? 1 : 0);
+    char *err = NULL;
+    if (bridge_core_save(sh->core, &err) != 0) {
+        free(err);
+    }
     gtk_list_box_invalidate_filter(sh->list);
 }
 
@@ -1492,6 +1614,16 @@ static void build_ui(Shell *sh) {
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),
                                   GTK_WIDGET(sh->list));
     gtk_box_append(GTK_BOX(side_box), scroll);
+    /* History affordance below the list: the header is the expand
+     * toggle (membership + expansion live in the core); rows stay
+     * siblings in the list above, sorted last. Collapsed by default. */
+    sh->history_expander = GTK_EXPANDER(gtk_expander_new("History (0)"));
+    gtk_expander_set_expanded(sh->history_expander, FALSE);
+    gtk_widget_set_margin_start(GTK_WIDGET(sh->history_expander), 8);
+    gtk_widget_set_margin_end(GTK_WIDGET(sh->history_expander), 8);
+    g_signal_connect(sh->history_expander, "notify::expanded",
+                     G_CALLBACK(on_history_expanded), sh);
+    gtk_box_append(GTK_BOX(side_box), GTK_WIDGET(sh->history_expander));
     adw_overlay_split_view_set_sidebar(split, side_box);
 
     /* Terminal side: find revealer on top, VTE in a scrolled window. */
@@ -1513,7 +1645,7 @@ static void build_ui(Shell *sh) {
     gtk_widget_set_vexpand(GTK_WIDGET(sh->term_scroll), TRUE);
     gtk_widget_set_hexpand(GTK_WIDGET(sh->term_scroll), TRUE);
     sh->term = VTE_TERMINAL(vte_terminal_new());
-    vte_terminal_set_scrollback_lines(sh->term, SCROLLBACK_LINES);
+    vte_terminal_set_scrollback_lines(sh->term, VTE_SCROLLBACK_LINES);
     vte_terminal_set_scroll_on_output(sh->term, TRUE);
     vte_terminal_set_scroll_on_keystroke(sh->term, TRUE);
     vte_terminal_set_cursor_blink_mode(sh->term, VTE_CURSOR_BLINK_ON);
@@ -1578,8 +1710,9 @@ static void refresh_roster(Shell *sh) {
     const char *fq =
         gtk_editable_get_text(GTK_EDITABLE(sh->filter));
     GString *fp = g_string_new(NULL);
-    g_string_append_printf(fp, "%zu|%s|%zu|", n, fq ? fq : "",
-                           bridge_selected(sh->core));
+    g_string_append_printf(fp, "%zu|%s|%zu|%d|", n, fq ? fq : "",
+                           bridge_selected(sh->core),
+                           bridge_history_expanded(sh->core));
     for (size_t i = 0; i < n; i++) {
         char *json = bridge_session_json(sh->core, i);
         char *id = json_string(json ? json : "{}", "id");
@@ -1672,12 +1805,60 @@ static void refresh_roster(Shell *sh) {
         free(project);
         free(harness);
     }
-    /* Restore the core selection into the list. */
-    size_t sel = bridge_selected(sh->core);
-    GtkListBoxRow *at = gtk_list_box_get_row_at_index(sh->list, (int)sel);
-    if (at) {
-        gtk_list_box_select_row(sh->list, at);
+    /* Restore the core selection into the list by row id (never by
+     * position: the sort func + collapsed History mean visual position
+     * and core index diverge, so a positional select would highlight a
+     * different row than R/restart acts on). */
+    char *sel_json = NULL;
+    char *sel_id = NULL;
+    {
+        size_t sel = bridge_selected(sh->core);
+        sel_json = bridge_session_json(sh->core, sel);
+        sel_id = json_string(sel_json ? sel_json : "{}", "id");
     }
+    if (sel_id) {
+        GtkListBoxRow *at = NULL;
+        for (GtkWidget *child =
+                 gtk_widget_get_first_child(GTK_WIDGET(sh->list));
+             child && !at;
+             child = gtk_widget_get_next_sibling(child)) {
+            if (!GTK_IS_LIST_BOX_ROW(child)) {
+                continue;
+            }
+            const char *rid = g_object_get_data(G_OBJECT(child),
+                                                "staap-row-id");
+            if (rid && strcmp(rid, sel_id) == 0) {
+                at = GTK_LIST_BOX_ROW(child);
+            }
+        }
+        if (at) {
+            gtk_list_box_select_row(sh->list, at);
+        }
+    }
+    free(sel_id);
+    bridge_string_free(sel_json);
+    /* Sync the History affordance to the core (count label + expanded
+     * state; the toggle handler is blocked during the programmatic
+     * set so syncing never writes back). */
+    size_t history_n = 0;
+    for (size_t i = 0; i < n; i++) {
+        char *json = bridge_session_json(sh->core, i);
+        char *id = json_string(json ? json : "{}", "id");
+        bridge_string_free(json);
+        if (id && bridge_is_history(sh->core, id)) {
+            history_n++;
+        }
+        free(id);
+    }
+    char *history_label = g_strdup_printf("History (%zu)", history_n);
+    gtk_expander_set_label(sh->history_expander, history_label);
+    g_free(history_label);
+    g_signal_handlers_block_by_func(sh->history_expander,
+                                    on_history_expanded, sh);
+    gtk_expander_set_expanded(sh->history_expander,
+                              bridge_history_expanded(sh->core) ? TRUE : FALSE);
+    g_signal_handlers_unblock_by_func(sh->history_expander,
+                                      on_history_expanded, sh);
 }
 
 static void on_activate(GtkApplication *app, gpointer data) {

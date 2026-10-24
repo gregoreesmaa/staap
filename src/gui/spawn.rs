@@ -66,12 +66,11 @@ impl ShellView {
         }
     }
 
-    /// Success bookkeeping for a fresh spawn: refresh output recency and
-    /// clear any sticky error (errors stay until dismissed/next success).
-    pub(crate) fn note_spawn_success(&mut self, run_id: &str) {
-        if let Some(run) = self.runs.get_mut(run_id) {
-            run.last_output = std::time::Instant::now();
-        }
+    /// Success bookkeeping for a fresh spawn: clear any sticky error
+    /// (errors stay until dismissed/next success). Output recency stays
+    /// None until the pump observes bytes, so a fresh run reads Idle
+    /// (issues #103/#105) - same rule as the core registry.
+    pub(crate) fn note_spawn_success(&mut self, _run_id: &str) {
         self.app.clear_error();
     }
 

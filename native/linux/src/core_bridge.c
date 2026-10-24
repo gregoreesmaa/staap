@@ -132,6 +132,18 @@ int bridge_is_live(const StaapCore *core, const char *id) {
     return staap_is_live(core, id) ? 1 : 0;
 }
 
+int bridge_is_history(const StaapCore *core, const char *id) {
+    return staap_is_history(core, id) ? 1 : 0;
+}
+
+int bridge_history_expanded(const StaapCore *core) {
+    return staap_history_expanded(core) ? 1 : 0;
+}
+
+void bridge_set_history_expanded(StaapCore *core, int expanded) {
+    staap_set_history_expanded(core, expanded);
+}
+
 int bridge_run_spawn(StaapCore *core, const char *cli, const char *cwd,
                      int yolo, unsigned cols, unsigned rows, char *id_out,
                      size_t id_cap, char **msg_out) {
@@ -190,6 +202,22 @@ int bridge_run_exited(const StaapCore *core, const char *id) {
     return staap_run_exited(core, id) ? 1 : 0;
 }
 
+int bridge_run_cursor(const StaapCore *core, const char *id,
+                      uint16_t *row_out, uint16_t *col_out) {
+    uint16_t row = 0, col = 0;
+    int rc = staap_run_cursor(core, id, &row, &col);
+    if (rc != 0) {
+        return rc;
+    }
+    if (row_out) {
+        *row_out = row;
+    }
+    if (col_out) {
+        *col_out = col;
+    }
+    return 0;
+}
+
 int bridge_key_encode(const char *key, const char *key_char, int ctrl,
                       int alt, unsigned char *bytes_out, size_t cap) {
     return staap_key_encode(key, key_char, ctrl, alt, bytes_out, cap);
@@ -228,6 +256,10 @@ char *bridge_spawn_preview(const char *cli, const char *folder, int yolo) {
 
 int bridge_yolo_value(int selected) {
     return staap_yolo_value((int32_t)selected);
+}
+
+int bridge_yolo_default(const StaapCore *core, const char *cli) {
+    return staap_yolo_default(core, cli);
 }
 
 char *bridge_age_string(long long now_unix, long long then_unix) {

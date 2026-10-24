@@ -275,9 +275,12 @@ clipboard access, focus, and byte transport — nothing else. Shared
 behavior with native look:
 
 - Roster: core registry rows, grouped Needs input → Working → Idle →
-  History on every shell; one shared cap (10, oldest-exited reaped
-  first); spawns attach real rows (`staap_run_spawn`), restart/resume keep
-  the id (`staap_run_restart`), close drops entry + PTY (`staap_run_close`).
+  History on every shell (active = attached live PTY, even when
+  exited; historic = no live PTY, hidden in the collapsed-by-default
+  History group; expansion is core-owned and persisted); one shared
+  cap (10, oldest-exited reaped first); spawns attach real rows
+  (`staap_run_spawn`), restart/resume keep the id
+  (`staap_run_restart`), close drops entry + PTY (`staap_run_close`).
 - Statuses actually move: `staap_pump_all` refreshes attention/links and
   re-sorts inside (the old launch-snapshot rows never changed).
 - Persistence is automatic (throttled pump autosave + close hooks):
@@ -428,6 +431,8 @@ plus the pre-existing `app`/`config`/`launch`/`embedded`/`parsers`/
 | `staap_age_string` / `staap_status_glyph` / `staap_section_title` | shared display strings; freed with `staap_screen_text_free` |
 | `staap_clamp_sidebar` | shared 220..480px sidebar clamp |
 | `staap_row_matches` / `staap_set_filter` | core-owned filter test / replace (snaps selection) |
+| `staap_is_history` | historic membership (no live PTY attached); null-safe |
+| `staap_history_expanded` / `staap_set_history_expanded` | History expansion get/set (collapsed default; persist via `staap_core_save`) |
 | `staap_selected` / `staap_select` / `staap_select_step` | core-owned selection |
 | `staap_last_error` | thread-local message; never null |
 | `staap_pty_free` | reaps the child; null no-op |

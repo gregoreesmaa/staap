@@ -26,6 +26,12 @@ struct CoreTerminalView: NSViewRepresentable {
         let view = TerminalView(frame: .zero, font: font)
         applyThemeColors(to: view, darkMode: darkMode)
         view.terminalDelegate = context.coordinator
+        // Fresh view per row: replay the full current text first, then
+        // only newer feeds (issue #106).
+        let initial = context.coordinator.initialText
+        if !initial.isEmpty {
+            view.feed(text: initial)
+        }
         context.coordinator.lastDarkMode = darkMode
         // Become key so keystrokes reach the child right away.
         DispatchQueue.main.async {
@@ -65,14 +71,24 @@ struct CoreTerminalView: NSViewRepresentable {
         private let state: AppState
         private let rowId: String
         fileprivate var lastFedSeq: UInt64 = 0
+        fileprivate var initialText = ""
         fileprivate var lastDarkMode = false
 
         init(state: AppState, rowId: String) {
             self.state = state
             self.rowId = rowId
+            // Replay baseline: the view is (re)created per row (see
+            // `.id(rowId)`), so it starts from the row's full current
+            // text and only drains newer pump feeds after that (#106).
+            let replay = state.replayText(for: rowId)
+            self.initialText = replay.text
+            self.lastFedSeq = replay.seq
         }
 
-        /// Feed anything the pump produced since the last drain.
+        /// Feed anything the pump produced since the last drain. The view
+        /// keeps its default cursor tracking the fed stream: no custom
+        /// CUP placement (core grid coordinates sat one line low and
+        /// skipped spaces on this grid).
         func drainFeed(into view: TerminalView) {
             let seq = state.feedSeq(for: rowId)
             guard seq != lastFedSeq,

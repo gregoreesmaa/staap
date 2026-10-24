@@ -83,10 +83,12 @@ impl ShellView {
             }
             // One classifier for live and historic runs alike (owned by
             // `app`): attention markers win, then exit, then recency.
+            // No output observed yet reads Idle (issues #103/#105):
+            // the same None-until-output rule as the core registry.
             let age = self
                 .runs
                 .get(&id)
-                .map(|run| now.duration_since(run.last_output));
+                .and_then(|run| run.last_output.map(|t| now.duration_since(t)));
             let status = crate::app::classify_with_attention(attention, age, exited);
             // Accumulate links in first-seen order: the visible screen
             // is only a viewport (vt100 `contents()` shows the live grid,

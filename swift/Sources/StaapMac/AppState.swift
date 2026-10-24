@@ -28,6 +28,9 @@ final class AppState: ObservableObject {
     }
 
     @Published var pendingError: String?
+    /// Row ids whose parsed links render expanded (issue #103: "1 link"
+    /// opens the actual URLs instead of only counting them).
+    @Published var expandedLinks: Set<String> = []
     /// 2D-launch picker sheet visibility (set by the menu, the caret,
     /// or Cmd-Shift-N; the sheet resets it on dismiss).
     @Published var pickerOpen = false
@@ -42,6 +45,7 @@ final class AppState: ObservableObject {
     private var grid = (cols: defaultCols, rows: defaultRows)
     private var timer: Timer?
     private var saveTick = 0
+    private var pumpTick = 0
 
     init(core: Core) {
         self.core = core
@@ -72,6 +76,7 @@ final class AppState: ObservableObject {
     func rows(with status: RunStatus) -> [SessionRow] {
         rows.filter {
             statuses[$0.id] == status.rawValue
+                && core.isLive($0.id)
                 && (filter.isEmpty || core.rowMatches(index(of: $0.id), query: filter))
         }
     }
@@ -80,8 +85,9 @@ final class AppState: ObservableObject {
         rows.firstIndex(where: { $0.id == id }) ?? -1
     }
 
-    /// History rows: ids with no live PTY in the core registry.
-    func isHistory(_ id: String) -> Bool { !core.isLive(id) }
+    /// History membership (core-owned rule): ids with no live PTY in the
+    /// core registry. Attached means active, even when exited.
+    func isHistory(_ id: String) -> Bool { core.isHistory(id) }
 
     func status(of row: SessionRow) -> RunStatus {
         RunStatus(rawValue: statuses[row.id] ?? RunStatus.idle.rawValue) ?? .idle
@@ -97,15 +103,27 @@ final class AppState: ObservableObject {
     }
 
     /// History rows: ids with no live PTY (collapsed group at the end,
-    /// matching the other shells).
+    /// matching the other shells). Expansion lives in the core
+    /// (persisted via `save()`); the shell only renders it.
     var historyRows: [SessionRow] {
         rows.filter {
-            !core.isLive($0.id)
+            core.isHistory($0.id)
                 && (filter.isEmpty || core.rowMatches(index(of: $0.id), query: filter))
         }
     }
 
     var hasHistory: Bool { !historyRows.isEmpty }
+
+    /// History expansion, core-owned (collapsed by default).
+    var historyExpanded: Bool { core.historyExpanded }
+
+    /// Toggle History expansion and persist it (same funnel every shell
+    /// shares: core state + autosave, no shell-local expansion state).
+    func toggleHistory() {
+        core.setHistoryExpanded(!core.historyExpanded)
+        save()
+        reloadRoster()
+    }
 
     /// Non-color status marker for a row (shared core glyphs).
     func glyph(of row: SessionRow) -> String {
@@ -216,6 +234,27 @@ final class AppState: ObservableObject {
 
     func hasLivePty(_ id: String) -> Bool { core.isLive(id) }
 
+    /// Toggle the inline link list for a row (issue #103).
+    func toggleLinks(_ id: String) {
+        if expandedLinks.contains(id) {
+            expandedLinks.remove(id)
+        } else {
+            expandedLinks.insert(id)
+        }
+    }
+
+    /// Full current text + feed sequence for a row: a (re)created
+    /// terminal view replays this so switching rows never shows a stale
+    /// session (issue #106).
+    func replayText(for rowId: String) -> (text: String, seq: UInt64) {
+        (fedText[rowId, default: ""], feeds[rowId]?.seq ?? 0)
+    }
+
+    /// "Default (on/off)" label for the picker's yolo row (issue #102).
+    func yoloDefaultLabel(cli: String) -> String {
+        core.yoloDefault(cli) ? "Default (on)" : "Default (off)"
+    }
+
     func sendToPty(rowId: String, bytes: [UInt8]) {
         do {
             try core.runWrite(id: rowId, bytes: bytes)
@@ -271,11 +310,17 @@ final class AppState: ObservableObject {
 
     private func pump() {
         // The core registry feeds every live run (statuses, links, and
-        // re-sort inside) — the roster now actually moves, unlike the
-        // old launch-snapshot rows.
+        // re-sort inside).
         let dirty = core.pumpAll()
-        // Mirror new/changed rows (spawn attaches rows in the core now).
-        reloadRoster()
+        pumpTick += 1
+        // Rebuild the roster only when something visible changed (or once
+        // a second for age strings): reassigning `rows` on every 50 ms
+        // tick re-diffs a 500+ row List constantly, which ghosts and
+        // overlaps sidebar rows. Spawns, restarts, and closes reload
+        // explicitly at their call sites.
+        if dirty || pumpTick % 20 == 0 {
+            reloadRoster()
+        }
         for row in rows {
             let id = row.id
             guard core.isLive(id) else { continue }

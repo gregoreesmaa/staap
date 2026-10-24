@@ -255,16 +255,16 @@ pub fn row_matches_filter(session: &ChatSession, query: &str) -> bool {
     roster_matches(&session.title, &session.project, &session.id, query)
 }
 
-/// Group row indices into urgency sections: needs-input, working, idle —
-/// then history (rows with no live PTY) last. Returns `(header, indices)`
-/// pairs, skipping nothing: empty groups still render their header so the
-/// order is stable. This is the single rule replacing the Linux sort-fn,
-/// the macOS section builder, and the Windows group order.
+/// Group row indices into urgency sections: working, then idle —
+/// (idle holds needs-input rows first — issue #105), then history (rows
+/// with no live PTY) last. Returns `(header, indices)` pairs, skipping
+/// nothing: empty groups still render headers. This is the single rule
+/// replacing the Linux sort-fn, the macOS section builder, and Windows order.
 pub fn group_sections(
     sessions: &[ChatSession],
     live: &dyn Fn(&str) -> bool,
 ) -> Vec<(String, Vec<usize>)> {
-    let mut needs = Vec::new();
+    let mut attn = Vec::new();
     let mut working = Vec::new();
     let mut idle = Vec::new();
     let mut history = Vec::new();
@@ -282,23 +282,24 @@ pub fn group_sections(
             continue;
         }
         match sessions[i].status {
-            Status::Attention => needs.push(i),
+            Status::Attention => attn.push(i),
             Status::Working => working.push(i),
             Status::Idle => idle.push(i),
         }
     }
+    // Issue #105: idle and needs-input share one section (attention
+    // rows first, so urgency still reads top-down); the per-row glyph
+    // and the needs-input badge keep saying which idle rows wait.
+    let mut idle_all = attn;
+    idle_all.extend(idle);
     vec![
-        (
-            format!("{} ({})", section_title(RowStatus::Attention), needs.len()),
-            needs,
-        ),
         (
             format!("{} ({})", section_title(RowStatus::Working), working.len()),
             working,
         ),
         (
-            format!("{} ({})", section_title(RowStatus::Idle), idle.len()),
-            idle,
+            format!("{} ({})", section_title(RowStatus::Idle), idle_all.len()),
+            idle_all,
         ),
         (format!("History ({})", history.len()), history),
     ]
@@ -753,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_order_needs_working_idle_then_history() {
+    fn groups_order_working_idle_then_history() {
         let sessions = vec![
             sess("h", Status::Working, 9),
             sess("a", Status::Attention, 1),
@@ -761,8 +762,9 @@ mod tests {
             sess("w", Status::Working, 7),
         ];
         let live = |id: &str| id != "h";
+        // Issue #105: needs-input shares the Idle section (attention first).
         let groups = group_sections(&sessions, &live);
-        assert_eq!(groups.len(), 4);
+        assert_eq!(groups.len(), 3);
         let ids = |n: usize| {
             groups[n]
                 .1
@@ -770,12 +772,12 @@ mod tests {
                 .map(|&i| sessions[i].id.clone())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(ids(0), vec!["a"]);
-        assert_eq!(ids(1), vec!["w"]);
-        assert_eq!(ids(2), vec!["i"]);
-        assert_eq!(ids(3), vec!["h"]);
-        assert!(groups[0].0.starts_with("Needs input (1)"));
-        assert!(groups[3].0.starts_with("History (1)"));
+        assert_eq!(ids(0), vec!["w"]);
+        assert_eq!(ids(1), vec!["a", "i"]);
+        assert_eq!(ids(2), vec!["h"]);
+        assert!(groups[0].0.starts_with("Working (1)"));
+        assert!(groups[1].0.starts_with("Idle (2)"));
+        assert!(groups[2].0.starts_with("History (1)"));
     }
 
     #[test]

@@ -58,6 +58,9 @@ int main(void) {
     CHECK(bridge_yolo_value(0) == 0, "yolo default");
     CHECK(bridge_yolo_value(1) == 1, "yolo on");
     CHECK(bridge_yolo_value(2) == -1, "yolo off");
+    CHECK(bridge_yolo_default(NULL, "muse") == 0, "yolo default null");
+    CHECK(bridge_yolo_default(NULL, NULL) == 0, "yolo default nulls");
+    CHECK(bridge_run_cursor(NULL, "x", NULL, NULL) != 0, "cursor nulls");
     char *age = bridge_age_string(600, 0);
     CHECK(age && strcmp(age, "10m ago") == 0, "age buckets");
     bridge_string_free(age);

@@ -20,6 +20,7 @@
 #define STAAP_CORE_BRIDGE_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "staap.h"
 
@@ -105,6 +106,14 @@ size_t bridge_max_runs(void);
 /* True when the row id owns a live PTY in the registry. */
 int bridge_is_live(const StaapCore *core, const char *id);
 
+/* History membership + expansion (core-owned; the shell only renders):
+ * historic = no live PTY attached (attached means active, even when
+ * the child already exited). Expansion is collapsed by default;
+ * setters persist via bridge_core_save (callers save after toggling). */
+int bridge_is_history(const StaapCore *core, const char *id);
+int bridge_history_expanded(const StaapCore *core);
+void bridge_set_history_expanded(StaapCore *core, int expanded);
+
 /* Spawn a 2D-launch session attached to a new roster row, under the
  * shared cap. Returns 0 with the row id in `id_out` (up to `id_cap`
  * bytes incl. NUL); nonzero with `msg_out` set like bridge_core_save. */
@@ -137,6 +146,11 @@ char *bridge_run_screen_text(const StaapCore *core, const char *id);
 char *bridge_run_spans_json(const StaapCore *core, const char *id);
 int bridge_run_exited(const StaapCore *core, const char *id);
 
+/* Caret cell of an attached run, 0-based (issue #104). Returns 0 on
+ * success with `*row_out`/`*col_out` set; nonzero leaves them alone. */
+int bridge_run_cursor(const StaapCore *core, const char *id,
+                      uint16_t *row_out, uint16_t *col_out);
+
 /* Encode one logical keypress into child bytes (the single shared key
  * table). Returns the byte count in `bytes_out` (up to `cap` bytes), 0
  * when the native control keeps the key, -1 on null key. */
@@ -154,6 +168,9 @@ char *bridge_spawn_preview(const char *cli, const char *folder, int yolo);
 
 /* Tri-state yolo int from a segmented-control index. */
 int bridge_yolo_value(int selected);
+
+/* Configured yolo default for `cli` (1 = on, 0 = off; issue #102). */
+int bridge_yolo_default(const StaapCore *core, const char *cli);
 
 /* Human age (`just now`, `5m ago`, ...), status glyph (`●`/`◐`/`○`),
  * section header (`Needs input`/`Idle`/`Working`). Malloc'd; free with

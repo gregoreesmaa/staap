@@ -62,6 +62,9 @@ static void shared_helpers_come_from_core(void) {
     CHECK(bridge_yolo_value(0) == 0, "yolo default");
     CHECK(bridge_yolo_value(1) == 1, "yolo on");
     CHECK(bridge_yolo_value(2) == -1, "yolo off");
+    CHECK(bridge_yolo_default(nullptr, "muse") == 0, "yolo default null");
+    CHECK(bridge_yolo_default(nullptr, nullptr) == 0, "yolo default nulls");
+    CHECK(bridge_run_cursor(nullptr, "x", nullptr, nullptr) != 0, "cursor nulls");
     char *age = bridge_age_string(600, 0);
     CHECK(age && strcmp(age, "10m ago") == 0, "age buckets");
     bridge_string_free(age);
@@ -73,6 +76,17 @@ static void shared_helpers_come_from_core(void) {
     CHECK(core != nullptr, "core new");
     CHECK(bridge_max_runs() == 10, "cap is 10");
     CHECK(bridge_live_count(core) == 0, "no live runs");
+    /* History contract (core-owned): unknown ids are historic;
+     * expansion is collapsed by default and round-trips. */
+    CHECK(bridge_is_history(core, "missing") != 0, "unknown is history");
+    CHECK(bridge_is_history(nullptr, "missing") == 0, "null core no history");
+    CHECK(bridge_history_expanded(core) == 0, "history starts collapsed");
+    CHECK(bridge_history_expanded(nullptr) == 0, "null core not expanded");
+    bridge_set_history_expanded(nullptr, 1);
+    bridge_set_history_expanded(core, 1);
+    CHECK(bridge_history_expanded(core) != 0, "history set expanded");
+    bridge_set_history_expanded(core, 0);
+    CHECK(bridge_history_expanded(core) == 0, "history set collapsed");
     bridge_core_free(core);
 }
 

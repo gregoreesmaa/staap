@@ -1,4 +1,4 @@
-# agents.md
+# AGENTS.md
 
 You are completely autonomous from now on.
 
@@ -48,3 +48,38 @@ right shell — each owns its own sidebar/chrome.
 - Gates: macOS `cargo test --all-targets`, `cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`; Swift `swift test`;
   Linux meson suite. Never fix one shell by editing another.
+
+## Dumb-shell contract
+
+UIs are dumb shells: every UI renders what the Rust core reports and
+owns nothing else. Shells own widgets, event wiring, clipboard access,
+focus management, and byte transport — nothing else.
+
+Everything below lives in the core exactly once (native shells reach
+it via `shell_shared` or the `staap_*` C ABI; the gpui shell calls it
+directly) and must never be reimplemented per shell:
+
+- Roster grouping and history membership: active = attached live PTY
+  (`RunRegistry::is_live` / `staap_is_live`), grouped Needs input →
+  Working → Idle; historic = no live PTY, hidden in the
+  collapsed-by-default History group (`RunRegistry::is_history` /
+  `staap_is_history`, expansion via `App.history_expanded` /
+  `staap_history_expanded` / `staap_set_history_expanded`, persisted
+  through `staap_core_save`).
+- Filter match and selection (`row_matches_filter` /
+  `staap_row_matches`, `App::set_filter` / `staap_set_filter`,
+  `staap_selected` / `staap_select` / `staap_select_step`).
+- Statuses and attention (`classify`, `attention_count`), links
+  (`push_links`, `visible_links`), display strings (`relative_age`,
+  `status_glyph`, `section_title`), key table (`encode_key` /
+  `staap_key_encode`), feed reconciler (`feed_delta` /
+  `staap_feed_delta`), SGR renderer (`render_ansi` /
+  `staap_ansi_render`), spawn preview (`spawn_preview`), sidebar
+  clamp (`clamp_sidebar_width`), live-run cap + eviction
+  (`MAX_LIVE_RUNS`, `make_room`), persistence (`persist`, `Config`).
+
+`grep -rni gpui` over the core module set (everything except
+`src/gui/` + `src/main.rs`) returns zero hits. A new UI follows the
+same seam: bind the C ABI, render the core, add its wiring table
+README. Fix shell bugs in the owning shell; fix shared behavior in
+the core with headless tests.

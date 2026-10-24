@@ -35,7 +35,10 @@ pub(crate) fn oldest_exited_id(runs: &HashMap<String, Run>) -> Option<String> {
 /// dies, so key handling never depends on the child being alive.
 pub struct Run {
     pub pty: EmbeddedPty,
-    pub last_output: Instant,
+    /// When the child last produced output (None until the first pump
+    /// observes any: a fresh run reads Idle, not Working - issues
+    /// #103/#105, same rule as [crate::runs::LiveRun]).
+    pub last_output: Option<Instant>,
     pub attention: bool,
     /// Pager offset in lines up from the live bottom (issue #25): 0 is
     /// the live screen, positive shows retained history. Fresh output
@@ -47,7 +50,7 @@ impl Run {
     pub fn new(pty: EmbeddedPty) -> Self {
         Self {
             pty,
-            last_output: Instant::now(),
+            last_output: None,
             attention: false,
             scroll_offset: 0,
         }
@@ -57,7 +60,7 @@ impl Run {
     /// Returns true when new output arrived.
     pub fn pump(&mut self) -> bool {
         if self.pty.pump() {
-            self.last_output = Instant::now();
+            self.last_output = Some(Instant::now());
             true
         } else {
             false
@@ -100,7 +103,7 @@ mod tests {
     #[test]
     fn run_pump_refreshes_recency_and_reports_freshness() {
         let mut run = Run::new(EmbeddedPty::spawn("echo", &["hi".to_string()], 80, 24).unwrap());
-        let born = run.last_output;
+        assert_eq!(run.last_output, None);
         std::thread::sleep(std::time::Duration::from_millis(50));
         // echo writes promptly: the pump sees bytes and moves recency.
         let mut saw_fresh = false;
@@ -112,7 +115,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(saw_fresh);
-        assert!(run.last_output >= born);
+        assert!(run.last_output.is_some());
         assert!(!run.attention);
     }
 
@@ -136,7 +139,7 @@ mod tests {
         let mut runs: HashMap<String, Run> = HashMap::new();
         // A live run, fresher than everything: never a reap victim.
         let mut live = Run::new(EmbeddedPty::spawn("sleep", &["5".to_string()], 80, 24).unwrap());
-        live.last_output = Instant::now();
+        live.last_output = Some(Instant::now());
         runs.insert("live".to_string(), live);
         for id in ["old", "new"] {
             let mut run = Run::new(EmbeddedPty::spawn("true", &[], 80, 24).unwrap());
@@ -151,8 +154,8 @@ mod tests {
             runs.insert(id.to_string(), run);
         }
         runs.get_mut("old").unwrap().last_output =
-            Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
-        runs.get_mut("new").unwrap().last_output = Instant::now();
+            Some(Instant::now().checked_sub(Duration::from_secs(60)).unwrap());
+        runs.get_mut("new").unwrap().last_output = Some(Instant::now());
         assert_eq!(oldest_exited_id(&runs).as_deref(), Some("old"));
         runs.remove("old");
         runs.remove("new");
