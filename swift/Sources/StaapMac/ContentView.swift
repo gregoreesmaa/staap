@@ -121,6 +121,9 @@ struct ContentView: View {
                     }
                 }
                 .listStyle(.sidebar)
+                // No row animations: the roster re-sorts live and a torn
+                // insert/delete crossfade paints two rows as one.
+                .transaction { $0.animation = nil }
                 // No sidebar footer: Restart/Close ride the New Session
                 // menu, row context menus, keyboard shortcuts, and the
                 // detail pane (Windows parity — no headings, no footer).

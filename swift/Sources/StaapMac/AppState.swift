@@ -192,6 +192,7 @@ final class AppState: ObservableObject {
         do {
             try core.runRestart(id: id, cols: grid.cols, rows: grid.rows)
             fedText[id] = ""
+            feeds.removeValue(forKey: id)
             reloadRoster()
         } catch {
             pendingError = error.localizedDescription
@@ -210,6 +211,7 @@ final class AppState: ObservableObject {
             let id = try core.runSpawn(cli: nil, cwd: nil, yolo: 0,
                                        cols: grid.cols, rows: grid.rows)
             fedText[id] = ""
+            feeds.removeValue(forKey: id)
             reloadRoster()
             selection = id
         } catch {
@@ -225,6 +227,7 @@ final class AppState: ObservableObject {
             let id = try core.runSpawn(cli: cli, cwd: folder, yolo: yolo,
                                        cols: grid.cols, rows: grid.rows)
             fedText[id] = ""
+            feeds.removeValue(forKey: id)
             reloadRoster()
             selection = id
         } catch {
@@ -238,6 +241,7 @@ final class AppState: ObservableObject {
         do {
             try core.runRestart(id: id, cols: grid.cols, rows: grid.rows)
             fedText[id] = ""
+            feeds.removeValue(forKey: id)
             reloadRoster()
         } catch {
             pendingError = error.localizedDescription
@@ -305,9 +309,11 @@ final class AppState: ObservableObject {
         core.runResize(id: rowId, cols: cols, rows: rows)
     }
 
-    /// Feed text the terminal view has not shown yet, if any.
+    /// Feed text the terminal view has not shown yet, if any. Consumes
+    /// it: later deltas accumulate fresh from the next pump.
     func takeFeed(for rowId: String, after seq: UInt64) -> String? {
         guard let feed = feeds[rowId], feed.seq != seq else { return nil }
+        feeds[rowId] = nil
         return feed.text
     }
 
@@ -379,7 +385,18 @@ final class AppState: ObservableObject {
                !feed.isEmpty
             {
                 feedSeq += 1
-                feeds[id] = (feed, feedSeq)
+                // Accumulate, never overwrite: the view drains at its own
+                // cadence and an overwritten delta is lost output (the grid
+                // drifts and the cursor lands a line off). Concatenated
+                // deltas compose: a later clear+replay resets whatever
+                // came before.
+                var pending = (feeds[id]?.text ?? "") + feed
+                if pending.utf8.count > 65536 {
+                    // Stalled view: drop the backlog rather than grow
+                    // forever; the next clear+replay resyncs.
+                    pending = feed
+                }
+                feeds[id] = (pending, feedSeq)
             }
             fedText[id] = current
         }
