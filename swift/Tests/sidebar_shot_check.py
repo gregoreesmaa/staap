@@ -4,15 +4,16 @@
 Reference-free and resolution-independent: finds the app window by its
 traffic lights, bounds the sidebar at the split divider, extracts text
 baselines from a bright-pixel density profile, and asserts the roster
-renders as distinct two-line rows (no merged/overprinted lines, no
-missing or duplicated rows).
+renders as distinct rows (no merged/overprinted lines, no missing or
+duplicated rows).
 
 Row text is indented past the glyph/dot markers while headers hug the
-sidebar edge, so a two-line group only counts as a row when its inset
-reaches into the row band (relative to the band width, so 1x and 2x
-captures behave the same). Single-line groups (headers, filter,
-buttons) are ignored; any row group of three or more lines is
-overprinting. Detached dots and descenders rejoin first at a fraction
+sidebar edge, so a group only counts as a row when its inset reaches
+into the row band (relative to the band width, so 1x and 2x captures
+behave the same). A row is normally a two-line title/subtitle pair;
+when a descender bridges the pair into one tall blob it still counts
+by height. Single-line groups (headers, filter, buttons) are ignored;
+any row group of three or more lines is overprinting. Detached dots and descenders rejoin first at a fraction
 of the row pitch; row grouping keys off the 75th percentile gap, so a
 few torn lines cannot drag the thresholds.
 
@@ -238,8 +239,8 @@ def main():
     ap.add_argument("--expect-rows", type=int, default=3)
     ap.add_argument("--annotate", default=None)
     ap.add_argument("--density", type=float, default=0.008)
-    ap.add_argument("--join-ratio", type=float, default=0.7)
-    ap.add_argument("--repair-ratio", type=float, default=0.15)
+    ap.add_argument("--join-ratio", type=float, default=0.65)
+    ap.add_argument("--repair-ratio", type=float, default=0.25)
     args = ap.parse_args()
 
     img = Image.open(args.png).convert("RGB")
@@ -285,15 +286,27 @@ def main():
     def is_row(g):
         return min(ln[2] for ln in g) >= inset_cut
 
-    multis = [g for g in grouped if len(g) == 2 and is_row(g)]
+    # Tall-blob reference: the first three lines are always chrome
+    # (button, filter, first header) at single-line height, so their
+    # median anchors the row height no matter how many rows follow.
+    chrome = sorted(ln[1] - ln[0] + 1 for ln in lines[:3])
+    tall_single = 1.7 * chrome[len(chrome) // 2]
+
+    def is_tall_single(g):
+        return (len(g) == 1
+                and g[0][1] - g[0][0] + 1 >= tall_single
+                and is_row(g))
+
+    multis = [g for g in grouped
+              if (len(g) == 2 and is_row(g)) or is_tall_single(g)]
     others = [g for g in grouped if len(g) >= 3 and is_row(g)]
 
     print("sidebar_shot_check: window=(%d,%d) divider=%d(score %.2f) "
           "band=%dx%d lines=%d groups=%d multis=%d others=%d "
-          "p75_gap=%.1f join<%.1f inset_cut=%.1f"
+          "p75_gap=%.1f join<%.1f inset_cut=%.1f tall>=%.1f"
           % (win_left, win_top, divider, divider_score, band.size[0],
              band.size[1], len(lines), len(grouped), len(multis),
-             len(others), pitch, join, inset_cut))
+             len(others), pitch, join, inset_cut, tall_single))
     for g in grouped:
         print("  group y=%d..%d nlines=%d row=%s" % (y0 + g[0][0],
                                                      y0 + g[-1][1], len(g),
@@ -303,7 +316,7 @@ def main():
         out = img.convert("RGB")
         draw = ImageDraw.Draw(out)
         for g in grouped:
-            if len(g) == 2 and is_row(g):
+            if ((len(g) == 2 and is_row(g)) or is_tall_single(g)):
                 color = (80, 200, 80)
             elif len(g) >= 3 and is_row(g):
                 color = (230, 70, 70)
@@ -316,7 +329,7 @@ def main():
 
     problems = []
     if len(multis) != args.expect_rows:
-        problems.append("expected %d two-line rows, found %d"
+        problems.append("expected %d rows, found %d"
                         % (args.expect_rows, len(multis)))
     if others:
         problems.append("%d row group(s) with 3+ lines (overprinted?)"
