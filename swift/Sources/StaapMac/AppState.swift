@@ -40,11 +40,10 @@ final class AppState: ObservableObject {
     /// Deliberately not @Published: the terminal view polls this on its own timer, so
     /// streaming output never re-evaluates the sidebar List (constant
     /// re-diffs leave stale hover/selection ghosts on top of live rows).
-    private(set) var feeds: [String: (text: String, seq: UInt64)] = [:]
+    private(set) var feeds: [String: FeedBacklog] = [:]
 
     private let core: Core
     private var fedText: [String: String] = [:]
-    private var feedSeq: UInt64 = 0
     private var grid = (cols: defaultCols, rows: defaultRows)
     private var timer: Timer?
     private var saveTick = 0
@@ -163,17 +162,19 @@ final class AppState: ObservableObject {
         // Ages only move by the minute: bucket the clock so the
         // fingerprint (and the List) sits still between minutes.
         let minute = Int(Date.now.timeIntervalSince1970 / 60)
-        var fingerprint = ""
-        fingerprint.reserveCapacity(loaded.count * 64)
-        for row in loaded {
-            fingerprint += row.id + "\u{1F}" + row.title + "\u{1F}"
-                + row.project + "\u{1F}" + row.harness + "\u{1F}"
-                + String(row.lastActive) + "\u{1F}"
-                + String(row.linkCount) + "\u{1F}"
-                + String(fresh[row.id, default: -1]) + "\n"
-        }
-        fingerprint += (core.historyExpanded ? "H" : "h")
-            + (newSelection ?? "-") + String(minute)
+        let fingerprint = rosterFingerprint(
+            rows: loaded.map {
+                RosterFingerprintRow(
+                    id: $0.id, title: $0.title, project: $0.project,
+                    harness: $0.harness, lastActive: $0.lastActive,
+                    linkCount: $0.linkCount,
+                    status: fresh[$0.id, default: -1]
+                )
+            },
+            historyExpanded: core.historyExpanded,
+            selection: newSelection,
+            minute: minute
+        )
         guard fingerprint != lastRosterFingerprint else { return }
         lastRosterFingerprint = fingerprint
         rows = loaded
@@ -312,9 +313,9 @@ final class AppState: ObservableObject {
     /// Feed text the terminal view has not shown yet, if any. Consumes
     /// it: later deltas accumulate fresh from the next pump.
     func takeFeed(for rowId: String, after seq: UInt64) -> String? {
-        guard let feed = feeds[rowId], feed.seq != seq else { return nil }
-        feeds[rowId] = nil
-        return feed.text
+        guard var backlog = feeds[rowId], let text = backlog.take(after: seq) else { return nil }
+        feeds[rowId] = backlog
+        return text
     }
 
     func feedSeq(for rowId: String) -> UInt64 { feeds[rowId]?.seq ?? 0 }
@@ -384,19 +385,12 @@ final class AppState: ObservableObject {
             if let feed = Core.feedDelta(old: shown, new: current),
                !feed.isEmpty
             {
-                feedSeq += 1
                 // Accumulate, never overwrite: the view drains at its own
                 // cadence and an overwritten delta is lost output (the grid
                 // drifts and the cursor lands a line off). Concatenated
                 // deltas compose: a later clear+replay resets whatever
-                // came before.
-                var pending = (feeds[id]?.text ?? "") + feed
-                if pending.utf8.count > 65536 {
-                    // Stalled view: drop the backlog rather than grow
-                    // forever; the next clear+replay resyncs.
-                    pending = feed
-                }
-                feeds[id] = (pending, feedSeq)
+                // came before (see FeedBacklog).
+                feeds[rowId, default: FeedBacklog()].push(feed)
             }
             fedText[id] = current
         }

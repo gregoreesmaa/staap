@@ -13,11 +13,17 @@ The core staticlib must exist first (the linker searches
 ```sh
 cargo build --lib          # produces target/debug/libstaap.a
 cd swift && swift build    # SPM-only build (no Xcode project needed)
-swift test                 # pure-Swift unit tests (snapshot delta)
+swift test                 # pure-Swift unit tests (reconciler, feed backlog, roster gate)
 .build/debug/StaapMac --smoke   # headless C ABI runtime check
 ```
 
 Run the app with `swift run` or `.build/debug/StaapMac`.
+
+Sidebar regression: `.build/debug/StaapMac --shot-spawn 3` attaches three
+live runs up front; capture the window and run `python3
+swift/Tests/sidebar_shot_check.py shot.png --expect-rows 3`, which asserts
+the roster renders as distinct two-line rows (CI runs the same check over
+seeded mock sessions).
 
 ## Wiring (dumb renderer over the core run registry)
 
