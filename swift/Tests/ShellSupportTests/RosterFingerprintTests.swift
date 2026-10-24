@@ -7,11 +7,11 @@ final class RosterFingerprintTests: XCTestCase {
         [
             RosterFingerprintRow(
                 id: "a", title: "wren", project: "staap", harness: "claude",
-                lastActive: 100, linkCount: 0, status: 2
+                lastActive: 100, linkCount: 0, status: 2, live: true
             ),
             RosterFingerprintRow(
                 id: "b", title: "mole", project: "staap", harness: "claude",
-                lastActive: 90, linkCount: 1, status: 2
+                lastActive: 90, linkCount: 1, status: 2, live: true
             ),
         ]
     }
@@ -60,6 +60,15 @@ final class RosterFingerprintTests: XCTestCase {
         var active = rows()
         active[0].lastActive = 101
         XCTAssertNotEqual(print(), print(active))
+    }
+
+    func testLiveFlipChanges() {
+        // Restart/resume moves a row between the active sections and
+        // History with every other field unchanged: the stillness gate
+        // must wake so the List drops its stale section.
+        var historic = rows()
+        historic[0].live = false
+        XCTAssertNotEqual(print(), print(historic))
     }
 
     func testHistorySelectionAndMinuteChange() {

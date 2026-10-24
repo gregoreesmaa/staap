@@ -41,6 +41,11 @@ final class AppState: ObservableObject {
     /// streaming output never re-evaluates the sidebar List (constant
     /// re-diffs leave stale hover/selection ghosts on top of live rows).
     private(set) var feeds: [String: FeedBacklog] = [:]
+    /// Same-tick caret per row, captured alongside the snapshot in pump().
+    /// The terminal view places the cursor from this pair, never from a
+    /// later live read: screen text and cursor read ticks apart cross
+    /// and the stale CUP dangles a line low. Not @Published (polled).
+    private(set) var cursors: [String: (row: Int, col: Int)] = [:]
 
     private let core: Core
     private var fedText: [String: String] = [:]
@@ -168,7 +173,8 @@ final class AppState: ObservableObject {
                     id: $0.id, title: $0.title, project: $0.project,
                     harness: $0.harness, lastActive: $0.lastActive,
                     linkCount: $0.linkCount,
-                    status: fresh[$0.id, default: -1]
+                    status: fresh[$0.id, default: -1],
+                    live: core.isLive($0.id)
                 )
             },
             historyExpanded: core.historyExpanded,
@@ -194,6 +200,7 @@ final class AppState: ObservableObject {
             try core.runRestart(id: id, cols: grid.cols, rows: grid.rows)
             fedText[id] = ""
             feeds.removeValue(forKey: id)
+            cursors.removeValue(forKey: id)
             reloadRoster()
         } catch {
             pendingError = error.localizedDescription
@@ -213,6 +220,7 @@ final class AppState: ObservableObject {
                                        cols: grid.cols, rows: grid.rows)
             fedText[id] = ""
             feeds.removeValue(forKey: id)
+            cursors.removeValue(forKey: id)
             reloadRoster()
             selection = id
         } catch {
@@ -229,6 +237,7 @@ final class AppState: ObservableObject {
                                        cols: grid.cols, rows: grid.rows)
             fedText[id] = ""
             feeds.removeValue(forKey: id)
+            cursors.removeValue(forKey: id)
             reloadRoster()
             selection = id
         } catch {
@@ -243,6 +252,7 @@ final class AppState: ObservableObject {
             try core.runRestart(id: id, cols: grid.cols, rows: grid.rows)
             fedText[id] = ""
             feeds.removeValue(forKey: id)
+            cursors.removeValue(forKey: id)
             reloadRoster()
         } catch {
             pendingError = error.localizedDescription
@@ -255,6 +265,7 @@ final class AppState: ObservableObject {
         core.runClose(id: id)
         fedText.removeValue(forKey: id)
         feeds.removeValue(forKey: id)
+        cursors.removeValue(forKey: id)
         save()
         reloadRoster()
     }
@@ -284,12 +295,17 @@ final class AppState: ObservableObject {
         (fedText[rowId, default: ""], feeds[rowId]?.seq ?? 0)
     }
 
-    /// Caret cell for a row (0-based), for placing the view cursor on
-    /// a static screen. Nil when the core cannot answer. Never fed
-    /// while output streams: snapshot and cursor cross in two reads,
-    /// so a streamed CUP dangles a line low.
+    /// Same-tick caret for a row (0-based), captured in pump() alongside
+    /// the snapshot the feed was reconciled from. The view places the
+    /// cursor from this pair: a live read ticks later crosses the
+    /// snapshot and the stale CUP dangles a line low.
+    func storedCursor(for rowId: String) -> (row: Int, col: Int)? {
+        cursors[rowId]
+    }
+
+    /// Live caret fallback (separate read; prefer storedCursor).
     func coreCursor(for rowId: String) -> (row: Int, col: Int)? {
-        core.runCursor(id: rowId)
+        storedCursor(for: rowId) ?? core.runCursor(id: rowId)
     }
 
     /// "Default (on/off)" label for the picker's yolo row (issue #102).
@@ -393,6 +409,12 @@ final class AppState: ObservableObject {
                 feeds[id, default: FeedBacklog()].push(feed)
             }
             fedText[id] = current
+            // Same-tick caret for the exact snapshot above: the view
+            // places the cursor from this pair, so a later live read
+            // can never cross the text it positions.
+            if let caret = core.runCursor(id: id) {
+                cursors[id] = caret
+            }
         }
         // Autosave throttle (replaces the manual Save button): persist at
         // most every ~5s while dirty, like the shared pump persist.

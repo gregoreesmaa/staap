@@ -30,7 +30,7 @@ struct CoreTerminalView: NSViewRepresentable {
         // only newer feeds (issue #106).
         let initial = context.coordinator.initialText
         if !initial.isEmpty {
-            view.feed(text: initial)
+            view.feed(text: Self.normalized(initial))
         }
         context.coordinator.lastDarkMode = darkMode
         context.coordinator.startPolling(view: view)
@@ -39,6 +39,10 @@ struct CoreTerminalView: NSViewRepresentable {
             view.window?.makeFirstResponder(view)
         }
         return view
+    }
+
+    static func normalized(_ text: String) -> String {
+        Coordinator.normalized(text)
     }
 
     func updateNSView(_ view: TerminalView, context: Context) {
@@ -78,6 +82,8 @@ struct CoreTerminalView: NSViewRepresentable {
         fileprivate var lastFedSeq: UInt64 = 0
         fileprivate var initialText = ""
         fileprivate var lastDarkMode = false
+        fileprivate var lastPlacedRow: Int = -1
+        fileprivate var lastPlacedCol: Int = -1
         private var pollTimer: Timer?
         private weak var pollView: TerminalView?
 
@@ -92,23 +98,36 @@ struct CoreTerminalView: NSViewRepresentable {
             self.lastFedSeq = replay.seq
         }
 
-        /// Feed anything the pump produced since the last drain. While
-        /// output streams, the caret rides the end of the fed stream: a
-        /// core-grid CUP read at that moment is already stale (snapshot
-        /// and cursor cross in two separate reads) and dangles a line
-        /// low, so it is skipped. On a static screen the snapshot and
-        /// the caret agree, so the view cursor is placed exactly —
-        /// keeping it off the bottom-right corner.
+        /// Feed anything the pump produced since the last drain, then place
+        /// the same-tick caret. The cursor rides with its snapshot (both
+        /// captured in one pump tick): feeding text alone leaves the caret
+        /// at the end of the stream, which is a line off for cursor-addressed
+        /// programs, and a live read ticks later crosses the snapshot it
+        /// positions. Static screens re-place only on moves.
         func drainFeed(into view: TerminalView) {
             let seq = state.feedSeq(for: rowId)
+            var fed = false
             if seq != lastFedSeq,
                let text = state.takeFeed(for: rowId, after: lastFedSeq)
             {
                 lastFedSeq = seq
                 view.feed(text: text)
-            } else if let cursor = state.coreCursor(for: rowId) {
-                view.feed(text: cup(cursor))
+                fed = true
             }
+            guard let cursor = state.coreCursor(for: rowId) else { return }
+            if fed || cursor.row != lastPlacedRow || cursor.col != lastPlacedCol {
+                view.feed(text: cup(cursor))
+                lastPlacedRow = cursor.row
+                lastPlacedCol = cursor.col
+            }
+        }
+
+        /// CRLF normalization for full replays (mirrors the shared feed
+        /// reconciler: a bare LF is line-feed-only in the view and would
+        /// stair-step the replay).
+        fileprivate static func normalized(_ text: String) -> String {
+            text.replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\n", with: "\r\n")
         }
 
         /// Absolute CUP (1-based) for a 0-based core caret cell.

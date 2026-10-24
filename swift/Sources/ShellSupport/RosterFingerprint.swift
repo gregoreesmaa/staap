@@ -8,10 +8,14 @@ public struct RosterFingerprintRow {
     public var lastActive: Int64
     public var linkCount: Int
     public var status: Int
+    /// Live (attached PTY) vs historic (no live PTY): a restart/resume
+    /// moves the row between the active sections and History without
+    /// changing any other field, so the stillness gate must see it.
+    public var live: Bool
 
     public init(
         id: String, title: String, project: String, harness: String,
-        lastActive: Int64, linkCount: Int, status: Int
+        lastActive: Int64, linkCount: Int, status: Int, live: Bool = true
     ) {
         self.id = id
         self.title = title
@@ -20,6 +24,7 @@ public struct RosterFingerprintRow {
         self.lastActive = lastActive
         self.linkCount = linkCount
         self.status = status
+        self.live = live
     }
 }
 
@@ -40,7 +45,8 @@ public func rosterFingerprint(
             + row.project + "\u{1F}" + row.harness + "\u{1F}"
             + String(row.lastActive) + "\u{1F}"
             + String(row.linkCount) + "\u{1F}"
-            + String(row.status) + "\n"
+            + String(row.status) + "\u{1F}"
+            + (row.live ? "L" : "h") + "\n"
     }
     out += (historyExpanded ? "H" : "h") + (selection ?? "-") + String(minute)
     return out
