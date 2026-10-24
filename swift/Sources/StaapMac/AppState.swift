@@ -37,7 +37,10 @@ final class AppState: ObservableObject {
 
     /// Feeds waiting for the terminal view: row id -> (text, sequence).
     /// The sequence lets the view skip what it already fed.
-    @Published private(set) var feeds: [String: (text: String, seq: UInt64)] = [:]
+    /// Deliberately not @Published: the terminal view polls this on its own timer, so
+    /// streaming output never re-evaluates the sidebar List (constant
+    /// re-diffs leave stale hover/selection ghosts on top of live rows).
+    private(set) var feeds: [String: (text: String, seq: UInt64)] = [:]
 
     private let core: Core
     private var fedText: [String: String] = [:]

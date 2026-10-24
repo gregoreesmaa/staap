@@ -33,6 +33,7 @@ struct CoreTerminalView: NSViewRepresentable {
             view.feed(text: initial)
         }
         context.coordinator.lastDarkMode = darkMode
+        context.coordinator.startPolling(view: view)
         // Become key so keystrokes reach the child right away.
         DispatchQueue.main.async {
             view.window?.makeFirstResponder(view)
@@ -46,6 +47,10 @@ struct CoreTerminalView: NSViewRepresentable {
             context.coordinator.lastDarkMode = darkMode
             applyThemeColors(to: view, darkMode: darkMode)
         }
+    }
+
+    static func dismantleNSView(_: TerminalView, coordinator: Coordinator) {
+        coordinator.stopPolling()
     }
 
     /// Terminal colors as a pure function of the theme prop — never of
@@ -73,6 +78,8 @@ struct CoreTerminalView: NSViewRepresentable {
         fileprivate var lastFedSeq: UInt64 = 0
         fileprivate var initialText = ""
         fileprivate var lastDarkMode = false
+        private var pollTimer: Timer?
+        private weak var pollView: TerminalView?
 
         init(state: AppState, rowId: String) {
             self.state = state
@@ -108,6 +115,27 @@ struct CoreTerminalView: NSViewRepresentable {
         private func cup(_ cursor: (row: Int, col: Int)) -> String {
             String(Character(UnicodeScalar(UInt8(27)))) + "["
                 + String(cursor.row + 1) + ";" + String(cursor.col + 1) + "H"
+        }
+
+        /// Poll the feed cache on the main runloop so the terminal stays
+        /// live without routing every output chunk through SwiftUI state
+        /// (which would re-evaluate the whole sidebar 20x/sec while any
+        /// run streams, leaving stale hover/selection ghosts behind).
+        func startPolling(view: TerminalView) {
+            stopPolling()
+            pollView = view
+            pollTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let strongSelf = self, let view = strongSelf.pollView else { return }
+                    strongSelf.drainFeed(into: view)
+                }
+            }
+        }
+
+        /// Stop the poll (paired with `dismantleNSView`).
+        func stopPolling() {
+            pollTimer?.invalidate()
+            pollTimer = nil
         }
 
         // MARK: - TerminalViewDelegate
