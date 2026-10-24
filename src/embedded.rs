@@ -854,6 +854,56 @@ mod tests {
     }
 
     #[test]
+    fn claude_glyph_widths_match_swiftterm() {
+        // Caret-parity invariant (issue #104): the core emulator must
+        // advance exactly what SwiftTerm's `UnicodeUtil.columnWidth`
+        // reports for every glyph Claude Code draws, or the view caret
+        // and the core cursor diverge by a row after a wrap. Verified
+        // Oct 2026 by diffing vt100 cursor advance against a port of
+        // SwiftTerm's width table over U+00A0..U+2FFF, CJK punctuation,
+        // halfwidth/fullwidth forms, and U+1F000..U+1FAFF (16k
+        // codepoints): the only disagreements were exotic scripts
+        // (Indic Mc marks, Khmer, Hangul filler), regional indicators,
+        // Fitzpatrick modifiers, and unassigned new-emoji — nothing
+        // Claude emits. If a unicode-width/vt100 upgrade moves one of
+        // these, the caret bug returns; this test catches the core half.
+        let one_cell = [
+            '⏺', '✻', '✳', '●', '○', '❯', '›', '⎿', '─', '│', '✓', '✗', '⚠', '→', '▶', '…', '◆',
+            '★', '⬆', 'é', '™', '©', '±', '×', '⌘', '⏎', '◯', '◇', '□', '■', '▲', '△', '▼', '◀',
+            '↑', '↓', '←', '↩', '↵', '✎', '✏', '☐', '☑', '⦿', '⊙',
+        ];
+        for ch in one_cell {
+            let mut p = vt100::Parser::new(10, 60, 0);
+            let mut buf = [0u8; 4];
+            p.process(ch.encode_utf8(&mut buf).as_bytes());
+            assert_eq!(
+                p.screen().cursor_position(),
+                (0, 1),
+                "glyph U+{:04X} must advance one cell",
+                ch as u32
+            );
+        }
+        let two_cell = [
+            '⌛', '⏰', '☕', '♈', '⚽', '❌', '➕', '⭐', '🔥', '😀', '中', '。',
+        ];
+        for ch in two_cell {
+            let mut p = vt100::Parser::new(10, 60, 0);
+            let mut buf = [0u8; 4];
+            p.process(ch.encode_utf8(&mut buf).as_bytes());
+            assert_eq!(
+                p.screen().cursor_position(),
+                (0, 2),
+                "glyph U+{:04X} must advance two cells",
+                ch as u32
+            );
+        }
+        // A combining mark attaches to the previous cell: zero advance.
+        let mut p = vt100::Parser::new(10, 60, 0);
+        p.process("́".as_bytes());
+        assert_eq!(p.screen().cursor_position(), (0, 0));
+    }
+
+    #[test]
     fn harness_ids_map_and_route_spawn_commands() {
         // opencode spawn surface: plain `opencode` starts fresh,
         // `opencode --session <id>` re-attaches a discovered session.

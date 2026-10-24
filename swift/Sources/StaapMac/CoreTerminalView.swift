@@ -80,11 +80,13 @@ struct CoreTerminalView: NSViewRepresentable {
     final class Coordinator: NSObject, @MainActor TerminalViewDelegate {
         private let state: AppState
         private let rowId: String
+        private static let probeEnabled = ProcessInfo.processInfo.environment["STAAP_CARET_DEBUG"] != nil
         fileprivate var lastFedSeq: UInt64 = 0
         fileprivate var initialText = ""
         fileprivate var lastDarkMode = false
         fileprivate var lastPlacedRow: Int = -1
         fileprivate var lastPlacedCol: Int = -1
+        fileprivate var lastProbeLog = Date.distantPast
         private var pollTimer: Timer?
         private weak var pollView: TerminalView?
 
@@ -120,9 +122,41 @@ struct CoreTerminalView: NSViewRepresentable {
                 lastPlacedRow = cursor.row
                 lastPlacedCol = cursor.col
             }
+        probeCaret(view: view, core: cursor, fed: fed)
         }
 
-        /// CRLF normalization for full replays (mirrors the shared feed
+        /// Caret-divergence probe for the Claude-only 1-row-low caret
+    /// (issue #104): after placing the core caret, compare SwiftTerm's
+    /// own grid caret and drawn caret row against it. Gated by
+    /// STAAP_CARET_DEBUG so normal runs pay one branch; mismatches log
+    /// to stderr throttled to one line per 2 s. Ship the log from a
+    /// repro run instead of guessing at the diverging byte.
+    private func probeCaret(view: TerminalView, core: (row: Int, col: Int), fed: Bool) {
+        guard Self.probeEnabled else { return }
+        let term = view.getTerminal()
+        let loc = term.getCursorLocation()
+        let frame = view.caretFrame
+        let drawnRow: Int
+        if frame.height > 0 {
+            if view.isFlipped {
+                drawnRow = Int((frame.minY / frame.height).rounded())
+            } else {
+                drawnRow = Int(((view.bounds.height - frame.minY - frame.height) / frame.height).rounded())
+            }
+        } else {
+            drawnRow = -1
+        }
+        guard loc.x != core.col || loc.y != core.row || (drawnRow >= 0 && drawnRow != core.row) else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastProbeLog) > 2 else { return }
+        lastProbeLog = now
+        let line = "staap caret-probe row=\(rowId) core=(\(core.row),\(core.col)) view=(\(loc.y),\(loc.x)) drawnRow=\(drawnRow) grid=\(term.cols)x\(term.rows) fed=\(fed)\n"
+        if let data = line.data(using: .utf8) {
+            try? FileHandle.standardError.write(contentsOf: data)
+        }
+    }
+
+    /// CRLF normalization for full replays (mirrors the shared feed
         /// reconciler: a bare LF is line-feed-only in the view and would
         /// stair-step the replay).
         fileprivate static func normalized(_ text: String) -> String {
