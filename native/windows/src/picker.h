@@ -10,7 +10,11 @@
  * Catalog rows come from `bridge_clis_json`
  * ([{id,program,path,available}] in core order); recents from
  * `bridge_recent_json` ([String], MRU-first). Missing CLIs stay listed
- * (available=false) with an install hint, never hidden.
+ * (available=false) with an install hint, never hidden. The SSH host
+ * axis trims/prefixes locally too (`trim_host`, `is_remote`,
+ * `with_ssh_prefix`); remote catalogs/recents/spawns stay on the
+ * bridge (`bridge_clis_remote`, `bridge_remote_recent_json`,
+ * `bridge_run_spawn_remote`).
  */
 
 #ifndef STAAP_WIN_PICKER_H
@@ -198,6 +202,35 @@ inline std::vector<std::string> parse_recents(const std::string &json) {
         out.push_back(std::move(val));
     }
     return out;
+}
+
+/* SSH host axis (remote sessions): blank/whitespace means this machine
+ * (local launch). Trimmed for routing, so "  " stays local and
+ * " host " dials "host". */
+inline std::string trim_host(const std::string &raw) {
+    const char *ws = " \t\n\r";
+    std::string::size_type b = raw.find_first_not_of(ws);
+    if (b == std::string::npos) {
+        return {};
+    }
+    std::string::size_type e = raw.find_last_not_of(ws);
+    return raw.substr(b, e - b + 1);
+}
+
+/* True when the trimmed host names an SSH host (remote launch). */
+inline bool is_remote(const std::string &host) {
+    return !trim_host(host).empty();
+}
+
+/* Prefix a core preview line for a remote launch ("ssh <host>: ...");
+ * local launches return the preview unchanged. */
+inline std::string with_ssh_prefix(const std::string &host,
+                                   const std::string &preview) {
+    std::string h = trim_host(host);
+    if (h.empty()) {
+        return preview;
+    }
+    return "ssh " + h + ": " + preview;
 }
 
 } /* namespace picker */

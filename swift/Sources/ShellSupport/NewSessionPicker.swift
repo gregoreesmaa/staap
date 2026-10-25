@@ -58,13 +58,15 @@ public struct NewSessionPicker {
     public var cliIndex: Int
     public var folder: String
     public var recents: [String]
+    public var host: String
     public var yolo: YoloChoice = .useDefault
 
-    public init(clis: [CliRow], cliIndex: Int, folder: String, recents: [String]) {
+    public init(clis: [CliRow], cliIndex: Int, folder: String, recents: [String], host: String = "") {
         self.clis = clis
         self.cliIndex = cliIndex
         self.folder = folder
         self.recents = recents
+        self.host = host
     }
 
     /// Blank folder means inherit (the historic behavior); anything else
@@ -93,6 +95,27 @@ public struct NewSessionPicker {
         case .forceOff: yoloTag = " (yolo off)"
         }
         return "\(cli)\(where_)\(yoloTag)"
+    }
+
+    /// Blank host means a local launch (the historic behavior); anything
+    /// else dials that SSH host and skips the local is-dir validation
+    /// (the folder is a remote path then).
+    public var isRemote: Bool {
+        effectiveRemoteHost != nil
+    }
+
+    /// Trimmed SSH host, or nil for a local launch.
+    public var effectiveRemoteHost: String? {
+        let trimmed = host.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// One-line spawn preview with the SSH leg named when remote
+    /// (`ssh mybox: muse in ~/api + yolo`), so the launch is verifiable
+    /// before it runs.
+    public var remotePreview: String {
+        guard let remote = effectiveRemoteHost else { return preview }
+        return "ssh \(remote): \(preview)"
     }
 
     public mutating func stepCli(forward: Bool) {

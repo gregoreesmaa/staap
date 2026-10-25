@@ -245,6 +245,42 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Last SSH host used for a remote launch (shell-local memory: the
+    /// core owns the per-host folder recents, but exposes no last-host
+    /// getter over the C ABI, so the sheet preselects from here).
+    private static let lastRemoteHostKey = "staap.lastRemoteHost"
+
+    var lastRemoteHost: String {
+        UserDefaults.standard.string(forKey: Self.lastRemoteHostKey) ?? ""
+    }
+
+    /// Confirmed remote picker launch: SSH host + remote folder × CLI +
+    /// tri-state yolo (same 1/-1/0 convention as the local funnel).
+    /// Blank hosts refuse fail-visible in `pendingError`, never silently.
+    /// Records the host shell-locally so the next sheet preselects it;
+    /// the core records the per-host folder memory itself.
+    func confirmRemotePicker(host: String, remoteCwd: String?, cli: String, yolo: Int32) {
+        do {
+            let id = try core.runSpawnRemote(host: host, remoteCwd: remoteCwd, cli: cli, yolo: yolo,
+                                             cols: grid.cols, rows: grid.rows)
+            UserDefaults.standard.set(host, forKey: Self.lastRemoteHostKey)
+            fedText[id] = ""
+            feeds.removeValue(forKey: id)
+            cursors.removeValue(forKey: id)
+            reloadRoster()
+            selection = id
+        } catch {
+            pendingError = error.localizedDescription
+        }
+    }
+
+    /// Remote CLI catalog for one SSH host (blocking: one bounded `ssh`
+    /// round trip — the sheet calls this off the main thread).
+    func pickerRemoteCatalog(host: String) -> [CliRow] { Core.remoteCliCatalog(host: host) }
+
+    /// Remote folder recents for one SSH host (MRU-first, no network).
+    func pickerRemoteRecents(host: String) -> [String] { core.remoteRecentFolders(host: host) }
+
     /// Restart/resume the selected run on the same id.
     func restartSelected() {
         guard let id = selection else { return }

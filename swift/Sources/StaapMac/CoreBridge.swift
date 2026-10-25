@@ -18,8 +18,17 @@ import Foundation
 // Owned JSON of the autodetected CLI catalog ([{id,program,path,
 // available}]) and of the folder recents ([String], MRU-first).
 @_silgen_name("staap_clis_json") private func staap_clis_json() -> UnsafeMutablePointer<CChar>?
+@_silgen_name("staap_remote_clis_json") private func staap_remote_clis_json(
+    _ host: UnsafePointer<CChar>?
+) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("staap_recent_json") private func staap_recent_json(
     _ core: OpaquePointer?
+) -> UnsafeMutablePointer<CChar>?
+// Owned JSON of the persisted remote folder recents for one SSH host
+// ([String], MRU-first). Null core / blank / unknown hosts yield [].
+@_silgen_name("staap_remote_recent_json") private func staap_remote_recent_json(
+    _ core: OpaquePointer?,
+    _ host: UnsafePointer<CChar>?
 ) -> UnsafeMutablePointer<CChar>?
 // Owned harness id of the effective CLI for `cli` (explicit id, or the
 // core's last-used / configured / autodetected resolution for NULL).
@@ -49,6 +58,17 @@ import Foundation
     _ core: OpaquePointer?,
     _ cli: UnsafePointer<CChar>?,
     _ cwd: UnsafePointer<CChar>?,
+    _ yolo: Int32,
+    _ cols: UInt16,
+    _ rows: UInt16,
+    _ idOut: UnsafeMutablePointer<CChar>?,
+    _ idCap: Int
+) -> Int32
+@_silgen_name("staap_run_spawn_remote") private func staap_run_spawn_remote(
+    _ core: OpaquePointer?,
+    _ host: UnsafePointer<CChar>?,
+    _ remoteCwd: UnsafePointer<CChar>?,
+    _ cli: UnsafePointer<CChar>?,
     _ yolo: Int32,
     _ cols: UInt16,
     _ rows: UInt16,
@@ -304,6 +324,32 @@ final class Core {
         return String(cString: idBuf)
     }
 
+    /// Spawn a remote session over SSH and attach it to a new roster
+    /// row, under the shared cap. Blank hosts refuse with the core
+    /// message before any spawn is attempted; the local PTY runs
+    /// `ssh -t <host> <cli...>` so interactive auth prompts surface in
+    /// the terminal. The target persists on the row, so restarts
+    /// redial it, and per-host folder memory refreshes like the local
+    /// MRU. Returns the row id; throws with the core message otherwise.
+    func runSpawnRemote(host: String, remoteCwd: String?, cli: String?, yolo: Int32, cols: Int, rows: Int) throws -> String {
+        var idBuf = [CChar](repeating: 0, count: 256)
+        let rc = host.withCString { hostPtr in
+            withOptionalCString(remoteCwd) { cwdPtr in
+                withOptionalCString(cli) { cliPtr in
+                    staap_run_spawn_remote(
+                        handle, hostPtr, cwdPtr, cliPtr, yolo,
+                        UInt16(clamping: cols), UInt16(clamping: rows),
+                        &idBuf, idBuf.count
+                    )
+                }
+            }
+        }
+        guard rc == 0 else {
+            throw CoreError.spawn(message: Self.lastError())
+        }
+        return String(cString: idBuf)
+    }
+
     /// Restart an ended run / resume a historic entry on the same id.
     func runRestart(id: String, cols: Int, rows: Int) throws {
         let rc = id.withCString {
@@ -498,6 +544,38 @@ final class Core {
               let recents = try? JSONDecoder().decode([String].self, from: data)
         else { return [] }
         return recents
+    }
+
+    /// Remote CLI catalog for one SSH host ([CliRow] in core order).
+    /// Blocking: one bounded `ssh` round trip — callers fetch this off
+    /// the main thread. Decodes to [] on failure (an unreachable host
+    /// renders as an empty picker section, never a hang or a crash).
+    static func remoteCliCatalog(host: String) -> [CliRow] {
+        var result: [CliRow] = []
+        host.withCString { hostPtr in
+            if let text = copyOwnedString(staap_remote_clis_json(hostPtr)),
+               let data = text.data(using: .utf8),
+               let rows = try? JSONDecoder().decode([CliRow].self, from: data)
+            {
+                result = rows
+            }
+        }
+        return result
+    }
+
+    /// Persisted remote folder recents for one SSH host (MRU-first).
+    /// Never touches the network; decodes to [] when absent.
+    func remoteRecentFolders(host: String) -> [String] {
+        var result: [String] = []
+        host.withCString { hostPtr in
+            if let text = copyOwnedString(staap_remote_recent_json(handle, hostPtr)),
+               let data = text.data(using: .utf8),
+               let recents = try? JSONDecoder().decode([String].self, from: data)
+            {
+                result = recents
+            }
+        }
+        return result
     }
 
     /// Harness id of the effective CLI for `cli` (explicit id, or the

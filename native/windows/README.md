@@ -71,7 +71,7 @@ powershell -ExecutionPolicy Bypass `
 | Test | What it proves |
 |---|---|
 | `feed` | `staap-win-feed-test`: the bridge's reconciler wrapper (`bridge_feed_delta` over the shared `staap_feed_delta`) against the real staticlib, no WinUI |
-| `picker` | `staap-win-picker-test`: the catalog/recents parse (native ComboBox rows) plus the shared preview/yolo/age/section/registry surface via the bridge, mirroring Linux `staap-picker-test` |
+| `picker` | `staap-win-picker-test`: the catalog/recents parse (native ComboBox rows) plus the shared preview/yolo/age/section/registry surface via the bridge, mirroring Linux `staap-picker-test`, plus the hermetic remote surface (`bridge_clis_remote` null/blank degrade, `bridge_remote_recent_json` unknown/null-core empty, `bridge_run_spawn_remote` blank/null-host refuse — no network) and the host-axis helpers (`trim_host`/`is_remote`/`with_ssh_prefix`) |
 | `keys` | `staap-win-keys-test`: the bridge's key-table wrapper (`bridge_key_encode` over the shared core table) — Return→CR, Ctrl+C→ETX, keep-keys→0, the contract the terminal preview-tunnel relies on |
 | `smoke` | `staap-win-smoke`: roster count/JSON/status over the real staticlib, OOB contract (`SMOKE-OK sessions=<n>`), plus the 2D-launch catalog and shared-helper surface |
 | `smoke-live` | `smoke_live.ps1`: compiles `tests/fake_muse.c` to `muse.exe`, then registry spawn/pump/write/resize/close against it in a scratch profile (`SMOKE-LIVE-OK`), hermetic — no real agent, no live config |
@@ -87,7 +87,7 @@ behavior).
 | Feature | Path |
 |---|---|
 | Roster | core registry rows (`staap_session_count` + `staap_session_json` live, `staap_pump_all` refreshes statuses/links), grouped Working → Idle (needs-input shares Idle, #105) → History (Needs-input list collapsed); one shared selection across the live lists, stored in the core (`staap_selected`/`staap_select`) |
-| Spawn | split-button 2D launch: New Session face / Ctrl+N repeats the last folder × CLI + yolo via `bridge_run_spawn` (null CLI/folder, attaches a real roster row under the shared cap); the chevron / Ctrl+Shift+N opens the picker dialog (folder field + Browse picker + recents, CLI ComboBox with install paths over the autodetected catalog, yolo Default labeled on/off via `bridge_yolo_default`, core preview `bridge_spawn_preview`) → `bridge_run_spawn` |
+| Spawn | split-button 2D launch: New Session face / Ctrl+N repeats the last folder × CLI + yolo via `bridge_run_spawn` (null CLI/folder, attaches a real roster row under the shared cap); the chevron / Ctrl+Shift+N opens the picker dialog (folder field + Browse picker + recents, CLI ComboBox with install paths over the autodetected catalog, yolo Default labeled on/off via `bridge_yolo_default`, core preview `bridge_spawn_preview`) → `bridge_run_spawn`; the picker's SSH host axis (blank = this machine, `ssh <host>:`-prefixed preview) routes to `bridge_run_spawn_remote` (local PTY runs `ssh -t`, blank folder = remote login dir), swaps in the per-host recents (`bridge_remote_recent_json`, core-owned, no network) and probes the remote catalog on a worker thread (`bridge_clis_remote`, stale-drop, meanwhile-until-landing); the last host is preselected from shell-local `LocalSettings` (no C ABI getter) |
 | Restart / close | Restart + Close run buttons / Ctrl+R / Ctrl+W → `bridge_run_restart` (same id, keeps title/links) / `bridge_run_close` + autosave; ended rows offer restart inline in the terminal pane |
 | Sidebar resize | drag the grip (or Tab to it + arrows/Home/End) — 220..480px (shared `bridge_clamp_sidebar` rule), persisted in `LocalSettings` |
 | Converse | key event → `bridge_key_encode` (shared table; printables resolve through the thread layout via ToUnicode, so non-US layouts type correctly) → `bridge_run_write`; pump → `bridge_feed_delta` → append to the output box. Return and plain Ctrl+C ride `TermBox_PreviewKeyDown` (tunneling: the read-only box would otherwise swallow them before they bubble); everything else bubbles via `RootGrid_KeyDown`. New Session focuses the terminal, so typing + Enter submits immediately |
@@ -110,6 +110,12 @@ behavior).
   first autodetected, with the stored per-agent flags — the core loads
   the user config, so native spawns honor it); without any CLI on PATH
   the shell reports the core's error message in the status bar.
+- Remote sessions reuse the system SSH setup only (no daemon, no stored
+  passwords/keys): the local PTY runs `ssh -t <host> <cli...>`, so
+  interactive auth prompts surface in the terminal. The host field
+  preselects the shell-local last host (`LocalSettings`, never the
+  core); per-host folder recents stay core-owned via
+  `bridge_remote_recent_json`.
 - Styling (issue #72) targets the Windows App SDK gallery look: Mica system backdrop, content extended into the title bar with a custom drag region, card surfaces with rounded corners, Segoe UI Variable type ramp, and ThemeResource brushes throughout so the window follows the system theme. No behavior changes.
 - This directory must stay free of the macOS GUI framework in code and
   prose alike (CI enforces it with a literal grep gate): the Windows

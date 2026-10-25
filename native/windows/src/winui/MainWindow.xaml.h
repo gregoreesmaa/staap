@@ -45,8 +45,9 @@ namespace winrt::StaapWinUI::implementation
          * parity with the `r`/`x` keys and the other shells). */
         void RestartSelected();
         void CloseSelected();
-        /* 2D new-session picker (folder x CLI + tri-state yolo): the
-         * caret/menu counterpart to NewButton_Click's instant repeat. */
+        /* 2D new-session picker (SSH host + folder x CLI + tri-state
+         * yolo): the caret/menu counterpart to NewButton_Click's instant
+         * repeat. */
         void PickButton_Click(
             Windows::Foundation::IInspectable const &sender,
             Microsoft::UI::Xaml::RoutedEventArgs const &args);

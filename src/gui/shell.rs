@@ -163,6 +163,11 @@ pub struct ShellView {
     /// picker owns the keyboard (see `gui::picker`); Enter confirms, Esc
     /// cancels with zero side effects.
     pub(crate) launch_picker: Option<crate::launch::LaunchPicker>,
+    /// Remote half of the 2D-launch picker (manual SSH host input +
+    /// background CLI-probe state, see `gui::picker::PickerRemote`).
+    /// Blank-host local is the default, so existing paths behave exactly
+    /// as before until a host is typed.
+    pub(crate) picker_remote: super::picker::PickerRemote,
     /// Last run-state persist (issue #26); `None` until the first save.
     /// Throttles refresh-time saves so a streaming run doesn't rewrite
     /// the file every 50 ms tick; quitting and closing always save.
@@ -186,6 +191,7 @@ impl ShellView {
             filtering: false,
             cwd_capture: None,
             launch_picker: None,
+            picker_remote: super::picker::PickerRemote::default(),
             last_persist: None,
             runs: HashMap::new(),
             quit_armed: false,

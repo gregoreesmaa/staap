@@ -97,7 +97,14 @@ impl ShellView {
         if self.picker_open() {
             let picker = self.launch_picker.as_ref().expect("picker open");
             let cli = picker.selected_cli();
-            let cli_state = if cli.available {
+            let host = self.picker_remote.host_input.trim().to_string();
+            let remote = !host.is_empty();
+            // Remote rows probe the host in the background: name the
+            // target and show `probing` until the catalog lands, so the
+            // meanwhile state is visible instead of stale `ready` rows.
+            let cli_state = if remote && self.picker_remote.in_flight.is_some() {
+                "probing"
+            } else if cli.available {
                 "ready"
             } else {
                 "not installed"
@@ -107,8 +114,13 @@ impl ShellView {
             } else {
                 picker.folder_input.clone()
             };
+            let host_part = if remote {
+                format!(" · ssh {host}")
+            } else {
+                String::new()
+            };
             return format!(
-                "new run: {folder} · {} ({cli_state}) · yolo: {} · Tab: axis · Enter: start · Esc: cancel · {}",
+                "new run: {folder}{host_part} · {} ({cli_state}) · yolo: {} · Tab: axis · Enter: start · Esc: cancel · {}",
                 cli.id,
                 self.picker_yolo_label(),
                 self.picker_preview(),

@@ -73,6 +73,20 @@ StaapPty *bridge_spawn_launch(const StaapCore *core, const char *cli,
  * bridge_string_free(). Missing CLIs stay listed (available=false). */
 char *bridge_clis_json(void);
 
+/* Owned JSON of the remote CLI catalog for one SSH host (same shape as
+ * bridge_clis_json; availability probed on the remote PATH). Null/blank
+ * hosts and every probe failure degrade to the all-listed-none-available
+ * catalog, never NULL (allocation aside). Blocking: one bounded ssh
+ * round trip — shells call this off the UI thread when the host is
+ * picked, not on every picker open. Free with bridge_string_free(). */
+char *bridge_clis_remote(const char *host);
+
+/* Owned JSON of the persisted remote folder recents for one SSH host
+ * (string array, MRU-first). Null core, null/blank hosts, and unknown
+ * hosts yield an empty list — never UB, never network. Free with
+ * bridge_string_free(). */
+char *bridge_remote_recent_json(const StaapCore *core, const char *host);
+
 /* Owned JSON string array of folder recents (MRU-first), or NULL on
  * allocation failure. Free with bridge_string_free(). */
 char *bridge_recent_json(const StaapCore *core);
@@ -120,6 +134,19 @@ void bridge_set_history_expanded(StaapCore *core, int expanded);
 int bridge_run_spawn(StaapCore *core, const char *cli, const char *cwd,
                      int yolo, unsigned cols, unsigned rows, char *id_out,
                      size_t id_cap, char **msg_out);
+
+/* Spawn a remote session over SSH and attach it to a new roster row,
+ * under the shared cap. `host` names the SSH host (required: blank
+ * hosts refuse with `msg_out` set before any spawn is attempted);
+ * `remote_cwd` is NULL (remote login directory) or the working directory
+ * on the host; `cli`/`yolo` follow bridge_run_spawn. The local PTY runs
+ * `ssh -t <host> <cli...>` so interactive auth prompts surface in the
+ * terminal. Returns 0 with the row id in `id_out` (up to `id_cap` bytes
+ * incl. NUL); nonzero with `msg_out` set like bridge_core_save. */
+int bridge_run_spawn_remote(StaapCore *core, const char *host,
+                            const char *remote_cwd, const char *cli,
+                            int yolo, unsigned cols, unsigned rows,
+                            char *id_out, size_t id_cap, char **msg_out);
 
 /* Restart an ended run / resume a historic entry on the same id.
  * Returns 0, or nonzero with `msg_out` set. */

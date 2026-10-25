@@ -38,7 +38,7 @@ meson test -C native/linux/build
 | Test | What it proves |
 |---|---|
 | `feed` | `staap-feed-test`: the bridge's reconciler wrapper (`bridge_feed_delta` over the shared `staap_feed_delta`) against the real staticlib, no GTK |
-| `picker` | `staap-picker-test`: the bridge's shared-helper wrappers (feed/key/preview/yolo/age/glyph/registry surface) against the real staticlib, no GTK |
+| `picker` | `staap-picker-test`: the bridge's shared-helper wrappers (feed/key/preview/yolo/age/glyph/registry surface) against the real staticlib, no GTK, plus the hermetic remote wrappers (`bridge_clis_remote` null/blank degrade, `bridge_remote_recent_json` unknown/null-core empty, `bridge_run_spawn_remote` blank/null-host refuse — no network) |
 | `smoke` | `staap-gtk-smoke`: roster count/JSON/status over the real staticlib, OOB contract (`SMOKE-OK sessions=<n>`), plus the 2D-launch catalog and shared-helper surface |
 | `smoke-live` | `smoke_live.sh`: registry spawn/pump/write/resize/close against a fake `muse` on `PATH` in a scratch `HOME` (`SMOKE-LIVE-OK`), hermetic — no real agent, no live config |
 
@@ -58,7 +58,7 @@ as the macOS/Windows shells (native look, identical behavior).
 | Feature | Path |
 |---|---|
 | Roster | core registry rows (`staap_session_count` + `staap_session_json` live, `staap_pump_all` refreshes statuses/links), grouped Working → Idle (needs-input shares Idle, #105) → History; single selection in the core (`staap_selected`/`staap_select`) |
-| Spawn | split-button 2D launch: New-run button / Ctrl+N repeats the last folder × CLI + yolo via `bridge_run_spawn` (null CLI/folder, attaches a real roster row under the shared cap); the ▾ caret / Ctrl+Shift+N opens the picker dialog (folder entry + Choose dialog + recents, CLI radios with install-path tooltips over the autodetected catalog, yolo Default labeled on/off via `bridge_yolo_default`, core preview `bridge_spawn_preview`) → `bridge_run_spawn` |
+| Spawn | split-button 2D launch: New-run button / Ctrl+N repeats the last folder × CLI + yolo via `bridge_run_spawn` (null CLI/folder, attaches a real roster row under the shared cap); the ▾ caret / Ctrl+Shift+N opens the picker dialog (folder entry + Choose dialog + recents, CLI radios with install-path tooltips over the autodetected catalog, yolo Default labeled on/off via `bridge_yolo_default`, core preview `bridge_spawn_preview`) → `bridge_run_spawn`; the picker's SSH host axis (blank = this machine, `ssh <host>:`-prefixed preview) routes to `bridge_run_spawn_remote` (local PTY runs `ssh -t`, blank folder = remote login dir), swaps in the per-host recents (`bridge_remote_recent_json`, core-owned, no network) and probes the remote catalog off-thread (`bridge_clis_remote`, stale-drop, silent preselect) |
 | Restart / close | header buttons / Ctrl+R / Ctrl+W → `bridge_run_restart` (same id, keeps title/links) / `bridge_run_close` + autosave; ended rows offer restart inline in the terminal pane |
 | Converse | key event → `bridge_key_encode` (shared table) → `bridge_run_write`; pump → `bridge_feed_delta` → `vte_terminal_feed` + caret from `bridge_run_cursor` (CUP after each feed) |
 | Select / copy / paste | native VTE selection + Ctrl+Shift+C/V + right-click menu |
@@ -85,6 +85,12 @@ as the macOS/Windows shells (native look, identical behavior).
   first autodetected, with the stored per-agent flags — the core loads
   the user config, so native spawns honor it); without any CLI on PATH
   the shell toasts the core's error message.
+- Remote sessions reuse the system SSH setup only (no daemon, no stored
+  passwords/keys): the local PTY runs `ssh -t <host> <cli...>`, so
+  interactive auth prompts surface in the terminal. The host field has
+  no last-host preselect (the C ABI exposes no last-host getter);
+  per-host folder recents stay core-owned via
+  `bridge_remote_recent_json`.
 - This directory must stay free of the macOS GUI framework in code and
   prose alike (CI enforces it with a literal grep gate): the Linux shell
   binds the C ABI only.

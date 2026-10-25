@@ -385,6 +385,10 @@ private struct NewSessionSheet: View {
     @State private var folder = ""
     @State private var yolo = NewSessionPicker.YoloChoice.useDefault
     @State private var folderError: String?
+    @State private var host = ""
+    @State private var remoteClis: [CliRow]? = nil
+    @State private var probingRemote = false
+    @State private var probeToken = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -405,13 +409,26 @@ private struct NewSessionSheet: View {
                 }
                 .pickerStyle(.menu)
             }
+            // SSH host axis: blank means this Mac (the historic local
+            // path); anything else runs the CLI on that host over
+            // `ssh -t` and probes the remote catalog off the main
+            // thread, so typing never blocks on the network.
+            Text("Which machine?").font(.headline)
+            TextField("Blank = this Mac", text: $host)
+                .textFieldStyle(.roundedBorder)
+                .onChange(of: host) { _, _ in hostChanged() }
+            if isRemote {
+                Text(remoteStatusLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if let folderError {
                 Text(folderError).foregroundStyle(.red).font(.caption)
             }
             // CLI axis.
             Text("Who should do it?").font(.headline)
             Picker("Agent CLI", selection: $cliId) {
-                ForEach(clis, id: \.id) { cli in
+                ForEach(shownClis, id: \.id) { cli in
                     Label {
                         VStack(alignment: .leading) {
                             Text(cli.id)
@@ -448,13 +465,14 @@ private struct NewSessionSheet: View {
                 Button("Spawn") { spawn() }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
-                    .disabled(clis.isEmpty)
+                    .disabled(shownClis.isEmpty)
             }
         }
         .padding(20)
         .frame(minWidth: 360)
         .onAppear {
             clis = state.pickerCatalog()
+            host = state.lastRemoteHost
             // Preselect the first available CLI (catalog order); a
             // configured-but-missing default stays listed but never
             // preselected — Spawn would fail for certain.
@@ -466,6 +484,49 @@ private struct NewSessionSheet: View {
                 cliId = clis.first?.id ?? "muse"
             }
             folder = state.pickerRecents().first ?? ""
+            if effectiveHost != nil {
+                startRemoteProbe()
+            }
+        }
+    }
+
+    /// Host changed: drop the stale remote catalog and probe the new
+    /// host off the main thread (`staap_remote_clis_json` blocks on one
+    /// bounded `ssh` round trip). Arrivals carry a token, so a stale
+    /// host's late arrival never overwrites the current one.
+    private func hostChanged() {
+        probeToken += 1
+        if effectiveHost == nil {
+            remoteClis = nil
+            probingRemote = false
+            return
+        }
+        startRemoteProbe()
+    }
+
+    private func startRemoteProbe() {
+        guard let remote = effectiveHost else { return }
+        probeToken += 1
+        let token = probeToken
+        probingRemote = true
+        remoteClis = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            let catalog = Core.remoteCliCatalog(host: remote)
+            DispatchQueue.main.async {
+                guard token == probeToken else { return }
+                probingRemote = false
+                remoteClis = catalog
+                if let firstUp = catalog.first(where: { $0.available }) {
+                    if !catalog.contains(where: { $0.id == cliId && $0.available }) {
+                        cliId = firstUp.id
+                    }
+                } else if let first = catalog.first {
+                    cliId = first.id
+                }
+                if folder.trimmingCharacters(in: .whitespaces).isEmpty {
+                    folder = state.pickerRemoteRecents(host: remote).first ?? ""
+                }
+            }
         }
     }
 
@@ -482,7 +543,34 @@ private struct NewSessionSheet: View {
         }
     }
 
-    private var recents: [String] { state.pickerRecents() }
+    private var recents: [String] {
+        if let remote = effectiveHost {
+            return state.pickerRemoteRecents(host: remote)
+        }
+        return state.pickerRecents()
+    }
+
+    /// Trimmed SSH host, or nil for a local launch on this Mac.
+    private var effectiveHost: String? {
+        let trimmed = host.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private var isRemote: Bool { effectiveHost != nil }
+
+    /// CLI catalog the picker renders: the probed remote catalog while
+    /// a host is set, else the local autodetected one.
+    private var shownClis: [CliRow] {
+        effectiveHost != nil ? (remoteClis ?? []) : clis
+    }
+
+    /// Status line under the host field: probing state or availability.
+    private var remoteStatusLine: String {
+        if probingRemote { return "Probing remote CLIs over ssh…" }
+        let n = (remoteClis ?? []).filter { $0.available }.count
+        if n == 0 { return "No remote CLIs detected on this host." }
+        return "\(n) remote CLI\(n == 1 ? "" : "s") available."
+    }
 
     /// Detail caption for a CLI row: install path when ready, install
     /// hint when missing (issue #102).
@@ -502,13 +590,17 @@ private struct NewSessionSheet: View {
         case .forceOn: yoloArg = 1
         case .forceOff: yoloArg = -1
         }
-        return Core.spawnPreview(cli: cliId, folder: folder, yolo: yoloArg)
+        let local = Core.spawnPreview(cli: cliId, folder: folder, yolo: yoloArg)
+        if let remote = effectiveHost {
+            return "ssh \(remote): \(local)"
+        }
+        return local
     }
 
     private func spawn() {
         let trimmed = folder.trimmingCharacters(in: .whitespaces)
         let folderOrNil = trimmed.isEmpty ? nil : trimmed
-        if let dir = folderOrNil {
+        if effectiveHost == nil, let dir = folderOrNil {
             var isDir: ObjCBool = false
             let exists = FileManager.default.fileExists(
                 atPath: dir, isDirectory: &isDir)
@@ -523,7 +615,11 @@ private struct NewSessionSheet: View {
         case .forceOn: yoloArg = 1
         case .forceOff: yoloArg = -1
         }
-        state.confirmPicker(cli: cliId, folder: folderOrNil, yolo: yoloArg)
+        if let remote = effectiveHost {
+            state.confirmRemotePicker(host: remote, remoteCwd: folderOrNil, cli: cliId, yolo: yoloArg)
+        } else {
+            state.confirmPicker(cli: cliId, folder: folderOrNil, yolo: yoloArg)
+        }
         isPresented = false
     }
 }

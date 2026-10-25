@@ -43,7 +43,10 @@ impl ShellView {
             }
             // Configured per-agent flags ride along (issue #33). The
             // session's folder rides along too (issue #48): one seam,
-            // every backend, restarts included.
+            // every backend, restarts included. Remote rows report `None`
+            // from `session_cwd` (the dir rides inside the `ssh` command
+            // from `spawn_command_for`), so they spawn with an inherited
+            // local cwd — the same two lines cover both seams.
             let (program, args) = self.app.spawn_command_for(&kind);
             let spawned = match self.app.session_cwd(&run_id) {
                 Some(dir) => {
@@ -318,5 +321,35 @@ mod tests {
         let err = view.app.error_text().unwrap_or_default();
         assert!(err.contains("live runs"), "unexpected error: {err}");
         assert!(view.can_retry());
+    }
+
+    #[test]
+    fn remote_launch_queues_an_ssh_spawn_with_no_local_cwd() {
+        // The picker builds the selection (see `gui::picker`); the spawn
+        // path only has to honor the core remote-spawn API: `ssh -t`
+        // wrap with the remote dir folded into the snippet, and no local
+        // cwd for the PTY (the dir rides `ssh`, never the local child).
+        use crate::launch::SshTarget;
+        let mut view = test_shell();
+        view.app
+            .start_launch(&crate::launch::LaunchSelection::new_remote(
+                "muse".to_string(),
+                false,
+                SshTarget::new("mybox".to_string(), Some("/srv/api".to_string())),
+            ));
+        let kind = view.app.take_pending_spawn().expect("remote spawn queued");
+        assert!(kind.is_remote());
+        let target = kind.remote_target().expect("remote target queued");
+        assert_eq!(target.host, "mybox");
+        let (program, args) = view.app.spawn_command_for(&kind);
+        assert_eq!(program, "ssh");
+        assert!(args.contains(&"-t".to_string()), "{args:?}");
+        assert!(args.contains(&"mybox".to_string()), "{args:?}");
+        assert!(
+            args.iter().any(|a| a.contains("/srv/api")),
+            "remote dir folds into the ssh snippet: {args:?}"
+        );
+        let id = view.active_id().expect("new run selected");
+        assert_eq!(view.app.session_cwd(&id), None);
     }
 }

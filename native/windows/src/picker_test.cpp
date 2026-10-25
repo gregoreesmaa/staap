@@ -90,9 +90,75 @@ static void shared_helpers_come_from_core(void) {
     bridge_core_free(core);
 }
 
+static void host_axis_helpers(void) {
+    CHECK(!picker::is_remote(""), "blank not remote");
+    CHECK(!picker::is_remote("   "), "whitespace not remote");
+    CHECK(picker::trim_host("  nas\t") == "nas", "host trims");
+    CHECK(picker::is_remote("nas"), "host is remote");
+    CHECK(picker::with_ssh_prefix("", "runs: muse") == "runs: muse",
+          "local preview unchanged");
+    CHECK(picker::with_ssh_prefix("nas", "runs: muse") ==
+              "ssh nas: runs: muse",
+          "remote preview prefixed");
+}
+
+static void remote_bridge_surface(void) {
+    /* Hermetic: null/blank hosts degrade, unknown hosts yield no
+     * recents, and a blank-host spawn refuses before any spawn — no
+     * network in any path. */
+    StaapCore *core = bridge_core_new();
+    CHECK(core != nullptr, "remote core new");
+    char *rnull = bridge_clis_remote(nullptr);
+    CHECK(rnull && std::strstr(rnull, "\"available\":false") != nullptr,
+          "remote clis null degrades");
+    if (rnull) {
+        bridge_string_free(rnull);
+    }
+    char *rblank = bridge_clis_remote("");
+    CHECK(rblank && rblank[0] == '[' &&
+              std::strstr(rblank, "\"available\":false") != nullptr,
+          "remote clis blank degrades");
+    if (rblank) {
+        bridge_string_free(rblank);
+    }
+    char *rrec = bridge_remote_recent_json(core, "no-such-host-xyz");
+    CHECK(rrec && std::strcmp(rrec, "[]") == 0,
+          "remote recents unknown empty");
+    if (rrec) {
+        bridge_string_free(rrec);
+    }
+    char *rrec0 = bridge_remote_recent_json(nullptr, "h");
+    CHECK(rrec0 && std::strcmp(rrec0, "[]") == 0,
+          "remote recents null core empty");
+    if (rrec0) {
+        bridge_string_free(rrec0);
+    }
+    {
+        char id[128] = {0};
+        char *err = nullptr;
+        int rc = bridge_run_spawn_remote(core, "", nullptr, nullptr, 0, 80,
+                                         24, id, sizeof id, &err);
+        CHECK(rc != 0, "remote spawn blank refuses");
+        CHECK(err && err[0] != '\0', "remote spawn blank names fix");
+        free(err);
+    }
+    {
+        char id[128] = {0};
+        char *err = nullptr;
+        int rc = bridge_run_spawn_remote(core, nullptr, nullptr, nullptr, 0,
+                                         80, 24, id, sizeof id, &err);
+        CHECK(rc != 0, "remote spawn null host refuses");
+        CHECK(err && err[0] != '\0', "remote spawn null host names fix");
+        free(err);
+    }
+    bridge_core_free(core);
+}
+
 int main(void) {
     catalog_parses_in_order();
     recents_parse();
+    host_axis_helpers();
+    remote_bridge_surface();
     shared_helpers_come_from_core();
     if (failures == 0) {
         std::printf("PICKER-OK\n");

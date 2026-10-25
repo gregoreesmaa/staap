@@ -91,6 +91,14 @@ char *bridge_clis_json(void) {
     return staap_clis_json();
 }
 
+char *bridge_clis_remote(const char *host) {
+    return staap_remote_clis_json(host);
+}
+
+char *bridge_remote_recent_json(const StaapCore *core, const char *host) {
+    return staap_remote_recent_json(core, host);
+}
+
 char *bridge_recent_json(const StaapCore *core) {
     return staap_recent_json(core);
 }
@@ -149,6 +157,19 @@ int bridge_run_spawn(StaapCore *core, const char *cli, const char *cwd,
                      size_t id_cap, char **msg_out) {
     int rc = staap_run_spawn(core, cli, cwd, (int32_t)yolo, (uint16_t)cols,
                           (uint16_t)rows, id_out, id_cap);
+    if (rc != 0 && msg_out) {
+        *msg_out = copy_last_error();
+    }
+    return rc;
+}
+
+int bridge_run_spawn_remote(StaapCore *core, const char *host,
+                            const char *remote_cwd, const char *cli,
+                            int yolo, unsigned cols, unsigned rows,
+                            char *id_out, size_t id_cap, char **msg_out) {
+    int rc = staap_run_spawn_remote(core, host, remote_cwd, cli,
+                                 (int32_t)yolo, (uint16_t)cols,
+                                 (uint16_t)rows, id_out, id_cap);
     if (rc != 0 && msg_out) {
         *msg_out = copy_last_error();
     }

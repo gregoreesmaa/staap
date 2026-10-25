@@ -11,7 +11,8 @@
 //               shared selection across lists (#73)
 //   spawn       New Session button / Ctrl+N -> bridge_run_spawn
 //               (repeat-last: null CLI/folder, zero yolo); picker button /
-//               Ctrl+Shift+N -> ContentDialog (folder x CLI + yolo) below
+//               Ctrl+Shift+N -> ContentDialog (SSH host + folder x CLI +
+//               yolo) below; a host routes to bridge_run_spawn_remote
 //   restart     Ctrl+R -> bridge_run_restart (same id, keeps title/links)
 //   close       Ctrl+W -> bridge_run_close + autosave (no confirm)
 //   converse    key event -> bridge_key_encode -> bridge_run_write;
@@ -41,6 +42,9 @@
 #include "core_bridge.h"
 #include "json_mini.h"
 #include "picker.h"
+
+#include <memory>
+#include <thread>
 
 #include <shobjidl.h> // IInitializeWithWindow (folder picker owner)
 #include <microsoft.ui.xaml.window.h> // IWindowNative (picker owner HWND)
@@ -83,6 +87,9 @@ namespace winrt::StaapWinUI::implementation
     constexpr double kSidebarMax = 480.0;
     constexpr double kSidebarKeyStep = 8.0;
     constexpr wchar_t const *kSidebarWidthKey = L"SidebarWidth";
+    /* Shell-local last SSH host (LocalSettings; the C ABI exposes no
+     * last-host getter, so this never leaves the shell). */
+    constexpr wchar_t const *kRemoteHostKey = L"RemoteHost";
 
     static std::wstring to_wide(std::string const &s) {
         if (s.empty()) {
@@ -772,15 +779,16 @@ namespace winrt::StaapWinUI::implementation
         char *recents_raw = bridge_recent_json(m_core);
         std::string recents_json = recents_raw ? recents_raw : "[]";
         bridge_string_free(recents_raw);
-        auto clis = picker::parse_clis(clis_json);
+        auto clis_ptr = std::make_shared<std::vector<picker::CliRow>>(
+            picker::parse_clis(clis_json));
         auto recents = picker::parse_recents(recents_json);
-        if (clis.empty()) {
+        if (clis_ptr->empty()) {
             SetStatus(L"No agent CLI catalog: cannot open the picker.");
             co_return;
         }
 
         ComboBox cliBox;
-        for (auto const &cli : clis) {
+        for (auto const &cli : *clis_ptr) {
             ComboBoxItem item;
             std::string label = cli.id;
             label += cli.available ? " — ready" : " — not installed";
@@ -812,6 +820,14 @@ namespace winrt::StaapWinUI::implementation
             native->get_WindowHandle(&hwnd);
         }
 
+        /* SSH host axis (remote sessions): blank means this machine.
+         * Typing a host swaps in the per-host recents (core-owned, no
+         * network) and probes the remote CLI catalog on a worker thread
+         * (stale-drop; the local catalog stands meanwhile). */
+        TextBox hostBox;
+        hostBox.PlaceholderText(L"SSH host — blank = this machine");
+        hostBox.MinWidth(260);
+
         TextBox folderBox;
         folderBox.PlaceholderText(L"Blank = current folder");
         folderBox.Text(to_wide(recents.empty() ? "" : recents[0]));
@@ -841,11 +857,17 @@ namespace winrt::StaapWinUI::implementation
                           .Resources()
                           .Lookup(box_value(L"CaptionTextBlockStyle"))
                           .as<Style>());
+        /* Remote probe status line (empty unless probing/probed). */
+        TextBlock remoteStatus;
+        remoteStatus.Style(Application::Current()
+                               .Resources()
+                               .Lookup(box_value(L"CaptionTextBlockStyle"))
+                               .as<Style>());
         auto refresh = [&]() {
             int ci = cliBox.SelectedIndex();
             std::string cli =
-                (ci >= 0 && static_cast<size_t>(ci) < clis.size())
-                    ? clis[static_cast<size_t>(ci)].id
+                (ci >= 0 && static_cast<size_t>(ci) < clis_ptr->size())
+                    ? (*clis_ptr)[static_cast<size_t>(ci)].id
                     : "muse";
             /* Label "Default" with its resolved state (issue #102). */
             std::string def_label = "Default (";
@@ -853,12 +875,16 @@ namespace winrt::StaapWinUI::implementation
             def_label += ")";
             yoloBox.Items().SetAt(0, box_value(to_wide(def_label)));
             std::string folder = to_utf8(folderBox.Text());
-            /* Core-owned preview + yolo mapping (single copies). */
+            /* Core-owned preview + yolo mapping (single copies); a host
+             * prefixes the SSH chrome (shell-owned). */
             int yolo = bridge_yolo_value(yoloBox.SelectedIndex());
             char *text =
                 bridge_spawn_preview(cli.c_str(), folder.c_str(), yolo);
-            preview.Text(to_wide(text ? text : ""));
+            std::string line = text ? text : "";
             free(text);
+            std::string host =
+                picker::trim_host(to_utf8(hostBox.Text()));
+            preview.Text(to_wide(picker::with_ssh_prefix(host, line)));
         };
         cliBox.SelectionChanged(
             [&refresh](IInspectable const &, SelectionChangedEventArgs const &) {
@@ -872,18 +898,19 @@ namespace winrt::StaapWinUI::implementation
             [&](IInspectable const &, TextChangedEventArgs const &) {
                 refresh();
             });
-        if (!recents.empty()) {
-            recentBox.SelectionChanged(
-                [&](IInspectable const &,
-                    SelectionChangedEventArgs const &) {
-                    int ri = recentBox.SelectedIndex();
-                    if (ri > 0 &&
-                        static_cast<size_t>(ri - 1) < recents.size()) {
-                        folderBox.Text(to_wide(recents[static_cast<size_t>(ri - 1)]));
-                    }
-                    refresh();
-                });
-        }
+        /* Wired unconditionally: reload_recents swaps the model on
+         * every host edit, so a late-appearing recentBox must fill the
+         * folder too. Reads the current recents, never the initial. */
+        recentBox.SelectionChanged(
+            [&](IInspectable const &,
+                SelectionChangedEventArgs const &) {
+                int ri = recentBox.SelectedIndex();
+                if (ri > 0 &&
+                    static_cast<size_t>(ri - 1) < recents.size()) {
+                    folderBox.Text(to_wide(recents[static_cast<size_t>(ri - 1)]));
+                }
+                refresh();
+            });
         refresh();
 
         StackPanel panel;
@@ -897,6 +924,9 @@ namespace winrt::StaapWinUI::implementation
                         .as<Style>());
             return h;
         };
+        panel.Children().Append(head(L"Which machine?"));
+        panel.Children().Append(hostBox);
+        panel.Children().Append(remoteStatus);
         panel.Children().Append(head(L"Where should it work?"));
         StackPanel folderRow;
         folderRow.Orientation(Orientation::Horizontal);
@@ -934,8 +964,8 @@ namespace winrt::StaapWinUI::implementation
         auto sync_spawn = [&]() {
             int ci = cliBox.SelectedIndex();
             bool avail =
-                (ci >= 0 && static_cast<size_t>(ci) < clis.size()) &&
-                clis[static_cast<size_t>(ci)].available;
+                (ci >= 0 && static_cast<size_t>(ci) < clis_ptr->size()) &&
+                (*clis_ptr)[static_cast<size_t>(ci)].available;
             dialog.IsPrimaryButtonEnabled(avail);
         };
         cliBox.SelectionChanged(
@@ -943,15 +973,186 @@ namespace winrt::StaapWinUI::implementation
                 sync_spawn();
             });
         sync_spawn();
+        /* Remote catalog probe (off the UI thread; stale-drop). `probe`
+         * is shared with the worker, so a late arrival after the dialog
+         * closes drops on `open`/generation before touching dialog
+         * state (the hop back rides the window DispatcherQueue). */
+        struct ProbeState {
+            unsigned gen = 0;
+            bool open = true;
+        };
+        auto probe = std::make_shared<ProbeState>();
+        bool recent_shown = !recents.empty();
+        /* Rebuild the CLI ComboBox from a fresh catalog (local catalog
+         * when the host clears, remote catalog on probe arrival). The
+         * selected CLI id survives when still listed and available,
+         * else the first available CLI wins. */
+        auto replace_clis = [&](std::vector<picker::CliRow> fresh,
+                                const std::string &probed) {
+            std::string keep;
+            int ci = cliBox.SelectedIndex();
+            if (ci >= 0 &&
+                static_cast<size_t>(ci) < clis_ptr->size()) {
+                keep = (*clis_ptr)[static_cast<size_t>(ci)].id;
+            }
+            *clis_ptr = std::move(fresh);
+            cliBox.Items().Clear();
+            for (auto const &cli : *clis_ptr) {
+                ComboBoxItem item;
+                std::string label = cli.id;
+                label += cli.available ? " — ready" : " — not installed";
+                if (cli.available && !cli.path.empty()) {
+                    label += " (" + cli.path + ")";
+                }
+                item.Content(box_value(to_wide(label)));
+                item.Tag(box_value(to_wide(cli.id)));
+                item.IsEnabled(cli.available);
+                if (!cli.available) {
+                    ToolTipService::SetToolTip(
+                        item, box_value(winrt::hstring(
+                                  L"Install this CLI and ensure it is on PATH.")));
+                }
+                cliBox.Items().Append(item);
+            }
+            bool picked = false;
+            if (!keep.empty()) {
+                for (uint32_t i = 0; i < cliBox.Items().Size(); ++i) {
+                    auto item =
+                        cliBox.Items().GetAt(i).try_as<ComboBoxItem>();
+                    if (item && item.IsEnabled() &&
+                        to_utf8(unbox_value<hstring>(item.Tag())) ==
+                            keep) {
+                        cliBox.SelectedIndex(static_cast<int32_t>(i));
+                        picked = true;
+                        break;
+                    }
+                }
+            }
+            if (!picked) {
+                for (uint32_t i = 0; i < cliBox.Items().Size(); ++i) {
+                    auto item =
+                        cliBox.Items().GetAt(i).try_as<ComboBoxItem>();
+                    if (item && item.IsEnabled()) {
+                        cliBox.SelectedIndex(static_cast<int32_t>(i));
+                        picked = true;
+                        break;
+                    }
+                }
+            }
+            if (!picked) {
+                cliBox.SelectedIndex(-1);
+            }
+            if (probed.empty()) {
+                remoteStatus.Text(L"");
+            } else {
+                size_t ready = 0;
+                for (auto const &cli : *clis_ptr) {
+                    if (cli.available) {
+                        ++ready;
+                    }
+                }
+                remoteStatus.Text(winrt::hstring(to_wide(
+                    "Probed " + probed + ": " + std::to_string(ready) +
+                    " CLI(s) available.")));
+            }
+            refresh();
+            sync_spawn();
+        };
+        /* Per-host recents (core-owned, never network): the entry keeps
+         * whatever the user typed; the dropdown model is swapped. */
+        auto reload_recents = [&](const std::string &host) {
+            char *raw = host.empty()
+                            ? bridge_recent_json(m_core)
+                            : bridge_remote_recent_json(m_core,
+                                                        host.c_str());
+            std::string js = raw ? raw : "[]";
+            bridge_string_free(raw);
+            recents = picker::parse_recents(js);
+            recentBox.Items().Clear();
+            recentBox.Items().Append(
+                box_value(winrt::hstring(L"Type a folder…")));
+            for (auto const &r : recents) {
+                recentBox.Items().Append(box_value(to_wide(r)));
+            }
+            recentBox.SelectedIndex(0);
+            if (!recents.empty() && !recent_shown) {
+                /* Fixed panel order above: recentBox sits after
+                 * folderRow (index 5). */
+                panel.Children().InsertAt(5, recentBox);
+                recent_shown = true;
+            }
+        };
+        auto kick_probe = [&](const std::string &host) {
+            unsigned my = ++probe->gen;
+            if (host.empty()) {
+                char *raw = bridge_clis_json();
+                std::string js = raw ? raw : "[]";
+                bridge_string_free(raw);
+                replace_clis(picker::parse_clis(js), std::string{});
+                return;
+            }
+            remoteStatus.Text(
+                winrt::hstring(to_wide("Probing " + host + "…")));
+            /* NB: the type needs its namespace: the inherited
+             * DependencyObject::DispatcherQueue() method hides the bare
+             * type name inside this member function. */
+            Microsoft::UI::Dispatching::DispatcherQueue dq =
+                DispatcherQueue();
+            std::thread([my, host, dq, probe, replace_clis]() {
+                /* One bounded ssh round trip, off the UI thread. */
+                char *raw = bridge_clis_remote(host.c_str());
+                std::string js = raw ? raw : "[]";
+                bridge_string_free(raw);
+                dq.TryEnqueue([my, host, js, probe, replace_clis]() {
+                    if (!probe->open || my != probe->gen) {
+                        return; /* stale arrival or closed: drop */
+                    }
+                    replace_clis(picker::parse_clis(js), host);
+                });
+            }).detach();
+        };
+        hostBox.TextChanged(
+            [&](IInspectable const &, TextChangedEventArgs const &) {
+                std::string host =
+                    picker::trim_host(to_utf8(hostBox.Text()));
+                browse.IsEnabled(host.empty());
+                folderBox.PlaceholderText(
+                    host.empty()
+                        ? winrt::hstring(L"Blank = current folder")
+                        : winrt::hstring(
+                              L"Blank = remote login folder"));
+                reload_recents(host);
+                kick_probe(host);
+                refresh();
+            });
+        /* Last-host preselect (shell-local LocalSettings; the C ABI
+         * exposes no last-host getter). Setting Text fires the handler
+         * above: recents swap + probe with meanwhile-until-landing. */
+        try {
+            auto values = Windows::Storage::ApplicationData::Current()
+                              .LocalSettings()
+                              .Values();
+            if (values.HasKey(kRemoteHostKey)) {
+                hstring last =
+                    unbox_value<hstring>(values.Lookup(kRemoteHostKey));
+                if (!last.empty()) {
+                    hostBox.Text(last);
+                }
+            }
+        } catch (...) {
+        }
         auto result = co_await dialog.ShowAsync();
+        probe->open = false;
+        ++probe->gen; /* in-flight probes land stale and drop */
         if (result != ContentDialogResult::Primary) {
             co_return;
         }
         int ci = cliBox.SelectedIndex();
         std::string cli =
-            (ci >= 0 && static_cast<size_t>(ci) < clis.size())
-                ? clis[static_cast<size_t>(ci)].id
+            (ci >= 0 && static_cast<size_t>(ci) < clis_ptr->size())
+                ? (*clis_ptr)[static_cast<size_t>(ci)].id
                 : "muse";
+        std::string host = picker::trim_host(to_utf8(hostBox.Text()));
         std::string raw_folder = to_utf8(folderBox.Text());
         /* Blank/whitespace inherits (core trims the same way). */
         std::string folder;
@@ -963,8 +1164,10 @@ namespace winrt::StaapWinUI::implementation
             }
         }
         /* is-dir check inline (fail visible, dialog already closed by
-         * ShowAsync: report in the status line with the fix named). */
-        if (!folder.empty()) {
+         * ShowAsync: report in the status line with the fix named).
+         * Remote paths skip this gate (they cannot be stated locally);
+         * the core reports remote failures instead. */
+        if (host.empty() && !folder.empty()) {
             DWORD attrs = GetFileAttributesA(folder.c_str());
             if (attrs == INVALID_FILE_ATTRIBUTES ||
                 !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -979,9 +1182,23 @@ namespace winrt::StaapWinUI::implementation
         int yolo = bridge_yolo_value(yoloBox.SelectedIndex());
         char id[256] = {0};
         char *err = nullptr;
-        if (bridge_run_spawn(m_core, cli.c_str(),
-                             folder.empty() ? nullptr : folder.c_str(),
-                             yolo, kCols, kRows, id, sizeof id, &err) != 0) {
+        int rc;
+        if (!host.empty()) {
+            /* Remote: the local PTY runs `ssh -t <host> <cli...>` under
+             * the shared cap, so interactive auth prompts surface in
+             * the terminal; a blank folder means the remote login
+             * directory. */
+            rc = bridge_run_spawn_remote(
+                m_core, host.c_str(),
+                folder.empty() ? nullptr : folder.c_str(), cli.c_str(),
+                yolo, kCols, kRows, id, sizeof id, &err);
+        } else {
+            rc = bridge_run_spawn(m_core, cli.c_str(),
+                                  folder.empty() ? nullptr : folder.c_str(),
+                                  yolo, kCols, kRows, id, sizeof id,
+                                  &err);
+        }
+        if (rc != 0) {
             std::string msg = "Could not spawn: ";
             msg += err ? err : "unknown error";
             SetStatus(to_hstring(msg));
@@ -992,8 +1209,20 @@ namespace winrt::StaapWinUI::implementation
         RefreshRoster();
         ShowSelected();
         char *done = bridge_spawn_preview(cli.c_str(), folder.c_str(), yolo);
-        SetStatus(winrt::hstring(to_wide(done ? done : "")));
+        std::string line = done ? done : "";
         free(done);
+        if (!host.empty()) {
+            line = picker::with_ssh_prefix(host, line);
+            /* Remember the host for next time (shell-local only). */
+            try {
+                Windows::Storage::ApplicationData::Current()
+                    .LocalSettings()
+                    .Values()
+                    .Insert(kRemoteHostKey, box_value(to_wide(host)));
+            } catch (...) {
+            }
+        }
+        SetStatus(winrt::hstring(to_wide(line)));
         /* Hand the keyboard to the new session (takes the keyboard on
          * spawn, like the macOS shell's `n` key): without this, focus stays on
          * the New Session button, where Return re-clicks instead of

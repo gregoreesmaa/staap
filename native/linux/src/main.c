@@ -11,6 +11,7 @@
  *               grouped working → idle (needs-input shares idle,
  *               issue #105), history collapsed in its own toggle
  *   spawn       header New run (repeat-last) + ▾ picker → staap_run_spawn
+ *               (blank host) or staap_run_spawn_remote (SSH host axis)
  *   restart     header Restart / Ctrl+R → staap_run_restart (same id)
  *   close       header Close run / Ctrl+W → staap_run_close + autosave
  *   converse    key event → staap_key_encode → staap_run_write; pump →
@@ -504,7 +505,7 @@ static void on_spawn(GtkButton *btn, gpointer data) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 2D new-session picker (folder x CLI + yolo).                        */
+/* 2D new-session picker (folder x CLI + yolo, local or over SSH).     */
 /* ------------------------------------------------------------------ */
 
 /* Picker catalog row (parsed from the core CLI catalog JSON). */
@@ -519,14 +520,18 @@ typedef struct {
     PickerCli *clis;
     size_t n_clis;
     GtkCheckButton **cli_btns;
+    GtkWidget *cli_box; /* radio rows live here so a probe can rebuild them */
     GtkEntry *folder;
+    GtkEntry *host; /* SSH host; blank means this machine (local launch) */
     GtkDropDown *recent;
     char **recents;
     size_t n_recents;
     GtkDropDown *yolo;
     GtkLabel *preview;
+    GtkLabel *status; /* probing line under the host axis, else empty */
     GtkLabel *error;
     AdwDialog *dialog;
+    unsigned probe_gen; /* bumped per host edit; stale arrivals are dropped */
 } PickerUi;
 
 /* Minimal catalog/recents JSON parse (flat shapes from the core; the
@@ -666,7 +671,18 @@ static void picker_refresh_preview(PickerUi *pu) {
     int yolo =
         bridge_yolo_value((int)gtk_drop_down_get_selected(pu->yolo));
     char *text = bridge_spawn_preview(cli, folder, yolo);
-    gtk_label_set_text(pu->preview, text ? text : "runs: muse");
+    /* pu->host is NULL until the dialog build reaches the host axis. */
+    const char *host_raw =
+        pu->host ? gtk_editable_get_text(GTK_EDITABLE(pu->host)) : NULL;
+    char *host = trimmed_or_null(host_raw);
+    if (host && text) {
+        char *remote = g_strdup_printf("ssh %s: %s", host, text);
+        gtk_label_set_text(pu->preview, remote ? remote : text);
+        g_free(remote);
+    } else {
+        gtk_label_set_text(pu->preview, text ? text : "runs: muse");
+    }
+    free(host);
     free(text);
 }
 
@@ -729,42 +745,284 @@ static void picker_recent_changed(GObject *obj, GParamSpec *pspec,
     picker_on_changed(pu);
 }
 
+/* Live pickers (main thread only). The remote-catalog probe runs on a
+ * worker thread and never touches a PickerUi off-thread: its result hops
+ * back via g_idle_add and is applied only when the picker is still open
+ * and the generation still matches (stale arrivals are dropped). */
+static GSList *live_pickers = NULL;
+
+/* Trim ASCII spaces/tabs; NULL/blank yields NULL (malloc'd otherwise). */
+static char *trimmed_or_null(const char *raw) {
+    if (!raw) {
+        return NULL;
+    }
+    while (*raw == ' ' || *raw == '\t') {
+        raw++;
+    }
+    size_t len = strlen(raw);
+    while (len > 0 && (raw[len - 1] == ' ' || raw[len - 1] == '\t')) {
+        len--;
+    }
+    if (len == 0) {
+        return NULL;
+    }
+    char *out = malloc(len + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, raw, len);
+    out[len] = '\0';
+    return out;
+}
+
+/* Rebuild the CLI radio rows from a catalog JSON payload (local catalog
+ * at open, remote catalog on probe arrival). The previously selected CLI
+ * id is preserved when it is still listed and available; otherwise the
+ * first available CLI is preselected. Handlers connect after
+ * preselection, so the initial set_active stays silent — callers refresh
+ * the yolo label and preview explicitly. */
+static void picker_replace_clis(PickerUi *pu, const char *json) {
+    char selected[128] = { 0 };
+    for (size_t i = 0; i < pu->n_clis; i++) {
+        if (pu->cli_btns && gtk_check_button_get_active(pu->cli_btns[i])) {
+            snprintf(selected, sizeof selected, "%s", pu->clis[i].id);
+            break;
+        }
+    }
+    GtkWidget *child;
+    while ((child = gtk_widget_get_first_child(pu->cli_box)) != NULL) {
+        gtk_box_remove(GTK_BOX(pu->cli_box), child);
+    }
+    clis_free(pu->clis, pu->n_clis);
+    free(pu->cli_btns);
+    pu->clis = NULL;
+    pu->cli_btns = NULL;
+    pu->n_clis = 0;
+    pu->clis = parse_clis(json ? json : "[]", &pu->n_clis);
+    if (pu->clis) {
+        pu->cli_btns =
+            calloc(pu->n_clis ? pu->n_clis : 1, sizeof *pu->cli_btns);
+    }
+    if (!pu->clis || !pu->cli_btns) {
+        return;
+    }
+    GtkCheckButton *group = NULL;
+    for (size_t i = 0; i < pu->n_clis; i++) {
+        char *label;
+        if (pu->clis[i].available) {
+            label = g_strdup_printf("%s — ready", pu->clis[i].id);
+        } else {
+            label = g_strdup_printf("%s — not installed", pu->clis[i].id);
+        }
+        GtkWidget *row = gtk_check_button_new_with_label(label);
+        g_free(label);
+        gtk_check_button_set_group(GTK_CHECK_BUTTON(row), group);
+        if (!group) {
+            group = GTK_CHECK_BUTTON(row);
+        }
+        gtk_widget_set_sensitive(row, pu->clis[i].available ? TRUE : FALSE);
+        gtk_widget_set_tooltip_text(
+            row, pu->clis[i].available
+                     ? (pu->clis[i].path ? pu->clis[i].path : pu->clis[i].id)
+                     : "Install this CLI and ensure it is on PATH.");
+        gtk_box_append(GTK_BOX(pu->cli_box), row);
+        pu->cli_btns[i] = GTK_CHECK_BUTTON(row);
+    }
+    size_t pick = pu->n_clis;
+    if (selected[0]) {
+        for (size_t i = 0; i < pu->n_clis; i++) {
+            if (pu->clis[i].available &&
+                strcmp(pu->clis[i].id, selected) == 0) {
+                pick = i;
+                break;
+            }
+        }
+    }
+    if (pick == pu->n_clis) {
+        for (size_t i = 0; i < pu->n_clis; i++) {
+            if (pu->clis[i].available) {
+                pick = i;
+                break;
+            }
+        }
+    }
+    if (pick < pu->n_clis) {
+        gtk_check_button_set_active(pu->cli_btns[pick], TRUE);
+    }
+    for (size_t i = 0; i < pu->n_clis; i++) {
+        g_signal_connect(pu->cli_btns[i], "toggled",
+                         G_CALLBACK(picker_cli_toggled), pu);
+    }
+}
+
+typedef struct {
+    PickerUi *pu;
+    unsigned gen;
+    char *host; /* owned */
+} ProbeReq;
+
+typedef struct {
+    PickerUi *pu;
+    unsigned gen;
+    char *host; /* owned, for the failure line */
+    char *json; /* owned (bridge string); NULL on allocation failure */
+} ProbeDone;
+
+/* Main-thread landing for a finished probe: apply only when the picker
+ * is still open and the generation still matches. */
+static gboolean picker_probe_deliver(gpointer data) {
+    ProbeDone *done = data;
+    int current = g_slist_find(live_pickers, done->pu) != NULL &&
+                  done->pu->probe_gen == done->gen;
+    if (current) {
+        if (done->json) {
+            picker_replace_clis(done->pu, done->json);
+            gtk_label_set_text(done->pu->status, "");
+        } else {
+            char *msg = g_strdup_printf("Probe of %s failed.", done->host);
+            gtk_label_set_text(done->pu->status, msg);
+            g_free(msg);
+        }
+        picker_refresh_yolo(done->pu);
+        picker_on_changed(done->pu);
+    }
+    bridge_string_free(done->json);
+    g_free(done->host);
+    free(done);
+    return G_SOURCE_REMOVE;
+}
+
+/* Worker thread: one bounded ssh round trip, off the UI thread. Never
+ * touches widgets or the picker; the result hops back via idle. */
+static gpointer picker_probe_thread(gpointer data) {
+    ProbeReq *req = data;
+    char *json = bridge_clis_remote(req->host);
+    ProbeDone *done = malloc(sizeof *done);
+    if (done) {
+        done->pu = req->pu;
+        done->gen = req->gen;
+        done->host = req->host; /* ownership moves */
+        done->json = json;
+        req->host = NULL;
+        g_idle_add(picker_probe_deliver, done);
+    } else {
+        bridge_string_free(json);
+    }
+    g_free(req->host);
+    free(req);
+    return NULL;
+}
+
+/* Refresh the CLI catalog for `host` (NULL/blank = this machine).
+ * Remote hosts probe in the background with stale-drop; returning to
+ * blank restores the synchronous local catalog. */
+static void picker_probe_remote(PickerUi *pu, const char *host) {
+    pu->probe_gen++;
+    if (!host || !*host) {
+        gtk_label_set_text(pu->status, "");
+        char *json = bridge_clis_json();
+        picker_replace_clis(pu, json ? json : "[]");
+        bridge_string_free(json);
+        picker_refresh_yolo(pu);
+        picker_on_changed(pu);
+        return;
+    }
+    unsigned gen = pu->probe_gen;
+    char *msg = g_strdup_printf("Probing %s…", host);
+    gtk_label_set_text(pu->status, msg);
+    g_free(msg);
+    ProbeReq *req = malloc(sizeof *req);
+    if (!req) {
+        return;
+    }
+    req->pu = pu;
+    req->gen = gen;
+    req->host = g_strdup(host);
+    if (!req->host) {
+        free(req);
+        return;
+    }
+    GError *err = NULL;
+    GThread *th =
+        g_thread_new("staap-remote-probe", picker_probe_thread, req, &err);
+    g_clear_error(&err);
+    if (!th) {
+        gtk_label_set_text(pu->status,
+                           "Probe unavailable; showing local CLIs.");
+        g_free(req->host);
+        free(req);
+        return;
+    }
+    g_thread_unref(th); /* detached; the result hops back via idle */
+}
+
+/* Reload the recents dropdown: per-host persisted recents when remote
+ * (core-owned, never network), local MRU otherwise. Selection resets to
+ * the placeholder; the entry keeps whatever the user typed. */
+static void picker_reload_recents(PickerUi *pu, const char *host) {
+    char *json;
+    if (host && *host) {
+        json = bridge_remote_recent_json(pu->sh->core, host);
+    } else {
+        json = bridge_recent_json(pu->sh->core);
+    }
+    recents_free(pu->recents, pu->n_recents);
+    pu->recents = parse_recents(json ? json : "[]", &pu->n_recents);
+    bridge_string_free(json);
+    if (!pu->recents) {
+        return;
+    }
+    GtkStringList *list = GTK_STRING_LIST(gtk_string_list_new(NULL));
+    gtk_string_list_append(list, "Type a folder…");
+    for (size_t i = 0; i < pu->n_recents; i++) {
+        gtk_string_list_append(list, pu->recents[i]);
+    }
+    gtk_drop_down_set_model(pu->recent, G_LIST_MODEL(list));
+    gtk_drop_down_set_selected(pu->recent, 0);
+}
+
+static void picker_host_changed(GtkEditable *entry, gpointer data) {
+    (void)entry;
+    PickerUi *pu = data;
+    char *host =
+        trimmed_or_null(gtk_editable_get_text(GTK_EDITABLE(pu->host)));
+    picker_reload_recents(pu, host);
+    picker_probe_remote(pu, host);
+    free(host);
+    /* The probe paths refresh on arrival; blank↔host toggles refresh
+     * inside picker_probe_remote — this covers the ssh preview prefix
+     * on every keystroke. */
+    picker_on_changed(pu);
+}
+
 static void picker_free(PickerUi *pu) {
     if (!pu) {
         return;
     }
+    live_pickers = g_slist_remove(live_pickers, pu);
     clis_free(pu->clis, pu->n_clis);
     recents_free(pu->recents, pu->n_recents);
     free(pu->cli_btns);
     free(pu);
 }
 
-/* Spawn the confirmed combination: folder x CLI + one-shot yolo. A
- * missing folder refuses inline (the dialog stays open for a fix);
- * a spawn failure toasts and closes (the core error names the fix). */
+/* Spawn the confirmed combination: folder x CLI + one-shot yolo, local
+ * or over SSH. A missing local folder refuses inline (the dialog stays
+ * open for a fix); remote paths skip that gate (they cannot be stated
+ * locally) and let the core report failures. A spawn failure toasts and
+ * closes (the core error names the fix). */
 static void picker_confirm(PickerUi *pu) {
     Shell *sh = pu->sh;
-    const char *raw =
-        gtk_editable_get_text(GTK_EDITABLE(pu->folder));
-    char *folder = NULL;
-    {
-        const char *b = raw;
-        while (*b == ' ' || *b == '\t') {
-            b++;
-        }
-        size_t len = strlen(b);
-        while (len > 0 && (b[len - 1] == ' ' || b[len - 1] == '\t')) {
-            len--;
-        }
-        if (len > 0) {
-            folder = strndup(b, len);
-        }
-    }
-    if (folder && !g_file_test(folder, G_FILE_TEST_IS_DIR)) {
+    char *folder = trimmed_or_null(
+        gtk_editable_get_text(GTK_EDITABLE(pu->folder)));
+    char *host = trimmed_or_null(
+        gtk_editable_get_text(GTK_EDITABLE(pu->host)));
+    if (!host && folder && !g_file_test(folder, G_FILE_TEST_IS_DIR)) {
         char *msg = g_strdup_printf("No such folder: %s", folder);
         gtk_label_set_text(pu->error, msg);
         g_free(msg);
         free(folder);
+        free(host);
         return;
     }
     const char *cli = "muse";
@@ -781,14 +1039,26 @@ static void picker_confirm(PickerUi *pu) {
      * first); a refusal names per-run close like every other shell. */
     char id[128] = { 0 };
     char *err = NULL;
-    int rc = bridge_run_spawn(sh->core, cli, folder, yolo,
+    int rc;
+    if (host) {
+        /* Remote: the local PTY runs `ssh -t <host> <cli...>` under the
+         * shared cap, so interactive auth prompts surface in the
+         * terminal; a blank folder means the remote login directory. */
+        rc = bridge_run_spawn_remote(sh->core, host, folder, cli, yolo,
+                                     (unsigned)sh->cols,
+                                     (unsigned)sh->rows_grid, id, sizeof id,
+                                     &err);
+    } else {
+        rc = bridge_run_spawn(sh->core, cli, folder, yolo,
                               (unsigned)sh->cols,
                               (unsigned)sh->rows_grid, id, sizeof id, &err);
+    }
     if (rc != 0) {
         if (err && strstr(err, "live runs")) {
             gtk_label_set_text(pu->error, err);
             free(err);
             free(folder);
+            free(host);
             return;
         }
         char *msg = g_strdup_printf("Could not start session: %s",
@@ -797,13 +1067,21 @@ static void picker_confirm(PickerUi *pu) {
         g_free(msg);
         free(err);
         free(folder);
+        free(host);
         adw_dialog_close(pu->dialog);
         return;
     }
     char *preview = bridge_spawn_preview(cli, folder, yolo);
-    toast(sh, preview ? preview : "Session started.");
+    if (host && preview) {
+        char *remote = g_strdup_printf("ssh %s: %s", host, preview);
+        toast(sh, remote ? remote : preview);
+        g_free(remote);
+    } else {
+        toast(sh, preview ? preview : "Session started.");
+    }
     free(preview);
     free(folder);
+    free(host);
     adw_dialog_close(pu->dialog);
     refresh_roster(sh);
     show_selected_in_terminal(sh);
@@ -856,10 +1134,11 @@ static void picker_choose_folder(GtkButton *btn, gpointer data) {
                                   g_object_ref(pu->folder));
     g_object_unref(dlg);
 }
-/* Open the 2D picker dialog: folder entry + recents, CLI radio rows
- * (missing CLIs disabled with an install hint), yolo tri-state, and
- * the live `runs: ...` preview. Catalog + recents re-read on every
- * open so the list is never stale. */
+/* Open the 2D picker dialog: folder entry + recents, SSH host axis,
+ * CLI radio rows (missing CLIs disabled with an install hint), yolo
+ * tri-state, and the live `runs: ...` preview. Catalog + recents
+ * re-read on every open so the list is never stale; typing a host swaps
+ * in the per-host recents and probes the remote catalog off-thread. */
 static void on_pick_session(GtkButton *btn, gpointer data) {
     (void)btn;
     Shell *sh = data;
@@ -871,20 +1150,20 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
         return;
     }
     pu->sh = sh;
-    char *clis_json = bridge_clis_json();
-    pu->clis = parse_clis(clis_json ? clis_json : "[]", &pu->n_clis);
-    bridge_string_free(clis_json);
+    live_pickers = g_slist_prepend(live_pickers, pu);
+    /* Radio rows live in their own box so a remote probe can rebuild
+     * them; the initial build is the synchronous local catalog. */
+    pu->cli_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    {
+        char *clis_json = bridge_clis_json();
+        picker_replace_clis(pu, clis_json ? clis_json : "[]");
+        bridge_string_free(clis_json);
+    }
     char *recents_json = bridge_recent_json(sh->core);
     pu->recents =
         parse_recents(recents_json ? recents_json : "[]", &pu->n_recents);
     bridge_string_free(recents_json);
-    if (!pu->clis) {
-        picker_free(pu);
-        toast(sh, "Could not load the agent catalog.");
-        return;
-    }
-    pu->cli_btns = calloc(pu->n_clis ? pu->n_clis : 1, sizeof *pu->cli_btns);
-    if (!pu->cli_btns) {
+    if (!pu->recents) {
         picker_free(pu);
         return;
     }
@@ -921,7 +1200,7 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
                      pu);
     gtk_box_append(GTK_BOX(folder_row), choose);
     gtk_box_append(GTK_BOX(box), folder_row);
-    if (pu->n_recents > 0) {
+    {
         GtkStringList *recent_list =
             GTK_STRING_LIST(gtk_string_list_new(NULL));
         gtk_string_list_append(recent_list, "Type a folder…");
@@ -935,6 +1214,24 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
                          G_CALLBACK(picker_recent_changed), pu);
         gtk_box_append(GTK_BOX(box), GTK_WIDGET(pu->recent));
     }
+
+    /* SSH host axis (blank = this machine). Typing a host swaps in the
+     * per-host recents and probes the remote CLI catalog off-thread. */
+    GtkWidget *host_label = gtk_label_new("Which machine? (SSH host)");
+    gtk_label_set_xalign(GTK_LABEL(host_label), 0);
+    gtk_widget_add_css_class(host_label, "heading");
+    gtk_box_append(GTK_BOX(box), host_label);
+    pu->host = GTK_ENTRY(gtk_entry_new());
+    gtk_widget_set_hexpand(GTK_WIDGET(pu->host), TRUE);
+    gtk_entry_set_placeholder_text(pu->host, "Blank = this machine");
+    g_signal_connect(pu->host, "changed",
+                     G_CALLBACK(picker_host_changed), pu);
+    gtk_box_append(GTK_BOX(box), GTK_WIDGET(pu->host));
+    pu->status = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(pu->status, 0);
+    gtk_widget_add_css_class(GTK_WIDGET(pu->status), "dim-label");
+    gtk_box_append(GTK_BOX(box), GTK_WIDGET(pu->status));
+
     pu->error = GTK_LABEL(gtk_label_new(""));
     gtk_label_set_xalign(pu->error, 0);
     gtk_widget_add_css_class(GTK_WIDGET(pu->error), "error");
@@ -944,38 +1241,10 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
     gtk_label_set_xalign(GTK_LABEL(cli_label), 0);
     gtk_widget_add_css_class(cli_label, "heading");
     gtk_box_append(GTK_BOX(box), cli_label);
-    GtkCheckButton *group = NULL;
-    for (size_t i = 0; i < pu->n_clis; i++) {
-        char *label;
-        if (pu->clis[i].available) {
-            label = g_strdup_printf("%s — ready", pu->clis[i].id);
-        } else {
-            label = g_strdup_printf("%s — not installed", pu->clis[i].id);
-        }
-        GtkWidget *row = gtk_check_button_new_with_label(label);
-        g_free(label);
-        gtk_check_button_set_group(GTK_CHECK_BUTTON(row), group);
-        if (!group) {
-            group = GTK_CHECK_BUTTON(row);
-        }
-        gtk_widget_set_sensitive(row, pu->clis[i].available ? TRUE : FALSE);
-        gtk_widget_set_tooltip_text(
-            row, pu->clis[i].available
-                     ? (pu->clis[i].path ? pu->clis[i].path
-                        : pu->clis[i].id)
-                     : "Install this CLI and ensure it is on PATH.");
-        g_signal_connect(row, "toggled", G_CALLBACK(picker_cli_toggled),
-                         pu);
-        gtk_box_append(GTK_BOX(box), row);
-        pu->cli_btns[i] = GTK_CHECK_BUTTON(row);
-    }
-    /* Preselect the first available CLI (catalog order: muse first). */
-    for (size_t i = 0; i < pu->n_clis; i++) {
-        if (pu->clis[i].available) {
-            gtk_check_button_set_active(pu->cli_btns[i], TRUE);
-            break;
-        }
-    }
+    /* Rows were built up-front (and rebuild on probe arrival); the box
+     * only needs placing. Preselection happened silently inside
+     * picker_replace_clis (first available; catalog order: muse first). */
+    gtk_box_append(GTK_BOX(box), pu->cli_box);
 
     GtkWidget *yolo_label = gtk_label_new("Permission mode");
     gtk_label_set_xalign(GTK_LABEL(yolo_label), 0);

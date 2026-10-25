@@ -35,6 +35,9 @@ impl ShellView {
     /// order only depends on status, so an unchanged pump leaves the order
     /// (and the selection index) untouched instead of re-sorting every tick.
     pub(crate) fn refresh(&mut self) -> bool {
+        // A landed remote probe swaps the picker catalog (repaint when
+        // the rows changed). Cheap when no probe is in flight.
+        let remote_arrived = self.poll_remote_probe();
         let spawned = self.spawn_queued();
         let mut fresh_any = false;
         let mut rescanned: Vec<String> = Vec::new();
@@ -59,7 +62,7 @@ impl ShellView {
         // Selection for the attention flip detector: background flips ring,
         // the selected run is already on screen so its flips stay silent.
         let selected_id = self.active_id();
-        let mut changed = spawned || fresh_any;
+        let mut changed = spawned || fresh_any || remote_arrived;
         // (run id, old status, new status) transitions observed this tick.
         let mut flips: Vec<(String, crate::app::Status, crate::app::Status)> = Vec::new();
         for id in ids {

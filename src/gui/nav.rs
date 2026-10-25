@@ -315,7 +315,9 @@ impl ShellView {
             self.accept_filter();
         }
         self.cwd_capture = None;
-        self.launch_picker = None;
+        // The picker capture drops the same way (zero side effects),
+        // including its remote host/probe half.
+        self.cancel_launch_picker();
         self.quit_armed = false;
         if terminal {
             self.app.focus_terminal();

@@ -4,7 +4,10 @@
  * helpers now live in the core (`staap_feed_delta`, `staap_key_encode`,
  * `staap_spawn_preview`, ...), pinned by `cargo test --lib`. This target
  * pins the bridge's own thin wrappers (malloc/free discipline, NULL
- * conventions) against the real staticlib — no GTK needed.
+ * conventions) against the real staticlib — no GTK needed. Remote
+ * coverage (`bridge_clis_remote`, `bridge_remote_recent_json`,
+ * `bridge_run_spawn_remote`) is hermetic: null/blank/unknown hosts never
+ * touch the network.
  *
  * Exit 0 on success (`PICKER-OK`), 1 on first failure. */
 
@@ -80,6 +83,54 @@ int main(void) {
     CHECK(bridge_live_count(core) == 0, "no live runs");
     CHECK(!bridge_is_live(core, "missing"), "unknown not live");
     CHECK(!bridge_needs_quit_confirm(core), "fresh quit needs no confirm");
+
+    /* Remote bridge surface: hermetic, no network. Null/blank hosts
+     * degrade to the all-listed-none-available catalog; unknown hosts
+     * yield no recents; a blank-host spawn refuses before any spawn. */
+    char *rnull = bridge_clis_remote(NULL);
+    CHECK(rnull && rnull[0] == '[' &&
+              strstr(rnull, "\"available\":false"),
+          "remote clis null degrades");
+    if (rnull) {
+        bridge_string_free(rnull);
+    }
+    char *rblank = bridge_clis_remote("");
+    CHECK(rblank && rblank[0] == '[' &&
+              strstr(rblank, "\"available\":false"),
+          "remote clis blank degrades");
+    if (rblank) {
+        bridge_string_free(rblank);
+    }
+    char *rrec = bridge_remote_recent_json(core, "no-such-host-xyz");
+    CHECK(rrec && strcmp(rrec, "[]") == 0, "remote recents unknown empty");
+    if (rrec) {
+        bridge_string_free(rrec);
+    }
+    char *rrec0 = bridge_remote_recent_json(NULL, "h");
+    CHECK(rrec0 && strcmp(rrec0, "[]") == 0,
+          "remote recents null core empty");
+    if (rrec0) {
+        bridge_string_free(rrec0);
+    }
+    {
+        char id[128] = { 0 };
+        char *err = NULL;
+        int rc = bridge_run_spawn_remote(core, "", NULL, NULL, 0, 80, 24,
+                                         id, sizeof id, &err);
+        CHECK(rc != 0, "remote spawn blank refuses");
+        CHECK(err && err[0], "remote spawn blank names fix");
+        free(err);
+    }
+    {
+        char id[128] = { 0 };
+        char *err = NULL;
+        int rc = bridge_run_spawn_remote(core, NULL, NULL, NULL, 0, 80,
+                                         24, id, sizeof id, &err);
+        CHECK(rc != 0, "remote spawn null host refuses");
+        CHECK(err && err[0], "remote spawn null host names fix");
+        free(err);
+    }
+
     bridge_core_free(core);
 
     if (failures == 0) {

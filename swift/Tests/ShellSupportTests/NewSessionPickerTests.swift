@@ -62,6 +62,27 @@ final class NewSessionPickerTests: XCTestCase {
         XCTAssertTrue(p.preview.contains("claude"))
     }
 
+    func testBlankHostIsLocal() {
+        var p = picker()
+        XCTAssertFalse(p.isRemote)
+        XCTAssertNil(p.effectiveRemoteHost)
+        p.host = "   "
+        XCTAssertFalse(p.isRemote)
+        XCTAssertNil(p.effectiveRemoteHost)
+        XCTAssertEqual(p.remotePreview, p.preview)
+    }
+
+    func testHostMarksRemoteAndNamesPreview() {
+        var p = picker()
+        p.host = "  mybox  "
+        XCTAssertTrue(p.isRemote)
+        XCTAssertEqual(p.effectiveRemoteHost, "mybox")
+        XCTAssertEqual(p.remotePreview, "ssh mybox: muse")
+        p.folder = "/tmp/api"
+        p.yolo = .forceOn
+        XCTAssertEqual(p.remotePreview, "ssh mybox: muse in /tmp/api + yolo")
+    }
+
     func testEmptyCatalogSelectsNothing() {
         var p = NewSessionPicker(clis: [], cliIndex: 0, folder: "", recents: [])
         XCTAssertNil(p.selectedCli)
