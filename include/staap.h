@@ -495,6 +495,28 @@ int staap_saved_host_add(struct StaapCore *core,
 int staap_saved_host_remove(struct StaapCore *core, const char *key);
 
 /**
+ * Rename/edit a saved SSH host in place (SSH picker): `key` matches the
+ * current host or display name; `name`/`host` replace the label and the
+ * SSH target; `default_folder` null/empty clears the per-host default.
+ * The entry keeps its saved-order position and never counts against
+ * [`crate::config::MAX_SAVED_HOSTS`] (no new entry). Unknown keys, blank
+ * fields, and targets colliding with another saved host report
+ * [`StaapError::Spawn`] with a message naming the fix; the per-host
+ * folder MRU follows the rename (see
+ * [`crate::config::Config::rename_saved_host`]). Callers persist via
+ * [`staap_core_save`].
+ *
+ * # Safety
+ * `core` must be non-null and live; `key`/`name`/`host`/`default_folder`
+ * must be null or valid NUL-terminated C strings.
+ */
+int staap_saved_host_rename(struct StaapCore *core,
+                            const char *key,
+                            const char *name,
+                            const char *host,
+                            const char *default_folder);
+
+/**
  * Owned default remote folder for `host` (SSH picker): the saved host
  * default, else the host MRU head, else null (the remote login directory
  * / home — a null return, not an error). Null core/host and blank hosts

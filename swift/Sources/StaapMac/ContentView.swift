@@ -411,6 +411,8 @@ private struct NewSessionScreen: View {
     @State private var savedHosts: [SavedHost] = []
     @State private var unsavedLastHost = ""
     @State private var showAddSheet = false
+    @State private var editingHost: SavedHost? = nil
+    @State private var machineError: String? = nil
     @State private var remoteClis: [CliRow]? = nil
     @State private var probingRemote = false
     @State private var probeToken = 0
@@ -442,6 +444,29 @@ private struct NewSessionScreen: View {
                 }
                 .pickerStyle(.menu)
                 .onChange(of: machine) { _, _ in machineChanged() }
+                // Saved-host management, rendered only for a saved pick:
+                // Edit reopens the sheet prefilled (rename in place),
+                // Delete forgets the host and its folder memory. Both are
+                // buttons (keyboard-focusable) with command shortcuts, and
+                // failures report in words below — never color-only.
+                if let selected = savedHosts.first(where: { $0.host == machine }) {
+                    HStack {
+                        Button("Edit…") {
+                            editingHost = selected
+                            showAddSheet = true
+                        }
+                        .keyboardShortcut("e", modifiers: .command)
+                        .help("Edit this saved machine (Command-E)")
+                        Button("Delete") { deleteSaved(selected) }
+                            .keyboardShortcut(.delete, modifiers: .command)
+                            .help("Delete this saved machine (Command-Delete)")
+                    }
+                    if let machineError {
+                        Text(machineError)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Text(NewSessionPicker.machinePlaceholder)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -557,8 +582,9 @@ private struct NewSessionScreen: View {
             if machine == NewSessionPicker.addMachineTag {
                 machine = previousMachine
             }
+            editingHost = nil
         }) {
-            SshAddSheet(state: state, isPresented: $showAddSheet) { savedHost in
+            SshAddSheet(state: state, isPresented: $showAddSheet, editing: editingHost) { savedHost in
                 savedHosts = state.pickerSavedHosts()
                 unsavedLastHost = ""
                 machine = savedHost
@@ -647,6 +673,27 @@ private struct NewSessionScreen: View {
                 }
                 Button("Use this folder") { folder = remotePath }
             }
+        }
+    }
+
+    /// Delete one saved machine (Delete button / Command-Delete): the
+    /// core forgets the host and its folder memory, then the dropdown
+    /// falls back to This machine when the deleted host was picked.
+    /// Failures (a race with another edit) report inline in words, never
+    /// a silent no-op.
+    private func deleteSaved(_ saved: SavedHost) {
+        do {
+            try state.removeSavedHost(key: saved.host)
+            machineError = nil
+            savedHosts = state.pickerSavedHosts()
+            unsavedLastHost = ""
+            if machine == saved.host {
+                machine = ""
+                previousMachine = ""
+                hostChanged()
+            }
+        } catch {
+            machineError = error.localizedDescription
         }
     }
 
@@ -858,10 +905,13 @@ private struct NewSessionScreen: View {
 /// core saved-hosts. Test dials the core tester off the main thread
 /// (reachable plus the detected remote CLIs, or the core reason line,
 /// dropped); Save persists through the core and hands the host back so
-/// the dropdown picks it.
+/// the dropdown picks it. With `editing` set the sheet edits instead:
+/// fields prefill and Save renames in place (the typo fix — label,
+/// target, and folder change, saved order kept, folder memory follows).
 private struct SshAddSheet: View {
     @ObservedObject var state: AppState
     @Binding var isPresented: Bool
+    var editing: SavedHost? = nil
     var onSaved: (String) -> Void
 
     @State private var displayName = ""
@@ -874,7 +924,7 @@ private struct SshAddSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Add remote machine").font(.title2)
+            Text(editing == nil ? "Add remote machine" : "Edit remote machine").font(.title2)
             Text("Display name").font(.headline)
             TextField("e.g. GPU box", text: $displayName)
                 .textFieldStyle(.roundedBorder)
@@ -910,6 +960,15 @@ private struct SshAddSheet: View {
         }
         .padding(20)
         .frame(minWidth: 360)
+        .onAppear {
+            // Edit mode prefills from the saved row (the original host
+            // stays in `editing` so Save renames it, never duplicates).
+            if let editing {
+                displayName = editing.name
+                host = editing.host
+                defaultFolder = editing.defaultFolder ?? ""
+            }
+        }
     }
 
     private var testHost: String? {
@@ -962,10 +1021,17 @@ private struct SshAddSheet: View {
             return
         }
         let trimmedFolder = defaultFolder.trimmingCharacters(in: .whitespaces)
+        let folderOrNil: String? = trimmedFolder.isEmpty ? nil : trimmedFolder
         do {
-            try state.addSavedHost(
-                name: name, host: remote,
-                defaultFolder: trimmedFolder.isEmpty ? nil : trimmedFolder)
+            if let editing {
+                try state.renameSavedHost(
+                    key: editing.host, name: name, host: remote,
+                    defaultFolder: folderOrNil)
+            } else {
+                try state.addSavedHost(
+                    name: name, host: remote,
+                    defaultFolder: folderOrNil)
+            }
             onSaved(remote)
             isPresented = false
         } catch {

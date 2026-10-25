@@ -437,6 +437,10 @@ plus the pre-existing `app`/`config`/`launch`/`embedded`/`parsers`/
 | `staap_selected` / `staap_select` / `staap_select_step` | core-owned selection |
 | `staap_last_error` | thread-local message; never null |
 | `staap_pty_free` | reaps the child; null no-op |
+| `staap_saved_hosts_json` | owned saved-host JSON (`[{name,host,default_folder\|null}]`, saved order); null core yields `[]`; freed with `staap_screen_text_free` |
+| `staap_saved_host_add` | save (or update, by trimmed host) a host; blank/cap refusals report `Spawn` with a fix-naming message; persist via `staap_core_save` |
+| `staap_saved_host_rename` | rename/edit in place by current host or name (typo fix: label + target + folder change, order kept, cap-exempt); unknown/blank/colliding targets report `Spawn` with a message; folder MRU follows the rename, `last_host` retargets; persist via `staap_core_save` |
+| `staap_saved_host_remove` | remove by host or name (unknown reports `Spawn`); the host folder MRU drops and `last_host` clears when it pointed there; persist via `staap_core_save` |
 | `staap_remote_test_json(host)` | add-dialog tester: owned `{reachable,reason,message,clis}` JSON from one bounded non-interactive `ssh` round trip (POSIX spelling, then PowerShell on Windows remotes); `reason` is a kebab-case `launch::SshFailureReason` code (`empty-host`, `missing-ssh-binary`, `unknown-host`, `timeout`, `auth-failure`, `remote-shell-error`, `unreachable`), `message` its render-ready line shells show verbatim; blank hosts and every failure degrade to unreachable + degraded catalog, never null; freed with `staap_screen_text_free` |
 
 ### C header (`include/staap.h`, hardened #61)

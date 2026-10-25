@@ -446,14 +446,107 @@ impl Config {
     /// True when an entry matched (either key compares trimmed); false
     /// when nothing was saved under `key` — shells surface that as a
     /// fail-visible "no such host" flash, never a silent no-op.
+    ///
+    /// A deleted host leaves no memory behind: its per-host folder MRU
+    /// (`remote_folders`) is dropped and `last_host` clears when it
+    /// pointed at the removed host. A rename (see
+    /// [`Self::rename_saved_host`]) instead moves that memory to the new
+    /// target — delete forgets, rename keeps.
     pub fn remove_saved_host(&mut self, key: &str) -> bool {
         let key = key.trim();
         if key.is_empty() {
             return false;
         }
-        let before = self.saved_hosts.len();
+        let gone: Vec<String> = self
+            .saved_hosts
+            .iter()
+            .filter(|h| h.host == key || h.name == key)
+            .map(|h| h.host.clone())
+            .collect();
+        if gone.is_empty() {
+            return false;
+        }
         self.saved_hosts.retain(|h| h.host != key && h.name != key);
-        self.saved_hosts.len() != before
+        for host in gone {
+            self.remote_folders.remove(&host);
+            if self.last_host.as_deref() == Some(host.as_str()) {
+                self.last_host = None;
+            }
+        }
+        true
+    }
+
+    /// Rename/edit a saved SSH host in place (SSH picker): `key` matches
+    /// the current `host` or display `name` (trimmed, like
+    /// [`Self::remove_saved_host`]); `new_name`/`new_host` replace the
+    /// label and the SSH target, and `new_folder` (`None`/blank clears)
+    /// replaces the per-host default. The entry keeps its saved-order
+    /// position and never counts against [`MAX_SAVED_HOSTS`] — this is
+    /// the typo fix (`add` alone cannot change an already-saved target).
+    /// A new target colliding with another saved host refuses (a merge
+    /// would silently drop one entry); blank key/name/host and unknown
+    /// keys refuse the same way, each with a message naming the fix.
+    ///
+    /// Per-host folder memory follows the rename: the `remote_folders`
+    /// MRU moves from the old target to the new one (merged ahead of any
+    /// MRU the new target already earned while unsaved, still capped at
+    /// `launch::MAX_RECENT_FOLDERS`), and `last_host` retargets when it
+    /// pointed at the old host. Unchanged targets move nothing.
+    pub fn rename_saved_host(
+        &mut self,
+        key: &str,
+        new_name: &str,
+        new_host: &str,
+        new_folder: Option<&str>,
+    ) -> Result<(), String> {
+        let key = key.trim();
+        let new_name = new_name.trim();
+        let new_host = new_host.trim();
+        if key.is_empty() {
+            return Err("pick a saved machine first".to_string());
+        }
+        if new_name.is_empty() {
+            return Err("set a display name first".to_string());
+        }
+        if new_host.is_empty() {
+            return Err("set an SSH host first".to_string());
+        }
+        let Some(index) = self
+            .saved_hosts
+            .iter()
+            .position(|h| h.host == key || h.name == key)
+        else {
+            return Err("no such saved host — pick one from the list".to_string());
+        };
+        if self
+            .saved_hosts
+            .iter()
+            .enumerate()
+            .any(|(i, h)| i != index && h.host == new_host)
+        {
+            return Err(format!("{new_host} is already saved — remove it first"));
+        }
+        let old_host = std::mem::replace(&mut self.saved_hosts[index].host, new_host.to_string());
+        self.saved_hosts[index].name = new_name.to_string();
+        self.saved_hosts[index].default_folder = new_folder
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
+        if old_host != new_host {
+            if let Some(mru) = self.remote_folders.remove(&old_host) {
+                let entry = self.remote_folders.entry(new_host.to_string()).or_default();
+                // Oldest first through the push funnel: the renamed
+                // host's most recent dir stays most recent, deduped and
+                // capped, ahead of anything the new target earned.
+                for dir in mru.iter().rev() {
+                    crate::launch::push_recent_folder(entry, dir);
+                }
+            }
+            if self.last_host.as_deref() == Some(old_host.as_str()) {
+                self.last_host = Some(new_host.to_string());
+            }
+        }
+        Ok(())
     }
 
     /// Replace the per-host default folder of an already-saved host (SSH
@@ -664,6 +757,99 @@ mod tests {
         let back: Config = serde_json::from_str(&serde_json::to_string(&alias).unwrap()).unwrap();
         assert_eq!(back.saved_hosts()[0].host, "my-alias");
         assert_eq!(back.saved_hosts()[1].host, "dev@jump-box");
+    }
+
+    #[test]
+    fn saved_hosts_rename_fixes_typos_in_place() {
+        // SSH picker: renaming edits label + target + default folder in
+        // place (saved order kept, cap-exempt), keyed by current host or
+        // display name like remove.
+        let mut cfg = Config::default();
+        cfg.add_saved_host("prod box", "dev@mybox", Some("/srv/api"))
+            .unwrap();
+        cfg.add_saved_host("staging", "staging-box", None).unwrap();
+        // Keyed by display name; trims; keeps its saved-order slot.
+        cfg.rename_saved_host(" prod box ", "prod", "dev@prodbox", Some(" /srv/v2 "))
+            .unwrap();
+        assert_eq!(cfg.saved_hosts().len(), 2);
+        assert_eq!(cfg.saved_hosts()[0].name, "prod");
+        assert_eq!(cfg.saved_hosts()[0].host, "dev@prodbox");
+        assert_eq!(
+            cfg.saved_hosts()[0].default_folder.as_deref(),
+            Some("/srv/v2")
+        );
+        assert_eq!(cfg.saved_hosts()[1].host, "staging-box");
+        // Same-target rename is a plain label/folder update; blank
+        // folders clear back to the MRU/home fallback.
+        cfg.rename_saved_host("dev@prodbox", "prod box", "dev@prodbox", Some("   "))
+            .unwrap();
+        assert_eq!(cfg.saved_hosts()[0].name, "prod box");
+        assert_eq!(cfg.saved_hosts()[0].default_folder, None);
+        // Refusals name the fix: blank key/name/host, unknown keys, and
+        // targets colliding with another saved host (no silent merge).
+        assert!(cfg.rename_saved_host("  ", "n", "h", None).is_err());
+        assert!(cfg.rename_saved_host("prod box", "  ", "h", None).is_err());
+        assert!(cfg.rename_saved_host("prod box", "n", "   ", None).is_err());
+        assert!(cfg.rename_saved_host("ghost", "n", "h", None).is_err());
+        assert!(cfg
+            .rename_saved_host("prod box", "staging", "staging-box", None)
+            .is_err());
+        assert_eq!(cfg.saved_hosts().len(), 2);
+        // Renames never count against the cap: a full store still
+        // renames (the typo fix must work exactly when the list is full).
+        for i in 0..crate::config::MAX_SAVED_HOSTS {
+            cfg.add_saved_host(&format!("box {i}"), &format!("box-{i}"), None)
+                .unwrap_or_default();
+        }
+        assert_eq!(cfg.saved_hosts().len(), crate::config::MAX_SAVED_HOSTS);
+        assert!(cfg
+            .rename_saved_host("box-0", "renamed", "box-fixed", None)
+            .is_ok());
+        // Round-trips; still no secrets anywhere in the file.
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+        let text = serde_json::to_string(&cfg).unwrap().to_lowercase();
+        assert!(!text.contains("password"));
+        assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn saved_hosts_rename_moves_mru_but_delete_forgets() {
+        // SSH picker: per-host folder memory follows a rename (MRU moves
+        // to the new target, `last_host` retargets) but a delete drops it
+        // (`last_host` clears when it pointed at the removed host).
+        let mut cfg = Config::default();
+        cfg.add_saved_host("prod box", "dev@mybox", None).unwrap();
+        cfg.note_remote_launch("dev@mybox", Some("/srv/api"));
+        cfg.note_remote_launch("dev@mybox", Some("/srv/v2"));
+        assert_eq!(cfg.last_host.as_deref(), Some("dev@mybox"));
+        // The new target already earned an MRU while unsaved: the rename
+        // merges the old memory ahead of it, deduped and capped.
+        cfg.note_remote_launch("dev@prodbox", Some("/srv/api"));
+        cfg.note_remote_launch("dev@prodbox", Some("/srv/new"));
+        cfg.rename_saved_host("dev@mybox", "prod box", "dev@prodbox", None)
+            .unwrap();
+        assert_eq!(cfg.last_host.as_deref(), Some("dev@prodbox"));
+        assert!(cfg.remote_recents_for("dev@mybox").is_empty());
+        assert_eq!(
+            cfg.remote_recents_for("dev@prodbox"),
+            vec!["/srv/v2", "/srv/api", "/srv/new"]
+        );
+        // Same-target renames move nothing.
+        let before = cfg.remote_recents_for("dev@prodbox").to_vec();
+        cfg.rename_saved_host("dev@prodbox", "prod", "dev@prodbox", None)
+            .unwrap();
+        assert_eq!(cfg.remote_recents_for("dev@prodbox"), before);
+        // Delete forgets: MRU dropped, `last_host` cleared; other hosts
+        // keep their own memory.
+        cfg.add_saved_host("other", "other", None).unwrap();
+        cfg.note_remote_launch("other", Some("/srv/other"));
+        assert!(cfg.remove_saved_host("dev@prodbox"));
+        assert!(cfg.remote_recents_for("dev@prodbox").is_empty());
+        assert_eq!(cfg.last_host.as_deref(), Some("other"));
+        assert_eq!(cfg.remote_recents_for("other"), vec!["/srv/other"]);
+        assert!(cfg.remove_saved_host("other"));
+        assert_eq!(cfg.last_host, None);
     }
 
     #[test]

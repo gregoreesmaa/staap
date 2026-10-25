@@ -1275,6 +1275,72 @@ pub unsafe extern "C" fn staap_saved_host_remove(
     }
 }
 
+/// Rename/edit a saved SSH host in place (SSH picker): `key` matches the
+/// current host or display name; `name`/`host` replace the label and the
+/// SSH target; `default_folder` null/empty clears the per-host default.
+/// The entry keeps its saved-order position and never counts against
+/// [`crate::config::MAX_SAVED_HOSTS`] (no new entry). Unknown keys, blank
+/// fields, and targets colliding with another saved host report
+/// [`StaapError::Spawn`] with a message naming the fix; the per-host
+/// folder MRU follows the rename (see
+/// [`crate::config::Config::rename_saved_host`]). Callers persist via
+/// [`staap_core_save`].
+///
+/// # Safety
+/// `core` must be non-null and live; `key`/`name`/`host`/`default_folder`
+/// must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn staap_saved_host_rename(
+    core: *mut StaapCore,
+    key: *const c_char,
+    name: *const c_char,
+    host: *const c_char,
+    default_folder: *const c_char,
+) -> c_int {
+    if core.is_null() {
+        set_error("staap_saved_host_rename: null core".to_string());
+        return StaapError::Null.code();
+    }
+    if key.is_null() || name.is_null() || host.is_null() {
+        set_error("staap_saved_host_rename: null key, name, or host".to_string());
+        return StaapError::Null.code();
+    }
+    let (key, name, host) = match (
+        CStr::from_ptr(key).to_str(),
+        CStr::from_ptr(name).to_str(),
+        CStr::from_ptr(host).to_str(),
+    ) {
+        (Ok(key), Ok(name), Ok(host)) => (key, name, host),
+        _ => {
+            set_error("staap_saved_host_rename: key, name, or host is not valid UTF-8".to_string());
+            return StaapError::Utf8.code();
+        }
+    };
+    let folder = if default_folder.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(default_folder).to_str() {
+            Ok(s) => Some(s),
+            Err(_) => {
+                set_error("staap_saved_host_rename: default_folder is not valid UTF-8".to_string());
+                return StaapError::Utf8.code();
+            }
+        }
+    };
+    match (*core)
+        .reg
+        .app
+        .config_mut()
+        .rename_saved_host(key, name, host, folder)
+    {
+        Ok(()) => StaapError::Ok.code(),
+        Err(msg) => {
+            set_error(format!("staap_saved_host_rename: {msg}"));
+            StaapError::Spawn.code()
+        }
+    }
+}
+
 /// Owned default remote folder for `host` (SSH picker): the saved host
 /// default, else the host MRU head, else null (the remote login directory
 /// / home — a null return, not an error). Null core/host and blank hosts
@@ -3221,10 +3287,90 @@ mod tests {
             assert!(staap_remote_default_folder(core_ptr, c"unknown".as_ptr()).is_null());
             assert!(staap_remote_default_folder(core_ptr, c"  ".as_ptr()).is_null());
             assert!(staap_remote_default_folder(core_ptr, std::ptr::null()).is_null());
-            // Remove by display name; unknown keys fail visibly.
+            // Rename in place (keyed by display name): the typo fix moves
+            // the target, keeps saved order, and carries the folder MRU
+            // to the new target.
             let key = CString::new("prod box").unwrap();
+            let new_host = CString::new("dev@prodbox").unwrap();
+            let new_name = CString::new("prod").unwrap();
+            let new_folder = CString::new("/srv/v2").unwrap();
             assert_eq!(
-                staap_saved_host_remove(core_ptr, key.as_ptr()),
+                staap_saved_host_rename(
+                    core_ptr,
+                    key.as_ptr(),
+                    new_name.as_ptr(),
+                    new_host.as_ptr(),
+                    new_folder.as_ptr()
+                ),
+                StaapError::Ok.code()
+            );
+            let raw = staap_saved_hosts_json(core_ptr);
+            let text = CStr::from_ptr(raw).to_string_lossy().into_owned();
+            staap_screen_text_free(raw);
+            let docs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0]["name"], "prod");
+            assert_eq!(docs[0]["host"], "dev@prodbox");
+            assert_eq!(docs[0]["default_folder"], "/srv/v2");
+            let raw = staap_remote_default_folder(core_ptr, new_host.as_ptr());
+            assert_eq!(
+                CStr::from_ptr(raw).to_string_lossy().into_owned(),
+                "/srv/v2"
+            );
+            staap_screen_text_free(raw);
+            // Rename refusals: null key/name/host are null errors, blank
+            // fields and unknown keys fail visibly with a message.
+            assert_eq!(
+                staap_saved_host_rename(
+                    std::ptr::null_mut(),
+                    key.as_ptr(),
+                    new_name.as_ptr(),
+                    new_host.as_ptr(),
+                    std::ptr::null()
+                ),
+                StaapError::Null.code()
+            );
+            assert_eq!(
+                staap_saved_host_rename(
+                    core_ptr,
+                    std::ptr::null(),
+                    new_name.as_ptr(),
+                    new_host.as_ptr(),
+                    std::ptr::null()
+                ),
+                StaapError::Null.code()
+            );
+            let blank = CString::new("  ").unwrap();
+            assert_eq!(
+                staap_saved_host_rename(
+                    core_ptr,
+                    blank.as_ptr(),
+                    new_name.as_ptr(),
+                    new_host.as_ptr(),
+                    std::ptr::null()
+                ),
+                StaapError::Spawn.code()
+            );
+            assert_eq!(
+                staap_saved_host_rename(
+                    core_ptr,
+                    c"ghost".as_ptr(),
+                    new_name.as_ptr(),
+                    new_host.as_ptr(),
+                    std::ptr::null()
+                ),
+                StaapError::Spawn.code()
+            );
+            let msg = CStr::from_ptr(staap_last_error())
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                msg.contains("staap_saved_host_rename"),
+                "last_error: {msg:?}"
+            );
+            // Remove by the renamed host; unknown keys fail visibly.
+            assert_eq!(
+                staap_saved_host_remove(core_ptr, new_host.as_ptr()),
                 StaapError::Ok.code()
             );
             assert_eq!(

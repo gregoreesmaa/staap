@@ -31,7 +31,7 @@ import Foundation
     _ host: UnsafePointer<CChar>?
 ) -> UnsafeMutablePointer<CChar>?
 // Saved SSH hosts for the picker dropdown ([{name,host,default_folder}];
-// null core yields []). Adds/removes persist via `staap_core_save`.
+// null core yields []). Adds/renames/removes persist via `staap_core_save`.
 @_silgen_name("staap_saved_hosts_json") private func staap_saved_hosts_json(
     _ core: OpaquePointer?
 ) -> UnsafeMutablePointer<CChar>?
@@ -44,6 +44,13 @@ import Foundation
 @_silgen_name("staap_saved_host_remove") private func staap_saved_host_remove(
     _ core: OpaquePointer?,
     _ key: UnsafePointer<CChar>?
+) -> Int32
+@_silgen_name("staap_saved_host_rename") private func staap_saved_host_rename(
+    _ core: OpaquePointer?,
+    _ key: UnsafePointer<CChar>?,
+    _ name: UnsafePointer<CChar>?,
+    _ host: UnsafePointer<CChar>?,
+    _ defaultFolder: UnsafePointer<CChar>?
 ) -> Int32
 // Owned default remote folder for one SSH host (saved default, else host
 // MRU head, else null = remote home). Null/blank hosts yield null.
@@ -686,6 +693,27 @@ final class Core {
     /// throw with the core "no such host" message (fail visible).
     func removeSavedHost(key: String) throws {
         let rc = key.withCString { staap_saved_host_remove(handle, $0) }
+        if rc != 0 {
+            throw CoreError.spawn(message: Self.lastError())
+        }
+    }
+
+    /// Rename a saved SSH host in place (keyed by current host or
+    /// display name): the typo fix - label, target, and default
+    /// folder change, saved order kept, the cap never bites, and the
+    /// per-host folder memory follows the rename. Unknown keys, blank
+    /// fields, and colliding targets throw with the core message
+    /// naming the fix; persisting is the caller funnel (`save()`).
+    func renameSavedHost(key: String, name: String, host: String, defaultFolder: String?) throws {
+        let rc = key.withCString { keyPtr in
+            name.withCString { namePtr in
+                host.withCString { hostPtr in
+                    withOptionalCString(defaultFolder) { folderPtr in
+                        staap_saved_host_rename(handle, keyPtr, namePtr, hostPtr, folderPtr)
+                    }
+                }
+            }
+        }
         if rc != 0 {
             throw CoreError.spawn(message: Self.lastError())
         }

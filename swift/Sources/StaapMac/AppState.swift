@@ -303,6 +303,24 @@ final class AppState: ObservableObject {
         save()
     }
 
+    /// Remove a saved SSH host (by host or display name), then persist
+    /// (same funnel as every close). Unknown keys throw with the core
+    /// "no such host" message (fail visible). Deleting forgets: the
+    /// host folder memory goes with it (renaming instead keeps it).
+    func removeSavedHost(key: String) throws {
+        try core.removeSavedHost(key: key)
+        save()
+    }
+
+    /// Rename a saved SSH host in place (the typo fix: label, target,
+    /// and default folder change with saved order kept), then persist.
+    /// Unknown keys, blank fields, and colliding targets throw with
+    /// the core message naming the fix.
+    func renameSavedHost(key: String, name: String, host: String, defaultFolder: String?) throws {
+        try core.renameSavedHost(key: key, name: name, host: host, defaultFolder: defaultFolder)
+        save()
+    }
+
     /// Restart/resume the selected run on the same id.
     func restartSelected() {
         guard let id = selection else { return }

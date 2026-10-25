@@ -112,11 +112,12 @@ char *bridge_remote_recent_json(const StaapCore *core, const char *host);
  * a render-ready `message`, and the `clis` catalog (blank hosts degrade
  * to unreachable with the `empty-host` reason, shown verbatim).
  * Strings free with bridge_string_free();
- * add/remove report failures via `msg_out` (freed with free()). Callers
+ * add/rename/remove report failures via `msg_out` (freed with free()). Callers
  * persist via bridge_core_save after mutations. Listing/testing block
  * for one bounded ssh round trip - call off the UI thread. */
 char *bridge_saved_hosts_json(const StaapCore *core);
 int bridge_saved_host_add(StaapCore *core, const char *name, const char *host, const char *default_folder, char **msg_out);
+int bridge_saved_host_rename(StaapCore *core, const char *key, const char *name, const char *host, const char *default_folder, char **msg_out);
 int bridge_saved_host_remove(StaapCore *core, const char *key, char **msg_out);
 char *bridge_remote_default_folder(const StaapCore *core, const char *host);
 char *bridge_remote_list_json(const char *host, const char *path);

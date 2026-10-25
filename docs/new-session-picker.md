@@ -106,9 +106,22 @@ shells render rows and forward intents, never probe or resolve.
 - Saved hosts (`Config::saved_hosts`, `MAX_SAVED_HOSTS = 50`): display
   name + SSH target (`user@host` or an ssh-config alias) + optional
   per-host default folder. Add updates in place on a repeated host;
-  remove matches host or display name; past the cap only brand-new hosts
-  refuse. Old files without the key load empty; no secret field exists —
-  auth stays in the system ssh config.
+  rename (`Config::rename_saved_host`, keyed by current host or display
+  name) edits label + target + folder in place — the typo fix,
+  cap-exempt, saved order kept; remove matches host or display name;
+  past the cap only brand-new hosts refuse. Folder memory: a rename
+  moves the per-host folder MRU to the new target (merged ahead of any
+  MRU the target already earned, still capped; `last_host` retargets
+  when it pointed at the old host), while a delete drops that host's
+  MRU and clears `last_host` when it pointed there — rename keeps,
+  delete forgets. Old files without the key load empty; no secret field
+  exists — auth stays in the system ssh config.
+- Shell affordances (every shell renders these over the same core
+  entries): the machine list dials a row on pick and offers Edit (the
+  add dialog prefilled; saving renames) plus Delete/Remove (core remove
+  + persist, falling back to This machine when the picked host dies).
+  Every action is keyboard-reachable and reported in words, never
+  color-only.
 - Default folder (`launch::resolve_remote_default_folder`,
   `Config::remote_default_folder_for`): saved host default, then the
   host MRU head (`remote_folders`), then the remote home (`None`).
@@ -123,9 +136,10 @@ shells render rows and forward intents, never probe or resolve.
   all-listed-none-available catalog on blank hosts and every failure,
   never an auth hang.
 - FFI: `staap_saved_hosts_json`, `staap_saved_host_add`,
-  `staap_saved_host_remove`, `staap_remote_default_folder`,
-  `staap_remote_list_json`, `staap_remote_test_json` (header
-  regenerated with cbindgen; persist via `staap_core_save`).
+  `staap_saved_host_rename`, `staap_saved_host_remove`,
+  `staap_remote_default_folder`, `staap_remote_list_json`,
+  `staap_remote_test_json` (header regenerated with cbindgen; persist
+  via `staap_core_save`).
 
 ## Visual / triage
 

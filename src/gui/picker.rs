@@ -56,6 +56,8 @@ pub(crate) enum MachineOption {
 /// host, optional default folder, plus the tester result. Focus cycles
 /// name → host → folder; Enter saves, Esc cancels, and the Test button
 /// (or `ctrl+t`) probes the host through the core tester without saving.
+/// Opened from a saved row it edits instead (`edit_key` set): fields
+/// prefill and saving renames in place — the typo fix.
 #[derive(Default)]
 pub(crate) struct SshAddDialog {
     /// Display name shown in the machine dropdown.
@@ -64,6 +66,10 @@ pub(crate) struct SshAddDialog {
     pub host_input: String,
     /// Default folder on the host (blank = host MRU, then remote home).
     pub folder_input: String,
+    /// Original host (or name) being edited (`None` = adding a new
+    /// machine). Saving with this set renames through the core instead
+    /// of adding, so a typo'd target is fixed, not duplicated.
+    pub edit_key: Option<String>,
     /// Which field owns typing: 0 = name, 1 = host, 2 = folder.
     pub focus: usize,
     /// Last tester round trip, if any (reachable flag + detected CLIs).
@@ -614,6 +620,76 @@ impl ShellView {
         self.picker_remote.ssh_add = Some(SshAddDialog::default());
     }
 
+    /// Open the SSH dialog to edit one saved host (SSH picker): fields
+    /// prefill from the saved row and saving renames in place through
+    /// the core (typo fix, cap-exempt, folder MRU follows) instead of
+    /// adding a new row. Out-of-range indices are a no-op.
+    pub(crate) fn open_ssh_add_for_edit(&mut self, index: usize) {
+        let Some(saved) = self.app.config_saved_hosts().get(index).cloned() else {
+            return;
+        };
+        self.picker_remote.ssh_add = Some(SshAddDialog {
+            name_input: saved.name.clone(),
+            host_input: saved.host.clone(),
+            folder_input: saved.default_folder.clone().unwrap_or_default(),
+            edit_key: Some(saved.host.clone()),
+            ..Default::default()
+        });
+    }
+
+    /// Open the edit dialog for the highlighted machine-dropdown row
+    /// (`ctrl+e` on the machine axis): saved rows prefill the dialog, This
+    /// machine / Add are inert. The dialog owns every key once open.
+    pub(crate) fn open_highlighted_saved_host_editor(&mut self) {
+        if !self.picker_remote.machine_open {
+            return;
+        }
+        let options = self.machine_options();
+        let cursor = self
+            .picker_remote
+            .machine_cursor
+            .min(options.len().saturating_sub(1));
+        if let Some(MachineOption::Saved(i)) = options.get(cursor).cloned() {
+            self.open_ssh_add_for_edit(i);
+        }
+    }
+
+    /// Delete the highlighted machine-dropdown row (Delete on the machine
+    /// axis): saved rows remove through the core and persist like the add
+    /// dialog; This machine / Add are inert. When the typed host dies
+    /// with its row the picker falls back to local instead of dialing a
+    /// ghost; the dropdown stays open with the cursor clamped. Refusals
+    /// flash sticky (fail-visible, never a silent no-op).
+    pub(crate) fn delete_highlighted_saved_host(&mut self) {
+        if !self.picker_remote.machine_open {
+            return;
+        }
+        let options = self.machine_options();
+        let cursor = self
+            .picker_remote
+            .machine_cursor
+            .min(options.len().saturating_sub(1));
+        let Some(MachineOption::Saved(i)) = options.get(cursor).cloned() else {
+            return;
+        };
+        let Some(saved) = self.app.config_saved_hosts().get(i).cloned() else {
+            return;
+        };
+        if !self.app.config_mut().remove_saved_host(&saved.host) {
+            self.app
+                .set_error(format!("could not remove {}", saved.host));
+            return;
+        }
+        #[cfg(not(test))]
+        let _ = self.app.save_config();
+        if self.picker_remote.host_input.trim() == saved.host {
+            self.picker_remote.host_input.clear();
+            self.commit_picker_host();
+        }
+        self.picker_remote.machine_cursor =
+            cursor.min(self.machine_options().len().saturating_sub(1));
+    }
+
     /// Close the SSH add dialog with zero side effects.
     pub(crate) fn cancel_ssh_add(&mut self) {
         if let Some(dialog) = self.picker_remote.ssh_add.as_mut() {
@@ -731,16 +807,18 @@ impl ShellView {
     }
 
     /// Save the add dialog (SSH picker): blank name/host refuses with an
-    /// in-dialog flash; the core saved-hosts add persists (cap of 50 —
-    /// updating an existing host always succeeds); success closes the
-    /// dialog, dials the host, and persists the config. Returns true on
-    /// success.
+    /// in-dialog flash; add mode stores through the core saved-hosts add
+    /// (cap of 50 — updating an existing host always succeeds), edit mode
+    /// renames in place (typo fix, cap-exempt, folder MRU follows);
+    /// success closes the dialog, dials the host, and persists the
+    /// config. Returns true on success.
     pub(crate) fn save_ssh_add(&mut self) -> bool {
-        let (name, host, folder) = match self.picker_remote.ssh_add.as_ref() {
+        let (name, host, folder, edit_key) = match self.picker_remote.ssh_add.as_ref() {
             Some(d) => (
                 d.name_input.trim().to_string(),
                 d.host_input.trim().to_string(),
                 d.folder_input.trim().to_string(),
+                d.edit_key.clone(),
             ),
             None => return false,
         };
@@ -755,7 +833,14 @@ impl ShellView {
         } else {
             Some(folder.as_str())
         };
-        if let Err(msg) = self.app.config_mut().add_saved_host(&name, &host, folder) {
+        let saved = match edit_key {
+            Some(key) => self
+                .app
+                .config_mut()
+                .rename_saved_host(&key, &name, &host, folder),
+            None => self.app.config_mut().add_saved_host(&name, &host, folder),
+        };
+        if let Err(msg) = saved {
             if let Some(dialog) = self.picker_remote.ssh_add.as_mut() {
                 dialog.error = Some(msg);
             }
@@ -935,8 +1020,9 @@ impl ShellView {
     /// the framework-free [`crate::launch::LaunchPicker::key`] state
     /// machine — except on the machine axis, which owns every key
     /// (printables extend the host input, Up/Down steps the machine
-    /// dropdown, Enter picks the highlighted row) and never reaches the
-    /// core. The SSH add dialog owns every key while open. Remote Up/Down
+    /// dropdown, Enter picks the highlighted row, Delete removes it and
+    /// `ctrl+e` edits it when it is a saved machine) and never reaches
+    /// the core. The SSH add dialog owns every key while open. Remote Up/Down
     /// on the folder axis steps the folder browser (falling back to the
     /// host's folder recents while the browser is empty). Returns true
     /// when the picker owned the key.
@@ -983,6 +1069,12 @@ impl ShellView {
                 "backspace" => {
                     self.picker_remote.host_input.pop();
                 }
+                "delete" => {
+                    // Forward Delete on an open dropdown removes the
+                    // highlighted saved machine (This machine / Add are
+                    // inert); closed, the no-op below used to own it.
+                    self.delete_highlighted_saved_host();
+                }
                 "up" | "down" => {
                     self.step_machine_dropdown(key == "down");
                 }
@@ -991,6 +1083,12 @@ impl ShellView {
                 }
                 _ => {
                     if ctrl || platform {
+                        // `ctrl+e` (or cmd+e) edits the highlighted saved
+                        // machine without leaving the dropdown; other
+                        // chords stay consumed no-ops on this axis.
+                        if key == "e" {
+                            self.open_highlighted_saved_host_editor();
+                        }
                         return true;
                     }
                     if let Some(c) = key_char {
@@ -1453,6 +1551,117 @@ mod tests {
         assert!(view.picker_open(), "dialog opens over the picker");
         assert!(view.picker_remote.ssh_add.is_some());
         assert!(view.app.take_pending_spawn().is_none());
+    }
+
+    #[test]
+    fn machine_dropdown_delete_removes_the_saved_row() {
+        let mut view = test_shell();
+        view.app
+            .config_mut()
+            .add_saved_host("prod box", "dev@mybox", Some("/srv/api"))
+            .unwrap();
+        view.open_launch_picker();
+        view.picker_key("tab", None, false, false); // folder → machine
+        view.picker_key("down", None, false, false); // → saved host (dials it)
+        assert_eq!(view.picker_remote.host_input, "dev@mybox");
+        view.picker_key("delete", None, false, false);
+        assert!(view.app.config_saved_hosts().is_empty(), "row is gone");
+        assert_eq!(
+            view.picker_remote.host_input, "",
+            "typed host falls back to local"
+        );
+        assert!(!view.picker_is_remote());
+        assert!(view.picker_remote.machine_open, "dropdown stays open");
+        assert_eq!(view.machine_options().len(), 2, "This machine + Add only");
+        // Delete on This machine / Add is inert (never an error).
+        view.picker_key("delete", None, false, false);
+        assert!(view.picker_open());
+        view.picker_key("down", None, false, false); // → Add remote machine...
+        view.picker_key("delete", None, false, false);
+        assert!(view.picker_open());
+        assert!(view.picker_remote.ssh_add.is_none(), "Add never deletes");
+    }
+
+    #[test]
+    fn machine_dropdown_delete_with_closed_dropdown_is_inert() {
+        let mut view = test_shell();
+        view.app
+            .config_mut()
+            .add_saved_host("prod box", "dev@mybox", None)
+            .unwrap();
+        view.open_launch_picker();
+        view.picker_key("delete", None, false, false); // folder axis: no-op
+        assert_eq!(view.app.config_saved_hosts().len(), 1);
+        assert!(!view.picker_remote.machine_open);
+    }
+
+    #[test]
+    fn machine_dropdown_ctrl_e_edits_the_saved_row_in_place() {
+        let mut view = test_shell();
+        view.app
+            .config_mut()
+            .add_saved_host("prod box", "dev@mybox", Some("/srv/api"))
+            .unwrap();
+        view.open_launch_picker();
+        view.picker_key("tab", None, false, false); // folder → machine
+        view.picker_key("down", None, false, false); // → saved host
+        view.picker_key("e", None, true, false); // ctrl+e edits
+        let dialog = view
+            .picker_remote
+            .ssh_add
+            .as_ref()
+            .expect("edit dialog opens");
+        assert_eq!(dialog.name_input, "prod box", "name prefills");
+        assert_eq!(dialog.host_input, "dev@mybox", "host prefills");
+        assert_eq!(dialog.folder_input, "/srv/api", "folder prefills");
+        assert_eq!(dialog.edit_key.as_deref(), Some("dev@mybox"));
+        // Fix the typo in the target: renames, never duplicates.
+        {
+            let dialog = view.picker_remote.ssh_add.as_mut().unwrap();
+            dialog.host_input = "dev@prodbox".to_string();
+        }
+        assert!(view.save_ssh_add());
+        let saved = view.app.config_saved_hosts();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "prod box");
+        assert_eq!(saved[0].host, "dev@prodbox");
+        assert_eq!(saved[0].default_folder.as_deref(), Some("/srv/api"));
+        assert_eq!(
+            view.picker_remote.host_input, "dev@prodbox",
+            "dials the fixed host"
+        );
+        // ctrl+e on This machine is inert (nothing to edit).
+        view.picker_key("tab", None, false, false); // → folder
+        view.picker_key("tab", None, false, false); // → machine (on the saved row)
+        view.picker_key("up", None, false, false); // → This machine
+        assert_eq!(view.picker_remote.host_input, "");
+        view.picker_key("e", None, true, false);
+        assert!(view.picker_remote.ssh_add.is_none());
+    }
+
+    #[test]
+    fn ssh_edit_save_onto_another_saved_host_refuses_in_dialog() {
+        let mut view = open_picker();
+        view.app
+            .config_mut()
+            .add_saved_host("prod box", "dev@mybox", None)
+            .unwrap();
+        view.app
+            .config_mut()
+            .add_saved_host("staging", "staging-box", None)
+            .unwrap();
+        view.open_ssh_add_for_edit(0);
+        {
+            let dialog = view.picker_remote.ssh_add.as_mut().unwrap();
+            dialog.host_input = "staging-box".to_string();
+        }
+        assert!(!view.save_ssh_add(), "collision refuses, no silent merge");
+        let dialog = view.picker_remote.ssh_add.as_ref().unwrap();
+        assert!(dialog
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("already saved")));
+        assert_eq!(view.app.config_saved_hosts().len(), 2);
     }
 
     #[test]

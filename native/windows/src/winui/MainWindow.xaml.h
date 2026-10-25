@@ -40,6 +40,15 @@ namespace winrt::StaapWinUI::implementation
             Windows::Foundation::IInspectable const &sender,
             Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const
                 &args);
+        void MachineBox_KeyDown(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::Input.KeyRoutedEventArgs const &args);
+        void MachineEdit_Click(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::RoutedEventArgs const &args);
+        void MachineRemove_Click(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::RoutedEventArgs const &args);
         void PickerFolderBox_TextChanged(
             Windows::Foundation::IInspectable const &sender,
             Microsoft::UI::Xaml::Controls::TextChangedEventArgs const &args);
@@ -178,12 +187,14 @@ namespace winrt::StaapWinUI::implementation
         unsigned m_probeGen{0}; /* bumped per host edit; stale arrivals drop */
         void OpenNewSession();
         void CloseNewSession();
-        fire_and_forget ShowAddMachineDialog();
+        fire_and_forget ShowAddMachineDialog(std::string edit_host);
         std::string PickerCli();
         void RefreshPickerPreview();
         void RefreshPickerYolo(std::string const &cli);
         void RebuildCliRows(std::vector<picker::CliRow> fresh);
         void RebuildMachineBox(std::string const &select_host);
+        void SyncMachineButtons();
+        void RemoveSavedMachine();
         void AfterMachine();
         void ReloadPickerRecents();
         void KickProbe();

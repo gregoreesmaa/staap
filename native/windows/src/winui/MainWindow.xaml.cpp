@@ -862,6 +862,7 @@ namespace winrt::StaapWinUI::implementation
              !m_machineHosts[sel].empty())
                 ? m_machineHosts[sel]
                 : std::string{};
+        SyncMachineButtons();
     }
 
     /* Reload the recents dropdown: per-host persisted recents when
@@ -1058,7 +1059,7 @@ namespace winrt::StaapWinUI::implementation
             m_pickerSync = true;
             MachineBox().SelectedIndex(static_cast<int32_t>(m_machineSel));
             m_pickerSync = false;
-            ShowAddMachineDialog();
+            ShowAddMachineDialog({});
             return;
         }
         if (idx < 0 || static_cast<size_t>(idx) >= m_machineHosts.size()) {
@@ -1067,6 +1068,68 @@ namespace winrt::StaapWinUI::implementation
         m_machineSel = static_cast<size_t>(idx);
         m_machineHost = m_machineHosts[m_machineSel];
         AfterMachine();
+        SyncMachineButtons();
+    }
+
+    /* Edit/Remove sensitivity follows the selection: only a saved host
+     * row (a non-empty machine host) can be edited or removed. This
+     * machine and the Add row leave both buttons disabled - the keyboard
+     * path (Delete on the focused dropdown, Tab-reached buttons) matches
+     * the mouse path. */
+    void MainWindow::SyncMachineButtons() {
+        bool saved = m_pickerOpen && !m_machineHost.empty();
+        MachineEditButton().IsEnabled(saved);
+        MachineRemoveButton().IsEnabled(saved);
+    }
+
+    /* Remove the selected saved host (Remove button / Delete on the
+     * focused dropdown): the core forgets the host and its folder
+     * memory, the change autosaves, and the picker falls back to This
+     * machine instead of pointing at a deleted host. Refusals land in
+     * the picker error line (fail visible, never a silent no-op). */
+    void MainWindow::RemoveSavedMachine() {
+        if (!m_pickerOpen || !m_core || m_machineHost.empty()) {
+            return;
+        }
+        char *err = nullptr;
+        if (bridge_saved_host_remove(m_core, m_machineHost.c_str(),
+                                     &err) != 0) {
+            std::string msg = err ? err : "Could not remove.";
+            free(err);
+            PickerError().Text(to_hstring(msg));
+            return;
+        }
+        char *serr = nullptr;
+        if (bridge_core_save(m_core, &serr) != 0) {
+            free(serr);
+        }
+        PickerError().Text(L"");
+        RebuildMachineBox({});
+        AfterMachine();
+    }
+
+    void MainWindow::MachineEdit_Click(
+        IInspectable const &, RoutedEventArgs const &) {
+        if (m_pickerOpen && !m_machineHost.empty()) {
+            ShowAddMachineDialog(m_machineHost);
+        }
+    }
+
+    void MainWindow::MachineRemove_Click(
+        IInspectable const &, RoutedEventArgs const &) {
+        RemoveSavedMachine();
+    }
+
+    void MainWindow::MachineBox_KeyDown(
+        IInspectable const &, KeyRoutedEventArgs const &args) {
+        /* Delete on the focused dropdown removes the selected saved
+         * host (same funnel as the Remove button); anything else keeps
+         * the default ComboBox behavior. */
+        if (args.Key() == Windows::System::VirtualKey::Delete &&
+            !m_machineHost.empty()) {
+            RemoveSavedMachine();
+            args.Handled(true);
+        }
     }
 
     void MainWindow::PickerFolderBox_TextChanged(
@@ -1347,12 +1410,15 @@ namespace winrt::StaapWinUI::implementation
         PickerFolderBox().Focus(Microsoft::UI::Xaml::FocusState::Programmatic);
     }
 
-    /* SSH add dialog (opened from the machine dropdown's Add row):
+    /* SSH machine dialog (opened from the machine dropdown's Add row, or
+     * from Edit for one saved host with `edit_host` set):
      * display name, user@hostname-or-alias host, default folder,
-     * Test/Save/Cancel. Save stores a saved host via the core; Test
+     * Test/Save/Cancel. Save stores a saved host via the core (edit mode
+     * renames in place: the typo fix - saved order kept, the cap never
+     * bites, folder memory follows); Test
      * runs the core tester off-thread and reports reachable plus CLIs,
      * or the core reason line on failure. */
-    fire_and_forget MainWindow::ShowAddMachineDialog() {
+    fire_and_forget MainWindow::ShowAddMachineDialog(std::string edit_host) {
         auto lifetime = get_strong();
         if (!m_core || !m_pickerOpen) {
             co_return;
@@ -1377,6 +1443,24 @@ namespace winrt::StaapWinUI::implementation
         TextBox folderBox;
         folderBox.PlaceholderText(L"Blank = remote home directory");
         folderBox.MinWidth(260);
+        if (!edit_host.empty()) {
+            /* Edit mode: prefill from the saved row; the original host
+             * stays in edit_host so saving renames it, never duplicates. */
+            char *hosts_json = bridge_saved_hosts_json(m_core);
+            auto saved =
+                picker::parse_saved_hosts(hosts_json ? hosts_json : "[]");
+            bridge_string_free(hosts_json);
+            for (auto const &row : saved) {
+                if (row.host == edit_host) {
+                    nameBox.Text(to_hstring(row.name));
+                    hostBox.Text(to_hstring(row.host));
+                    if (!row.default_folder.empty()) {
+                        folderBox.Text(to_hstring(row.default_folder));
+                    }
+                    break;
+                }
+            }
+        }
         TextBlock result;
         result.Style(cap);
         result.TextWrapping(TextWrapping::Wrap);
@@ -1399,7 +1483,8 @@ namespace winrt::StaapWinUI::implementation
         };
         auto state = std::make_shared<AddState>();
         ContentDialog dialog;
-        dialog.Title(box_value(winrt::hstring(L"Add remote machine")));
+        dialog.Title(box_value(winrt::hstring(
+            edit_host.empty() ? L"Add remote machine" : L"Edit remote machine")));
         dialog.Content(panel);
         dialog.CloseButtonText(L"Cancel");
         dialog.DefaultButton(ContentDialogButton::Close);
@@ -1488,7 +1573,7 @@ namespace winrt::StaapWinUI::implementation
                        .Resources()
                        .Lookup(box_value(L"AccentButtonStyle"))
                        .as<Style>());
-        save.Click([this, state, nameBox, hostBox, folderBox, error,
+        save.Click([this, state, edit_host, nameBox, hostBox, folderBox, error,
                     dialog](IInspectable const &,
                             RoutedEventArgs const &) mutable {
             std::string name =
@@ -1506,11 +1591,20 @@ namespace winrt::StaapWinUI::implementation
                     L"Enter a host: user@hostname or an ssh-config alias.");
                 return;
             }
+            /* Add mode stores; edit mode renames in place (saved order
+             * kept, the cap never bites, folder memory follows). */
+            const char *folder_arg =
+                folder.empty() ? nullptr : folder.c_str();
             char *err = nullptr;
-            if (bridge_saved_host_add(m_core, name.c_str(), host.c_str(),
-                                      folder.empty() ? nullptr
-                                                     : folder.c_str(),
-                                      &err) != 0) {
+            int add_rc = edit_host.empty()
+                             ? bridge_saved_host_add(m_core, name.c_str(),
+                                                     host.c_str(), folder_arg,
+                                                     &err)
+                             : bridge_saved_host_rename(m_core,
+                                                        edit_host.c_str(),
+                                                        name.c_str(), host.c_str(),
+                                                        folder_arg, &err);
+            if (add_rc != 0) {
                 std::string msg = err ? err : "Could not save.";
                 free(err);
                 error.Text(to_hstring(msg));

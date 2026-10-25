@@ -193,13 +193,16 @@ int bridge_key_encode(const char *key, const char *key_char, int ctrl,
  * (blank hosts degrade to unreachable with the `empty-host` reason;
  * `message` is the render-ready core copy shells show verbatim).
  * Strings free with bridge_string_free();
- * add/remove report failures via `msg_out` (freed with free()). Callers
- * persist via bridge_core_save after mutations. Listing/testing block
- * for one bounded ssh round trip — call off the UI thread. */
+ * add/rename/remove report failures via `msg_out` (freed with free()).
+ * Callers persist via bridge_core_save after mutations. Listing/testing
+ * block for one bounded ssh round trip — call off the UI thread. */
 char *bridge_saved_hosts_json(const StaapCore *core);
 int bridge_saved_host_add(StaapCore *core, const char *name,
                           const char *host, const char *default_folder,
                           char **msg_out);
+int bridge_saved_host_rename(StaapCore *core, const char *key,
+                             const char *name, const char *host,
+                             const char *default_folder, char **msg_out);
 int bridge_saved_host_remove(StaapCore *core, const char *key,
                              char **msg_out);
 char *bridge_remote_default_folder(const StaapCore *core, const char *host);

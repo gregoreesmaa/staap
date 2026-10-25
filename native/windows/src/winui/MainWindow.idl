@@ -10,6 +10,13 @@ namespace StaapWinUI
         void MachineBox_SelectionChanged(
             Object sender,
             Microsoft.UI.Xaml.Controls.SelectionChangedEventArgs args);
+        void MachineBox_KeyDown(
+            Object sender,
+            Microsoft.UI.Xaml.Input.KeyRoutedEventArgs args);
+        void MachineEdit_Click(
+            Object sender, Microsoft.UI.Xaml.RoutedEventArgs args);
+        void MachineRemove_Click(
+            Object sender, Microsoft.UI.Xaml.RoutedEventArgs args);
         void PickerFolderBox_TextChanged(
             Object sender,
             Microsoft.UI.Xaml.Controls.TextChangedEventArgs args);

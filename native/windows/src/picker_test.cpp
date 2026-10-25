@@ -246,6 +246,39 @@ static void ssh_picker_bridge_surface(void) {
               "remote default saved host");
         bridge_string_free(d);
     }
+    {
+        /* Rename in place (keyed by display name): the typo fix moves
+         * the target, keeps the per-host default, and carries the
+         * folder memory to the new target. */
+        char *err = nullptr;
+        CHECK(bridge_saved_host_rename(core, "Build box", "Prod box",
+                                       "alice@prodbox", "/srv/v2",
+                                       &err) == 0,
+              "saved rename stores");
+        CHECK(err == nullptr, "saved rename sets no error");
+        char *h = bridge_saved_hosts_json(core);
+        CHECK(h && std::strstr(h, "alice@prodbox") &&
+                  std::strstr(h, "Prod box") &&
+                  std::strstr(h, "/srv/v2") &&
+                  !std::strstr(h, "alice@buildbox"),
+              "saved rename round trip");
+        bridge_string_free(h);
+        char *d = bridge_remote_default_folder(core, "alice@prodbox");
+        CHECK(d && std::strcmp(d, "/srv/v2") == 0,
+              "remote default follows rename");
+        bridge_string_free(d);
+    }
+    {
+        char *err = nullptr;
+        CHECK(bridge_saved_host_rename(core, "no-such-host-xyz", "n", "h",
+                                       nullptr, &err) != 0,
+              "saved rename unknown refuses");
+        CHECK(err && err[0] != '\0', "saved rename unknown names fix");
+        free(err);
+    }
+    CHECK(bridge_saved_host_rename(nullptr, "k", "n", "h", nullptr,
+                                   nullptr) != 0,
+          "saved rename null core refuses");
     CHECK(bridge_remote_default_folder(core, "no-such-host-xyz") == nullptr,
           "remote default unknown null");
     CHECK(bridge_remote_default_folder(core, "") == nullptr,
@@ -265,8 +298,8 @@ static void ssh_picker_bridge_surface(void) {
               "saved remove null core refuses");
         free(err);
     }
-    CHECK(bridge_saved_host_remove(core, "alice@buildbox", nullptr) == 0,
-          "saved remove by host");
+    CHECK(bridge_saved_host_remove(core, "alice@prodbox", nullptr) == 0,
+          "saved remove by renamed host");
     {
         char *h = bridge_saved_hosts_json(core);
         CHECK(h && std::strcmp(h, "[]") == 0,

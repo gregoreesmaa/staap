@@ -420,6 +420,13 @@ impl ShellView {
                 );
             }
             section = section.child(SidebarMenu::new().children(items));
+            // Keyboard affordance in words (never color-only): clicking a
+            // row dials it, Delete removes and ctrl+e edits a saved row.
+            section = section.child(
+                div()
+                    .text_xs()
+                    .child("(delete removes / ctrl+e edits a saved machine)".to_string()),
+            );
         }
         section
     }
@@ -525,15 +532,17 @@ impl ShellView {
     /// plus the detected CLIs) and Save/Cancel backed by the core
     /// saved-hosts store.
     fn render_ssh_add_dialog(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let (name, host, folder, focus, error) = match self.picker_remote.ssh_add.as_ref() {
+        let (name, host, folder, focus, error, editing) = match self.picker_remote.ssh_add.as_ref()
+        {
             Some(d) => (
                 d.name_input.clone(),
                 d.host_input.clone(),
                 d.folder_input.clone(),
                 d.focus,
                 d.error.clone(),
+                d.edit_key.is_some(),
             ),
-            None => (String::new(), String::new(), String::new(), 0, None),
+            None => (String::new(), String::new(), String::new(), 0, None, false),
         };
         let shown = |value: &str| {
             if value.is_empty() {
@@ -547,7 +556,11 @@ impl ShellView {
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().child("Add remote machine...".to_string()))
+            .child(div().child(if editing {
+                "Edit remote machine...".to_string()
+            } else {
+                "Add remote machine...".to_string()
+            }))
             .child(div().child(format!("{}Display name: {}", mark(0), shown(&name))))
             .child(div().child(format!(
                 "{}Host (user@hostname or alias): {}",

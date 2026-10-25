@@ -516,6 +516,8 @@ struct PickerUi {
     size_t n_machine_rows;
     guint machine_sel; /* last non-Add selection (Add reverts to this) */
     char *machine_host; /* trimmed selected host, NULL = this machine */
+    GtkWidget *machine_edit; /* Edit... for a saved selection */
+    GtkWidget *machine_remove; /* Remove for a saved selection */
     GtkDropDown *recent;
     char **recents;
     size_t n_recents;
@@ -982,7 +984,10 @@ static void picker_reload_recents(PickerUi *pu, const char *host) {
 static void picker_machine_changed(GObject *obj, GParamSpec *pspec,
                                    gpointer data);
 static void picker_after_machine(PickerUi *pu);
-static void picker_open_add_dialog(PickerUi *pu);
+static void picker_open_add_dialog(PickerUi *pu, const char *edit_host);
+static void picker_remove_saved_host(PickerUi *pu);
+static void picker_edit_saved_host(PickerUi *pu);
+static void picker_sync_machine_buttons(PickerUi *pu);
 static void picker_browse_refresh(PickerUi *pu);
 
 /* Saved-host row (parsed from the core saved-hosts JSON). */
@@ -1149,6 +1154,7 @@ static void picker_rebuild_machine(PickerUi *pu, const char *select_host) {
     pu->machine_host = (sel > 0 && pu->machine_hosts[sel])
         ? g_strdup(pu->machine_hosts[sel])
         : NULL;
+    picker_sync_machine_buttons(pu);
 }
 
 /* Refresh everything the machine axis owns: folder default inherit,
@@ -1191,7 +1197,7 @@ static void picker_machine_changed(GObject *obj, GParamSpec *pspec,
         gtk_drop_down_set_selected(pu->machine, pu->machine_sel);
         g_signal_handlers_unblock_by_func(pu->machine, picker_machine_changed,
                                           pu);
-        picker_open_add_dialog(pu);
+        picker_open_add_dialog(pu, NULL);
         return;
     }
     pu->machine_sel = idx;
@@ -1200,7 +1206,73 @@ static void picker_machine_changed(GObject *obj, GParamSpec *pspec,
         (idx > 0 && idx < pu->n_machine_rows && pu->machine_hosts[idx])
         ? g_strdup(pu->machine_hosts[idx])
         : NULL;
+    picker_sync_machine_buttons(pu);
     picker_after_machine(pu);
+}
+
+/* Edit/Remove sensitivity follows the selection: only a saved host row
+ * (non-NULL machine_host) can be edited or removed. This machine and the
+ * Add row leave both buttons insensitive — the keyboard path (Delete on
+ * the focused dropdown, Tab-reached buttons) matches the mouse path. */
+static void picker_sync_machine_buttons(PickerUi *pu) {
+    int saved = pu->machine_host != NULL;
+    if (pu->machine_edit) {
+        gtk_widget_set_sensitive(pu->machine_edit, saved);
+    }
+    if (pu->machine_remove) {
+        gtk_widget_set_sensitive(pu->machine_remove, saved);
+    }
+}
+
+/* Remove the selected saved host (Remove button / Delete on the focused
+ * dropdown): the core forgets the host and its folder memory, the change
+ * persists via the normal autosave, and the picker falls back to This
+ * machine instead of pointing at a deleted host. Refusals land in the
+ * picker error line (fail visible, never a silent no-op). */
+static void picker_remove_saved_host(PickerUi *pu) {
+    if (!pu->machine_host) {
+        return;
+    }
+    char *err = NULL;
+    if (bridge_saved_host_remove(pu->sh->core, pu->machine_host, &err) != 0) {
+        gtk_label_set_text(pu->error, err ? err : "Could not remove.");
+        free(err);
+        return;
+    }
+    char *serr = NULL;
+    if (bridge_core_save(pu->sh->core, &serr) != 0) {
+        free(serr);
+    }
+    picker_rebuild_machine(pu, NULL);
+    picker_after_machine(pu);
+}
+
+/* Edit the selected saved host: reopens the SSH dialog prefilled so
+ * saving renames in place (the typo fix). Inert without a selection. */
+static void picker_edit_saved_host(PickerUi *pu) {
+    if (!pu->machine_host) {
+        return;
+    }
+    char *host = g_strdup(pu->machine_host);
+    picker_open_add_dialog(pu, host);
+    g_free(host);
+}
+
+/* Delete on the focused machine dropdown removes the selected saved
+ * host (same funnel as the Remove button); other keys keep their
+ * default dropdown behavior. */
+static gboolean picker_machine_key_pressed(GtkEventControllerKey *self,
+                                           guint keyval, guint keycode,
+                                           GdkModifierType state,
+                                           gpointer data) {
+    (void)self;
+    (void)keycode;
+    (void)state;
+    if (keyval == GDK_KEY_Delete || keyval == GDK_KEY_KP_Delete) {
+        picker_remove_saved_host((PickerUi *)data);
+        return TRUE;
+    }
+    return FALSE;
 }
 
 /* Remote folder browser (remote hosts only): one bounded ssh listing
@@ -1459,9 +1531,11 @@ static void picker_browse_go(GtkButton *btn, gpointer data) {
     picker_on_changed(data);
 }
 
-/* SSH add dialog (opened from the machine dropdown's Add row): display
- * name, user@hostname-or-alias host, default folder, Test/Save/Cancel.
- * Save stores a saved host via the core; Test runs the core tester
+/* SSH add dialog (opened from the machine dropdown's Add row, or from
+ * Edit for one saved host): display name, user@hostname-or-alias host,
+ * default folder, Test/Save/Cancel. Save stores a saved host via the
+ * core (edit mode renames in place through the core rename entry, so a
+ * typo'd target is fixed, not duplicated); Test runs the core tester
  * off-thread and reports reachable plus detected CLIs, or the core
  * reason line on failure. */
 typedef struct {
@@ -1474,6 +1548,7 @@ typedef struct {
     AdwDialog *dialog;
     unsigned test_gen;
     int alive; /* cleared by the closed handler; stale tests drop */
+    char *edit_key; /* original host when editing, NULL when adding */
 } AddUi;
 
 typedef struct {
@@ -1680,8 +1755,17 @@ static void add_save_clicked(GtkButton *btn, gpointer data) {
     }
     {
         char *err = NULL;
-        if (bridge_saved_host_add(au->pu->sh->core, name, host, folder,
-                                  &err) != 0) {
+        int rc;
+        if (au->edit_key) {
+            /* Edit mode: rename in place (the typo fix — saved order
+             * kept, the cap never bites, folder memory follows). */
+            rc = bridge_saved_host_rename(au->pu->sh->core, au->edit_key,
+                                          name, host, folder, &err);
+        } else {
+            rc = bridge_saved_host_add(au->pu->sh->core, name, host, folder,
+                                       &err);
+        }
+        if (rc != 0) {
             gtk_label_set_text(au->error, err ? err : "Could not save.");
             free(err);
             goto out;
@@ -1712,10 +1796,15 @@ static void add_dialog_closed(AdwDialog *dialog, gpointer data) {
     AddUi *au = data;
     au->alive = 0;
     au->test_gen++;
+    g_free(au->edit_key);
     free(au);
 }
 
-static void picker_open_add_dialog(PickerUi *pu) {
+/* SSH machine dialog (opened from the machine dropdown's Add row, or
+ * from Edit for one saved host): in edit mode (`edit_host` non-NULL)
+ * the title changes and the entries prefill from the saved row, so
+ * saving renames in place instead of adding. */
+static void picker_open_add_dialog(PickerUi *pu, const char *edit_host) {
     GtkWindow *win = GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(pu->page)));
     AddUi *au = calloc(1, sizeof *au);
     if (!au) {
@@ -1723,10 +1812,17 @@ static void picker_open_add_dialog(PickerUi *pu) {
     }
     au->pu = pu;
     au->alive = 1;
+    if (edit_host && *edit_host) {
+        au->edit_key = g_strdup(edit_host);
+        if (!au->edit_key) {
+            free(au);
+            return;
+        }
+    }
 
     AdwDialog *dialog = ADW_DIALOG(adw_dialog_new());
     au->dialog = dialog;
-    adw_dialog_set_title(dialog, "Add remote machine");
+    adw_dialog_set_title(dialog, au->edit_key ? "Edit remote machine" : "Add remote machine");
     adw_dialog_set_content_width(dialog, 380);
     g_signal_connect(dialog, "closed", G_CALLBACK(add_dialog_closed), au);
 
@@ -1758,6 +1854,27 @@ static void picker_open_add_dialog(PickerUi *pu) {
     gtk_entry_set_placeholder_text(au->folder,
                                    "Blank = remote home directory");
     gtk_box_append(GTK_BOX(box), GTK_WIDGET(au->folder));
+    if (au->edit_key) {
+        /* Edit mode: prefill from the saved row (name + host + default
+         * folder); the original host stays in edit_key so saving
+         * renames it, never duplicates. */
+        char *hosts_json = bridge_saved_hosts_json(pu->sh->core);
+        size_t n = 0;
+        SavedHost *hosts = parse_hosts(hosts_json ? hosts_json : "[]", &n);
+        bridge_string_free(hosts_json);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(hosts[i].host, au->edit_key) == 0) {
+                gtk_editable_set_text(GTK_EDITABLE(au->name), hosts[i].name);
+                gtk_editable_set_text(GTK_EDITABLE(au->host), hosts[i].host);
+                if (hosts[i].folder) {
+                    gtk_editable_set_text(GTK_EDITABLE(au->folder),
+                                          hosts[i].folder);
+                }
+                break;
+            }
+        }
+        hosts_free(hosts, n);
+    }
 
     au->result = GTK_LABEL(gtk_label_new(""));
     gtk_label_set_xalign(au->result, 0);
@@ -2029,15 +2146,38 @@ static void show_new_session(Shell *sh) {
     }
 
     /* SSH machine axis: This machine, saved hosts, Add remote
-     * machine... (blank = this machine, local launch). */
+     * machine... (blank = this machine, local launch). The Edit/Remove
+     * buttons beside the dropdown manage the saved selection (both are
+     * keyboard-reachable; Delete on the focused dropdown removes too). */
     GtkWidget *host_label = gtk_label_new("Which machine?");
     gtk_label_set_xalign(GTK_LABEL(host_label), 0);
     gtk_widget_add_css_class(host_label, "heading");
     gtk_box_append(GTK_BOX(box), host_label);
+    GtkWidget *machine_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     pu->machine = GTK_DROP_DOWN(gtk_drop_down_new(NULL, NULL));
+    gtk_widget_set_hexpand(GTK_WIDGET(pu->machine), TRUE);
     g_signal_connect(pu->machine, "notify::selected",
                      G_CALLBACK(picker_machine_changed), pu);
-    gtk_box_append(GTK_BOX(box), GTK_WIDGET(pu->machine));
+    {
+        GtkEventController *keys = gtk_event_controller_key_new();
+        g_signal_connect(keys, "key-pressed",
+                         G_CALLBACK(picker_machine_key_pressed), pu);
+        gtk_widget_add_controller(GTK_WIDGET(pu->machine), keys);
+    }
+    gtk_box_append(GTK_BOX(machine_row), GTK_WIDGET(pu->machine));
+    pu->machine_edit = gtk_button_new_with_label("Edit...");
+    gtk_widget_set_tooltip_text(pu->machine_edit,
+                                "Edit the selected saved machine");
+    g_signal_connect_swapped(pu->machine_edit, "clicked",
+                             G_CALLBACK(picker_edit_saved_host), pu);
+    gtk_box_append(GTK_BOX(machine_row), pu->machine_edit);
+    pu->machine_remove = gtk_button_new_with_label("Remove");
+    gtk_widget_set_tooltip_text(pu->machine_remove,
+                                "Delete the selected saved machine");
+    g_signal_connect_swapped(pu->machine_remove, "clicked",
+                             G_CALLBACK(picker_remove_saved_host), pu);
+    gtk_box_append(GTK_BOX(machine_row), pu->machine_remove);
+    gtk_box_append(GTK_BOX(box), machine_row);
     GtkWidget *host_hint =
         gtk_label_new("This machine, a saved host, or add one - "
                       "e.g. alice@buildbox");

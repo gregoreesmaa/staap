@@ -129,6 +129,16 @@ int bridge_saved_host_remove(StaapCore *core, const char *key,
     return rc;
 }
 
+int bridge_saved_host_rename(StaapCore *core, const char *key,
+                             const char *name, const char *host,
+                             const char *default_folder, char **msg_out) {
+    int rc = staap_saved_host_rename(core, key, name, host, default_folder);
+    if (rc != 0 && msg_out) {
+        *msg_out = copy_last_error();
+    }
+    return rc;
+}
+
 char *bridge_remote_default_folder(const StaapCore *core, const char *host) {
     return staap_remote_default_folder(core, host);
 }

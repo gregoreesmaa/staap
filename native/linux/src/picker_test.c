@@ -8,7 +8,8 @@
  * coverage (`bridge_clis_remote`, `bridge_remote_recent_json`,
  * `bridge_run_spawn_remote`, plus the SSH-picker surface
  * `bridge_saved_hosts_json` / `bridge_saved_host_add` /
- * `bridge_saved_host_remove` / `bridge_remote_default_folder` /
+ * `bridge_saved_host_rename` / `bridge_saved_host_remove` /
+ * `bridge_remote_default_folder` /
  * `bridge_remote_list_json` / `bridge_remote_test_json`) is hermetic:
  * null/blank/unknown hosts never touch the network.
  *
@@ -170,6 +171,44 @@ int main(void) {
         CHECK(d && strcmp(d, "/srv/api") == 0, "remote default saved host");
         bridge_string_free(d);
     }
+    {
+        /* Rename in place (keyed by display name): the typo fix moves
+         * the target, keeps the per-host default, and carries the
+         * folder memory to the new target. */
+        char *err = NULL;
+        CHECK(bridge_saved_host_rename(core, "Build box", "Prod box",
+                                       "alice@prodbox", "/srv/v2",
+                                       &err) == 0,
+              "saved rename stores");
+        CHECK(err == NULL, "saved rename sets no error");
+        char *h = bridge_saved_hosts_json(core);
+        CHECK(h && strstr(h, "alice@prodbox") && strstr(h, "Prod box") &&
+                  strstr(h, "/srv/v2") && !strstr(h, "alice@buildbox"),
+              "saved rename round trip");
+        bridge_string_free(h);
+        char *d = bridge_remote_default_folder(core, "alice@prodbox");
+        CHECK(d && strcmp(d, "/srv/v2") == 0,
+              "remote default follows rename");
+        bridge_string_free(d);
+    }
+    {
+        char *err = NULL;
+        CHECK(bridge_saved_host_rename(core, "no-such-host-xyz", "n",
+                                       "h", NULL, &err) != 0,
+              "saved rename unknown refuses");
+        CHECK(err && err[0], "saved rename unknown names fix");
+        free(err);
+    }
+    {
+        char *err = NULL;
+        CHECK(bridge_saved_host_rename(core, "  ", "n", "h", NULL,
+                                       &err) != 0,
+              "saved rename blank key refuses");
+        CHECK(err && err[0], "saved rename blank key names fix");
+        free(err);
+    }
+    CHECK(bridge_saved_host_rename(NULL, "k", "n", "h", NULL, NULL) != 0,
+          "saved rename null core refuses");
     CHECK(bridge_remote_default_folder(core, "no-such-host-xyz") == NULL,
           "remote default unknown null");
     CHECK(bridge_remote_default_folder(core, "") == NULL,
@@ -183,8 +222,8 @@ int main(void) {
         CHECK(err && err[0], "saved remove unknown names fix");
         free(err);
     }
-    CHECK(bridge_saved_host_remove(core, "alice@buildbox", NULL) == 0,
-          "saved remove by host");
+    CHECK(bridge_saved_host_remove(core, "alice@prodbox", NULL) == 0,
+          "saved remove by renamed host");
     {
         char *h = bridge_saved_hosts_json(core);
         CHECK(h && strcmp(h, "[]") == 0, "saved hosts empty after remove");

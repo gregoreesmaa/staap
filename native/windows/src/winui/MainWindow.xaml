@@ -266,9 +266,28 @@
                             <TextBlock Text="Which machine?"
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
                             <ComboBox x:Name="MachineBox"
+                                      Grid.Column="0"
                                       HorizontalAlignment="Stretch"
-                                      SelectionChanged="MachineBox_SelectionChanged"/>
+                                      SelectionChanged="MachineBox_SelectionChanged"
+                                      KeyDown="MachineBox_KeyDown"/>
+                            <Button x:Name="MachineEditButton"
+                                    Grid.Column="1"
+                                    Content="Edit..."
+                                    IsEnabled="False"
+                                    Click="MachineEdit_Click"/>
+                            <Button x:Name="MachineRemoveButton"
+                                    Grid.Column="2"
+                                    Content="Remove"
+                                    IsEnabled="False"
+                                    Click="MachineRemove_Click"/>
+                            </Grid>
                             <TextBlock Text="This machine, a saved host, or add one - e.g. alice@buildbox"
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap"/>
