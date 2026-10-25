@@ -907,6 +907,123 @@ pub fn ssh_spawn_command(
     }
 }
 
+/// Which remote shell a folder spawn must target: the POSIX spelling
+/// (`cd … && exec …`) runs on sh/bash remotes, the PowerShell spelling
+/// (`Set-Location …; & …`, always wrapped for `cmd.exe`) on Windows
+/// remotes whatever their default shell. Detected per folder spawn by
+/// [`detect_remote_shell`]; when detection fails the spawn stays POSIX
+/// (the historic command, fail-visible in the terminal like before).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteShell {
+    Posix,
+    PowerShell,
+}
+
+/// One bounded non-interactive round trip deciding which folder-spawn
+/// spelling `host` needs: a host that runs `powershell` (any Windows
+/// default shell) means [`RemoteShell::PowerShell`]; anything else (no
+/// `powershell`, unreachable host, auth-gated) means
+/// [`RemoteShell::Posix`]. Blank hosts never dial: POSIX, matching
+/// [`ssh_spawn_command`].
+pub fn detect_remote_shell(host: &str) -> RemoteShell {
+    let target = host.trim();
+    if target.is_empty() {
+        return RemoteShell::Posix;
+    }
+    match run_ssh_attempt(target, &powershell_encoded_command("$null")) {
+        Ok(_) => RemoteShell::PowerShell,
+        Err(_) => RemoteShell::Posix,
+    }
+}
+
+/// PowerShell spelling of the folder spawn for Windows SSH hosts: a
+/// strict directory change, then the CLI invoked in place (`&` —
+/// PowerShell has no `exec`). Home dirs ride
+/// [`remote_ps_cd_snippet`] and quoting rides [`ps_quote`], so the
+/// same paths the listing probe just browsed keep working here.
+/// `-ErrorAction Stop` fails a missing dir instead of running the
+/// agent in the wrong directory.
+pub fn ps_spawn_snippet(dir: &str, program: &str, args: &[String]) -> String {
+    let mut snippet = remote_ps_cd_snippet(dir);
+    snippet.push_str(" -ErrorAction Stop; & ");
+    snippet.push_str(&ps_quote(program));
+    for arg in args {
+        snippet.push(' ');
+        snippet.push_str(&ps_quote(arg));
+    }
+    snippet
+}
+
+/// Folder spawn for a known remote shell (pure half of
+/// [`ssh_spawn_command_live`], headlessly testable): POSIX keeps the
+/// historic `cd … && exec …` snippet, PowerShell wraps
+/// [`ps_spawn_snippet`] for `cmd.exe` exactly like the probes.
+/// No-folder and blank-host inputs match [`ssh_spawn_command`]
+/// exactly — plain `ssh -t <host> <cli> …` runs on every default
+/// shell, so it needs no spelling.
+pub fn ssh_spawn_command_for_shell(
+    target: &SshTarget,
+    inner_program: &str,
+    inner_args: &[String],
+    shell: RemoteShell,
+) -> (String, Vec<String>) {
+    let host = target.normalized_host();
+    if host.is_empty() {
+        return (inner_program.to_string(), inner_args.to_vec());
+    }
+    let dir = target
+        .remote_cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    match (dir, shell) {
+        (Some(dir), RemoteShell::PowerShell) => (
+            "ssh".to_string(),
+            vec![
+                "-t".to_string(),
+                host,
+                powershell_encoded_command(&ps_spawn_snippet(dir, inner_program, inner_args)),
+            ],
+        ),
+        _ => ssh_spawn_command(target, inner_program, inner_args),
+    }
+}
+
+/// Folder spawn against a live host: one bounded canary round trip
+/// ([`detect_remote_shell`]) picks the spelling, then
+/// [`ssh_spawn_command_for_shell`] builds it. Only folder spawns pay
+/// the round trip — the plain form needs no detection and never dials
+/// here. Unknown hosts degrade to the POSIX spelling (the historic
+/// command, fail-visible in the terminal as before).
+///
+/// Blocking note for shells: at most one extra `ssh` round trip
+/// (bounded by the connect timeout in [`remote_probe_command`]), only
+/// when a remote folder is set. Previews keep using
+/// [`ssh_spawn_command`] through [`App::spawn_command_for`], so typing
+/// never waits on the network; every real spawn (first runs and
+/// restarts, every shell) comes here instead.
+pub fn ssh_spawn_command_live(
+    target: &SshTarget,
+    inner_program: &str,
+    inner_args: &[String],
+) -> (String, Vec<String>) {
+    let host = target.normalized_host();
+    if host.is_empty() {
+        return (inner_program.to_string(), inner_args.to_vec());
+    }
+    let has_folder = target
+        .remote_cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .is_some();
+    if !has_folder {
+        return ssh_spawn_command(target, inner_program, inner_args);
+    }
+    let shell = detect_remote_shell(&host);
+    ssh_spawn_command_for_shell(target, inner_program, inner_args, shell)
+}
+
 /// A confirmed 2D launch: where the child spawns, with what, how freely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSelection {
@@ -1570,6 +1687,93 @@ mod tests {
             ssh_spawn_command(&SshTarget::new("   ".to_string(), None), "muse", &inner);
         assert_eq!(program, "muse");
         assert_eq!(args, inner);
+    }
+
+    #[test]
+    fn ps_spawn_snippet_quotes_and_stops_on_missing_dirs() {
+        assert_eq!(
+            ps_spawn_snippet("/srv/api", "muse", &["--yolo".to_string()]),
+            "Set-Location -LiteralPath '/srv/api' -ErrorAction Stop; & 'muse' '--yolo'"
+        );
+        // Home dirs ride the shared rewrite; a missing dir stops the
+        // whole spawn instead of running the agent elsewhere.
+        assert_eq!(
+            ps_spawn_snippet("~", "muse", &[]),
+            "Set-Location -LiteralPath \"$HOME\" -ErrorAction Stop; & 'muse'"
+        );
+        // Single quotes double; backslashes stay literal.
+        assert_eq!(
+            ps_spawn_snippet("C:\\srv\\it's", "muse", &["it's".to_string()]),
+            "Set-Location -LiteralPath 'C:\\srv\\it''s' -ErrorAction Stop; & 'muse' 'it''s'"
+        );
+    }
+
+    #[test]
+    fn spawn_for_shell_picks_the_spelling_per_shell() {
+        let target = SshTarget::new("mybox".to_string(), Some("/srv/api".to_string()));
+        let inner = vec!["--yolo".to_string()];
+        // POSIX keeps the historic cd/exec snippet.
+        let (program, args) =
+            ssh_spawn_command_for_shell(&target, "muse", &inner, RemoteShell::Posix);
+        assert_eq!(program, "ssh");
+        assert_eq!(
+            args,
+            vec!["-t", "mybox", "cd '/srv/api' && exec 'muse' '--yolo'"]
+        );
+        // PowerShell wraps the Set-Location/invoke snippet for cmd.exe.
+        let (program, args) =
+            ssh_spawn_command_for_shell(&target, "muse", &inner, RemoteShell::PowerShell);
+        assert_eq!(program, "ssh");
+        assert_eq!(args.len(), 3);
+        assert_eq!(&args[..2], &["-t".to_string(), "mybox".to_string()]);
+        assert!(
+            args[2].starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "),
+            "{}",
+            args[2]
+        );
+        // No folder: both spellings stay the plain ssh form (zero
+        // detection needed — it runs on every default shell).
+        let nodir = SshTarget::new("mybox".to_string(), None);
+        for shell in [RemoteShell::Posix, RemoteShell::PowerShell] {
+            assert_eq!(
+                ssh_spawn_command_for_shell(&nodir, "muse", &inner, shell),
+                (
+                    "ssh".to_string(),
+                    vec![
+                        "-t".to_string(),
+                        "mybox".to_string(),
+                        "muse".to_string(),
+                        "--yolo".to_string()
+                    ]
+                )
+            );
+        }
+        // Blank host falls back to the inner command for both spellings.
+        let blank = SshTarget::new("   ".to_string(), Some("/srv/api".to_string()));
+        for shell in [RemoteShell::Posix, RemoteShell::PowerShell] {
+            assert_eq!(
+                ssh_spawn_command_for_shell(&blank, "muse", &inner, shell),
+                ("muse".to_string(), inner.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_live_never_dials_without_a_folder() {
+        // No folder: identical to the pure builder (zero round trips).
+        let nodir = SshTarget::new("mybox".to_string(), None);
+        let inner = vec!["--yolo".to_string()];
+        assert_eq!(
+            ssh_spawn_command_live(&nodir, "muse", &inner),
+            ssh_spawn_command(&nodir, "muse", &inner)
+        );
+        // Blank hosts never dial: POSIX, like the pure builder.
+        assert_eq!(detect_remote_shell("   "), RemoteShell::Posix);
+        let blank = SshTarget::new("   ".to_string(), Some("/srv/api".to_string()));
+        assert_eq!(
+            ssh_spawn_command_live(&blank, "muse", &inner),
+            ("muse".to_string(), inner)
+        );
     }
 
     #[test]

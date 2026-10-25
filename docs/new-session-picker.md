@@ -91,7 +91,11 @@ fail it silently.
   `staap_remote_recent_json`. Shells only render.
 - The remote folder never touches the local PTY cwd: without one the
   spawn is `ssh -t <host> <cli> <args…>`; with one it folds into
-  `ssh -t <host> 'cd <dir> && exec <cli> …'` (quoted). Preview reads
+  `ssh -t <host> 'cd <dir> && exec <cli> …'` (quoted) on sh remotes,
+  or the PowerShell `Set-Location …; & <cli> …` spelling (wrapped for
+  `cmd.exe`) on Windows remotes — one bounded canary round trip picks
+  the spelling per folder spawn (`ssh_spawn_command_live`), previews
+  keep the pure `ssh_spawn_command` so typing never waits. Preview reads
   `ssh <host>: <cli> [--flag] in <dir>`.
 - Persisted state is host + folder only (serde-defaulted, old files load
   as local; restarts redial the stored target). Passwords, keys, and

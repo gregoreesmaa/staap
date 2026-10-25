@@ -1081,7 +1081,9 @@ pub unsafe extern "C" fn staap_run_spawn_remote(
         inner: Box::new(inner),
         target: target.clone(),
     };
-    let (program, args) = app.spawn_command_for(&kind);
+    // Folder spawns detect the remote shell first, so Windows hosts
+    // get the PowerShell spelling (see `spawn_command_for_live`).
+    let (program, args) = app.spawn_command_for_live(&kind);
     // The local PTY just inherits its cwd: the remote dir rides inside
     // the `ssh` command, never in the local spawn.
     let pty = match EmbeddedPty::spawn_with_cwd(&program, &args, cols, rows, None) {
@@ -1553,7 +1555,8 @@ pub unsafe extern "C" fn staap_run_restart(
             return StaapError::Spawn.code();
         }
     };
-    let (program, args) = reg.app.spawn_command_for(&kind);
+    // Restarts re-detect like first spawns (see `spawn_command_for_live`).
+    let (program, args) = reg.app.spawn_command_for_live(&kind);
     let cwd = reg.app.session_cwd(&id_str);
     let pty = match EmbeddedPty::spawn_with_cwd(&program, &args, cols, rows, cwd.as_deref()) {
         Ok(pty) => pty,
