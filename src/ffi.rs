@@ -1356,13 +1356,18 @@ pub unsafe extern "C" fn staap_remote_list_json(
 }
 
 /// Owned JSON of the add-dialog tester result (SSH picker):
-/// `{"reachable":bool,"clis":[...]}` from one bounded non-interactive
-/// `ssh` round trip (see [`launch::test_remote_host`]). Null/blank hosts
-/// and every probe failure degrade to `{"reachable":false,
-/// all-listed-none-available}`, never null (allocation aside); non-UTF-8
-/// hosts report null with a message. Free with
-/// [`staap_screen_text_free`]. Blocking: shells call this off the UI
-/// thread, on tester-button press only.
+/// `{"reachable":bool,"reason":str|null,"message":str|null,"clis":[...]}`
+/// from one bounded non-interactive `ssh` round trip (see
+/// [`launch::test_remote_host`]). Null/blank hosts and every probe
+/// failure degrade to `{"reachable":false, reason, message,
+/// all-listed-none-available}`, never null (allocation aside): `reason`
+/// is a kebab-case [`launch::SshFailureReason`] code
+/// (`empty-host`, `missing-ssh-binary`, `unknown-host`, `timeout`,
+/// `auth-failure`, `remote-shell-error`, `unreachable`) and `message`
+/// its render-ready one-liner, which shells show verbatim instead of
+/// reimplementing the mapping per shell. Non-UTF-8 hosts report null
+/// with a message. Free with [`staap_screen_text_free`]. Blocking:
+/// shells call this off the UI thread, on tester-button press only.
 ///
 /// # Safety
 /// `host` must be null or a valid NUL-terminated C string.
@@ -3242,7 +3247,8 @@ mod tests {
                 staap_screen_text_free(raw);
             }
             // Tester degrades to unreachable + degraded catalog without
-            // spawning ssh on null/blank hosts.
+            // spawning ssh on null/blank hosts, naming the empty-host
+            // reason shells render verbatim.
             for h in [std::ptr::null(), c"".as_ptr(), c"   ".as_ptr()] {
                 let raw = staap_remote_test_json(h);
                 assert!(!raw.is_null());
@@ -3250,6 +3256,11 @@ mod tests {
                 staap_screen_text_free(raw);
                 let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
                 assert_eq!(doc["reachable"], false);
+                assert_eq!(doc["reason"], "empty-host");
+                assert_eq!(
+                    doc["message"],
+                    crate::launch::SshFailureReason::EmptyHost.message()
+                );
                 let ids: Vec<&str> = doc["clis"]
                     .as_array()
                     .unwrap()

@@ -210,18 +210,140 @@ pub fn detect_remote_clis(host: &str) -> Vec<AvailableCli> {
         return parse_remote_probe_output("");
     }
     match run_remote_posix_then_ps(target, &remote_probe_script(), &remote_ps_probe_script()) {
-        Some(text) => parse_remote_probe_output(&text),
-        None => parse_remote_probe_output(""),
+        Ok(text) => parse_remote_probe_output(&text),
+        Err(_) => parse_remote_probe_output(""),
+    }
+}
+
+/// Why one `ssh` probe round trip failed: the add-dialog tester reports
+/// this instead of a bare reachable/unreachable so users (and shells)
+/// can tell auth failure from unknown host from timeout at a glance.
+/// Serialized kebab-case (`"auth-failure"`, …) in the tester JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshFailureReason {
+    /// Blank host: the tester never spawned `ssh`.
+    EmptyHost,
+    /// The local `ssh` binary is missing from `PATH`.
+    MissingSshBinary,
+    /// The host does not resolve (`Could not resolve hostname`, …).
+    UnknownHost,
+    /// The host stopped answering mid-handshake (`Operation timed out`, …).
+    Timeout,
+    /// The server refused our credentials (`Permission denied`, …).
+    AuthFailure,
+    /// `ssh` connected but the remote shell understood neither the POSIX
+    /// nor the PowerShell probe spelling.
+    RemoteShellError,
+    /// Anything else: refused, reset, signal, or unrecognized output.
+    Unreachable,
+}
+
+impl SshFailureReason {
+    /// Render-ready one-liner for the tester UI. Shells show it verbatim
+    /// (dumb-shell contract: no per-shell error parsing); the generic arm
+    /// keeps the historic `unreachable — …` copy.
+    pub fn message(&self) -> &'static str {
+        match self {
+            SshFailureReason::EmptyHost => "no host entered — type a host, then test",
+            SshFailureReason::MissingSshBinary => "no ssh binary found — install OpenSSH and retry",
+            SshFailureReason::UnknownHost => "unknown host — check the name or ssh-config alias",
+            SshFailureReason::Timeout => {
+                "connection timed out — the host may be offline or firewalled"
+            }
+            SshFailureReason::AuthFailure => {
+                "auth failed — check keys, agent, or sign-in for this host"
+            }
+            SshFailureReason::RemoteShellError => {
+                "remote shell rejected the probe — connected, but neither shell spelling ran"
+            }
+            SshFailureReason::Unreachable => "unreachable — check the host and keys",
+        }
+    }
+}
+
+/// How one `ssh` probe round trip failed: stderr, exit status, and spawn
+/// error captured together. The tester merges the POSIX and PowerShell
+/// attempts into one of these and classifies it with
+/// [`classify_probe_failure`]; the discovery/listing probes keep
+/// degrading to empty through `.ok()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeFailure {
+    /// Raw standard error of the failed run (empty when `ssh` never ran).
+    pub stderr: String,
+    /// Process exit code (`None` on signal / no code).
+    pub status: Option<i32>,
+    /// Local spawn error when `ssh` never ran (e.g. missing binary).
+    pub spawn_error: Option<std::io::ErrorKind>,
+}
+
+impl ProbeFailure {
+    /// Merge the two failed spellings of one tester round trip: both
+    /// stderrs (transport spellings surface wherever they appear), the
+    /// last exit status, and the first spawn error.
+    fn merged(self, other: ProbeFailure) -> ProbeFailure {
+        let mut stderr = self.stderr;
+        if !stderr.is_empty() && !other.stderr.is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str(&other.stderr);
+        ProbeFailure {
+            stderr,
+            status: other.status,
+            spawn_error: self.spawn_error.or(other.spawn_error),
+        }
+    }
+}
+
+/// Pure mapping from one failed probe attempt (stderr + exit status +
+/// spawn error) to a small failure reason. Transport-level spellings win
+/// wherever they appear; remote-shell rejection spellings mean the
+/// transport worked but the remote shell choked; everything else stays
+/// the generic unreachable. Headlessly testable: no network, no spawn.
+pub fn classify_probe_failure(failure: &ProbeFailure) -> SshFailureReason {
+    use std::io::ErrorKind as Kind;
+    if let Some(kind) = failure.spawn_error {
+        return match kind {
+            Kind::NotFound => SshFailureReason::MissingSshBinary,
+            _ => SshFailureReason::Unreachable,
+        };
+    }
+    let hay = failure.stderr.to_lowercase();
+    if hay.contains("could not resolve hostname")
+        || hay.contains("could not resolve host")
+        || hay.contains("name or service not known")
+        || hay.contains("nodename nor servname provided")
+    {
+        SshFailureReason::UnknownHost
+    } else if hay.contains("permission denied")
+        || hay.contains("authentication fail")
+        || hay.contains("no supported authentication methods available")
+        || hay.contains("all authentication methods failed")
+    {
+        SshFailureReason::AuthFailure
+    } else if hay.contains("timed out") {
+        SshFailureReason::Timeout
+    } else if hay.contains("command not found")
+        || hay.contains(": not found")
+        || hay.contains("not recognized as")
+        || hay.contains("is not recognized")
+        || hay.contains("syntax error")
+        || hay.contains("unexpected token")
+        || hay.contains("parse error")
+    {
+        SshFailureReason::RemoteShellError
+    } else {
+        SshFailureReason::Unreachable
     }
 }
 
 /// One `ssh` round trip for the read-only remote probes
 /// ([`detect_remote_clis`], [`list_remote_dir`], [`test_remote_host`]):
-/// `Some` stdout only on a zero-exit run, `None` on every failure (spawn
-/// error, signal, non-zero exit). Split from parsing so tests cover the
-/// pure halves without touching the network.
-fn run_remote_command(host: &str, script: &str) -> Option<String> {
-    let out = std::process::Command::new("ssh")
+/// `Ok` stdout on a zero-exit run, `Err` with the captured stderr, exit
+/// status, and spawn error otherwise. Split from parsing so tests cover
+/// the pure halves without touching the network.
+fn run_ssh_attempt(host: &str, script: &str) -> Result<String, ProbeFailure> {
+    let out = match std::process::Command::new("ssh")
         .args([
             "-T",
             "-o",
@@ -232,11 +354,25 @@ fn run_remote_command(host: &str, script: &str) -> Option<String> {
             script,
         ])
         .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(ProbeFailure {
+                stderr: String::new(),
+                status: None,
+                spawn_error: Some(e.kind()),
+            });
+        }
+    };
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(ProbeFailure {
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            status: out.status.code(),
+            spawn_error: None,
+        })
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// One `ssh` round trip with a PowerShell fallback for Windows SSH hosts:
@@ -244,13 +380,22 @@ fn run_remote_command(host: &str, script: &str) -> Option<String> {
 /// it (non-zero exit — e.g. a PowerShell/cmd default shell choking on
 /// `&&` or `command -v`) run the PowerShell spelling. Both spellings
 /// share one wire format, so callers parse either output identically.
+/// Both failures merge into one [`ProbeFailure`] (both stderrs, so the
+/// tester reports e.g. remote-shell-error instead of generic).
 /// POSIX remotes pay one round trip as before; Windows remotes pay a
 /// second, fast-failing round trip per user action (probes and listings,
 /// never per-tick).
-fn run_remote_posix_then_ps(host: &str, posix_script: &str, ps_script: &str) -> Option<String> {
-    match run_remote_command(host, posix_script) {
-        Some(text) => Some(text),
-        None => run_remote_command(host, ps_script),
+fn run_remote_posix_then_ps(
+    host: &str,
+    posix_script: &str,
+    ps_script: &str,
+) -> Result<String, ProbeFailure> {
+    match run_ssh_attempt(host, posix_script) {
+        Ok(text) => Ok(text),
+        Err(first) => match run_ssh_attempt(host, ps_script) {
+            Ok(text) => Ok(text),
+            Err(second) => Err(first.merged(second)),
+        },
     }
 }
 
@@ -408,33 +553,41 @@ pub fn list_remote_dir(host: &str, path: &str) -> Vec<RemoteEntry> {
         &remote_list_script(path),
         &remote_ps_list_script(path),
     ) {
-        Some(text) => parse_remote_list_output(&text),
-        None => Vec::new(),
+        Ok(text) => parse_remote_list_output(&text),
+        Err(_) => Vec::new(),
     }
 }
 
 /// Result of the add-dialog tester round trip (SSH picker): whether
-/// `host` answered one bounded non-interactive `ssh` round trip, plus
-/// the CLI catalog parsed from the same run.
+/// `host` answered one bounded non-interactive `ssh` round trip, what
+/// went wrong when it did not, plus the CLI catalog parsed from the same
+/// run. `reason`/`message` are `None` when reachable; shells render
+/// `message` verbatim instead of reimplementing the mapping per shell.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteReachability {
     pub reachable: bool,
+    pub reason: Option<SshFailureReason>,
+    pub message: Option<String>,
     pub clis: Vec<AvailableCli>,
 }
 
-/// Pure half of [`test_remote_host`]: `Some` probe output means the host
-/// answered (reachable, with the parsed catalog); `None` (spawn error,
-/// signal, non-zero exit) means unreachable with the
-/// all-listed-none-available catalog. Split so tests cover the mapping
-/// without touching the network.
-pub fn reachability_from_probe(output: Option<&str>) -> RemoteReachability {
-    match output {
-        Some(text) => RemoteReachability {
+/// Pure half of [`test_remote_host`]: `Ok` probe output means the host
+/// answered (reachable, with the parsed catalog); `Err` reason means a
+/// failed round trip (unreachable, with the degraded catalog and the
+/// render-ready reason copy). Split so tests cover the mapping without
+/// touching the network.
+pub fn reachability_from_probe(result: Result<&str, SshFailureReason>) -> RemoteReachability {
+    match result {
+        Ok(text) => RemoteReachability {
             reachable: true,
+            reason: None,
+            message: None,
             clis: parse_remote_probe_output(text),
         },
-        None => RemoteReachability {
+        Err(reason) => RemoteReachability {
             reachable: false,
+            reason: Some(reason),
+            message: Some(reason.message().to_string()),
             clis: parse_remote_probe_output(""),
         },
     }
@@ -444,9 +597,10 @@ pub fn reachability_from_probe(output: Option<&str>) -> RemoteReachability {
 /// (SSH picker): the add-dialog tester. The POSIX probe runs first, then
 /// the PowerShell spelling on Windows SSH hosts. Same flags as
 /// [`remote_probe_command`], so auth prompts never hang the dialog —
-/// key-only hosts without keys report unreachable instead of blocking.
+/// key-only hosts without keys report auth-failure instead of blocking.
 /// Blank hosts and every failure degrade to unreachable plus the
-/// all-listed-none-available catalog: the tester reports, never throws.
+/// all-listed-none-available catalog and a render-ready reason: the
+/// tester reports, never throws.
 ///
 /// Blocking note for shells: one `ssh` round trip, bounded by the
 /// connect timeout. Call it off the UI thread, on tester-button press
@@ -454,12 +608,12 @@ pub fn reachability_from_probe(output: Option<&str>) -> RemoteReachability {
 pub fn test_remote_host(host: &str) -> RemoteReachability {
     let target = host.trim();
     if target.is_empty() {
-        return reachability_from_probe(None);
+        return reachability_from_probe(Err(SshFailureReason::EmptyHost));
     }
-    reachability_from_probe(
-        run_remote_posix_then_ps(target, &remote_probe_script(), &remote_ps_probe_script())
-            .as_deref(),
-    )
+    match run_remote_posix_then_ps(target, &remote_probe_script(), &remote_ps_probe_script()) {
+        Ok(text) => reachability_from_probe(Ok(&text)),
+        Err(failure) => reachability_from_probe(Err(classify_probe_failure(&failure))),
+    }
 }
 
 /// Resolve the picker's default remote folder for a host (SSH picker)
@@ -1582,26 +1736,203 @@ mod tests {
     #[test]
     fn reachability_maps_probe_output_without_network() {
         // Pure half: answered output means reachable with the parsed
-        // catalog; no output means unreachable with the degraded catalog.
-        let up = reachability_from_probe(Some("muse:/bin/muse\nclaude:\n"));
+        // catalog and no reason; a reason means unreachable with the
+        // degraded catalog and the render-ready copy.
+        let up = reachability_from_probe(Ok("muse:/bin/muse\nclaude:\n"));
         assert!(up.reachable);
+        assert_eq!(up.reason, None);
+        assert_eq!(up.message, None);
         assert!(up.clis[0].available);
         assert!(!up.clis[1].available);
-        let down = reachability_from_probe(None);
+        let down = reachability_from_probe(Err(SshFailureReason::Unreachable));
         assert!(!down.reachable);
+        assert_eq!(down.reason, Some(SshFailureReason::Unreachable));
+        assert_eq!(
+            down.message.as_deref(),
+            Some(SshFailureReason::Unreachable.message())
+        );
         assert!(down.clis.iter().all(|c| !c.available));
-        // Blank hosts never spawn ssh: unreachable + degraded catalog.
+        // Blank hosts never spawn ssh: empty-host + degraded catalog.
         for host in ["", "   "] {
             let t = test_remote_host(host);
             assert!(!t.reachable, "blank host reports unreachable");
+            assert_eq!(t.reason, Some(SshFailureReason::EmptyHost));
+            assert_eq!(
+                t.message.as_deref(),
+                Some(SshFailureReason::EmptyHost.message())
+            );
             let ids: Vec<&str> = t.clis.iter().map(|c| c.id.as_str()).collect();
             assert_eq!(ids, SUPPORTED_CLIS);
             assert!(t.clis.iter().all(|c| !c.available));
         }
-        // Serde round-trip for the tester JSON shape.
-        let back: RemoteReachability =
-            serde_json::from_str(&serde_json::to_string(&up).unwrap()).unwrap();
-        assert_eq!(back, up);
+        // Serde round-trip for the tester JSON shape (what the FFI
+        // hands shells): kebab-case reason plus render-ready message.
+        let wire = serde_json::to_string(&down).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(doc["reachable"], false);
+        assert_eq!(doc["reason"], "unreachable");
+        assert_eq!(doc["message"], SshFailureReason::Unreachable.message());
+        let back: RemoteReachability = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, down);
+        let up_wire = serde_json::to_string(&up).unwrap();
+        let up_doc: serde_json::Value = serde_json::from_str(&up_wire).unwrap();
+        assert_eq!(up_doc["reachable"], true);
+        assert!(up_doc["reason"].is_null());
+        assert!(up_doc["message"].is_null());
+    }
+
+    #[test]
+    fn classify_probe_failure_names_transport_spellings() {
+        // Real ssh stderr spellings, one per reason: unknown hosts
+        // (OpenSSH on Linux/macOS/Windows), auth, and timeouts.
+        let cases = [
+            (
+                "ssh: Could not resolve hostname gone-box: Name or service not known",
+                SshFailureReason::UnknownHost,
+            ),
+            (
+                "ssh: Could not resolve hostname gone-box: nodename nor servname provided, or not known",
+                SshFailureReason::UnknownHost,
+            ),
+            (
+                "ssh: Could not resolve host gone-box: No such host is known.",
+                SshFailureReason::UnknownHost,
+            ),
+            (
+                "dev@mybox: Permission denied (publickey,gssapi-keyex,gssapi-with-mic).",
+                SshFailureReason::AuthFailure,
+            ),
+            (
+                "Received disconnect from 10.0.0.9 port 22:2: Too many authentication failures",
+                SshFailureReason::AuthFailure,
+            ),
+            (
+                "ssh: connect to host 10.0.0.9 port 22: Operation timed out",
+                SshFailureReason::Timeout,
+            ),
+            (
+                "ssh: connect to host mybox port 22: Connection timed out",
+                SshFailureReason::Timeout,
+            ),
+        ];
+        for (stderr, want) in cases {
+            for status in [Some(255), Some(1), None] {
+                let got = classify_probe_failure(&ProbeFailure {
+                    stderr: stderr.to_string(),
+                    status,
+                    spawn_error: None,
+                });
+                assert_eq!(got, want, "stderr {stderr:?} status {status:?}");
+            }
+        }
+        // Transport spellings win even when the exit status varies: the
+        // status is captured for the record, never the decider.
+    }
+
+    #[test]
+    fn classify_probe_failure_names_spawn_and_shell_errors() {
+        use std::io::ErrorKind as Kind;
+        // ssh never ran: missing binary names itself, other local spawn
+        // errors stay generic.
+        assert_eq!(
+            classify_probe_failure(&ProbeFailure {
+                stderr: String::new(),
+                status: None,
+                spawn_error: Some(Kind::NotFound),
+            }),
+            SshFailureReason::MissingSshBinary
+        );
+        assert_eq!(
+            classify_probe_failure(&ProbeFailure {
+                stderr: String::new(),
+                status: None,
+                spawn_error: Some(Kind::PermissionDenied),
+            }),
+            SshFailureReason::Unreachable
+        );
+        // Transport worked but the remote shell choked: POSIX `sh`,
+        // PowerShell/cmd, and bash parse errors.
+        for stderr in [
+            "sh: 1: command: not found",
+            "bash: line 1: for: command not found",
+            "'foreach' is not recognized as an internal or external command",
+            "Get-Command : The term 'muse' is not recognized as a cmdlet",
+            "bash: -c: line 1: syntax error near unexpected token `&&'",
+            "powershell: parse error: unexpected token",
+        ] {
+            let got = classify_probe_failure(&ProbeFailure {
+                stderr: stderr.to_string(),
+                status: Some(127),
+                spawn_error: None,
+            });
+            assert_eq!(got, SshFailureReason::RemoteShellError, "{stderr:?}");
+        }
+        // Refused, reset, and empty/silent failures stay generic.
+        for stderr in [
+            "ssh: connect to host mybox port 22: Connection refused",
+            "ssh: connect to host mybox port 22: No route to host",
+            "Connection closed by 10.0.0.9 port 22",
+            "",
+        ] {
+            let got = classify_probe_failure(&ProbeFailure {
+                stderr: stderr.to_string(),
+                status: Some(255),
+                spawn_error: None,
+            });
+            assert_eq!(got, SshFailureReason::Unreachable, "{stderr:?}");
+        }
+    }
+
+    #[test]
+    fn merged_spellings_classify_as_one_attempt() {
+        // A Windows remote failing both spellings reports something
+        // truthful: merged shell-rejection stderrs classify as
+        // remote-shell-error, not generic.
+        let posix = ProbeFailure {
+            stderr: "sh: command: not found".to_string(),
+            status: Some(127),
+            spawn_error: None,
+        };
+        let ps = ProbeFailure {
+            stderr: "'Get-Command' is not recognized as an internal or external command"
+                .to_string(),
+            status: Some(1),
+            spawn_error: None,
+        };
+        let merged = posix.merged(ps);
+        assert!(merged.stderr.contains("sh: command: not found"));
+        assert!(merged.stderr.contains("not recognized as"));
+        assert_eq!(merged.status, Some(1));
+        assert_eq!(
+            classify_probe_failure(&merged),
+            SshFailureReason::RemoteShellError
+        );
+        // ...while a transport failure on both spellings keeps the
+        // transport reason (here: auth).
+        let a = ProbeFailure {
+            stderr: "Permission denied (publickey).".to_string(),
+            status: Some(255),
+            spawn_error: None,
+        };
+        let b = ProbeFailure {
+            stderr: "Permission denied (publickey).".to_string(),
+            status: Some(255),
+            spawn_error: None,
+        };
+        assert_eq!(
+            classify_probe_failure(&a.clone().merged(b)),
+            SshFailureReason::AuthFailure
+        );
+        // Missing binary on both spellings keeps the first spawn error.
+        let missing = ProbeFailure {
+            stderr: String::new(),
+            status: None,
+            spawn_error: Some(std::io::ErrorKind::NotFound),
+        };
+        assert_eq!(
+            classify_probe_failure(&missing.clone().merged(missing)),
+            SshFailureReason::MissingSshBinary
+        );
     }
 
     #[test]

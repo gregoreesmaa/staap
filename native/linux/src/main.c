@@ -1462,7 +1462,8 @@ static void picker_browse_go(GtkButton *btn, gpointer data) {
 /* SSH add dialog (opened from the machine dropdown's Add row): display
  * name, user@hostname-or-alias host, default folder, Test/Save/Cancel.
  * Save stores a saved host via the core; Test runs the core tester
- * off-thread and reports reachable/unreachable plus detected CLIs. */
+ * off-thread and reports reachable plus detected CLIs, or the core
+ * reason line on failure. */
 typedef struct {
     PickerUi *pu;
     GtkEntry *name;
@@ -1487,6 +1488,68 @@ typedef struct {
     char *host; /* owned */
     char *json; /* owned (bridge string) */
 } AddTestDone;
+
+/* Extract the core tester `message` string from the tester JSON
+ * (`{"reachable":bool,"reason":...,"message":...,"clis":[...]}`).
+ * Returns a malloc'd copy (JSON escapes resolved) or NULL when absent.
+ * The core copy is static prose, but escapes resolve so a future
+ * message never breaks the scan. */
+static char *tester_message(const char *json) {
+    if (!json) {
+        return NULL;
+    }
+    const char *p = strstr(json, "\"message\"");
+    if (!p) {
+        return NULL;
+    }
+    p = strchr(p, ':');
+    if (!p) {
+        return NULL;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (strncmp(p, "null", 4) == 0) {
+        return NULL;
+    }
+    if (*p != '"') {
+        return NULL;
+    }
+    p++;
+    GString *out = g_string_new(NULL);
+    if (!out) {
+        return NULL;
+    }
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+            case 'n':
+                g_string_append_c(out, '\n');
+                break;
+            case 't':
+                g_string_append_c(out, '\t');
+                break;
+            case 'r':
+                g_string_append_c(out, '\r');
+                break;
+            default:
+                g_string_append_c(out, *p);
+                break;
+            }
+            p++;
+        } else {
+            g_string_append_c(out, *p);
+            p++;
+        }
+    }
+    if (*p != '"') {
+        g_string_free(out, TRUE);
+        return NULL;
+    }
+    return g_string_free(out, FALSE);
+}
 
 static gboolean add_test_deliver(gpointer data) {
     AddTestDone *done = data;
@@ -1515,9 +1578,19 @@ static gboolean add_test_deliver(gpointer data) {
             g_string_free(have, TRUE);
             clis_free(clis, n);
         } else {
-            char *msg = g_strdup_printf(
-                "Unreachable - check the host name and SSH access (%s).",
-                done->host);
+            /* Failure copy renders the core `message` verbatim
+             * (dumb-shell contract: no per-shell error parsing); the
+             * host stays in parens as before for context. */
+            char *reason = tester_message(done->json);
+            char *msg;
+            if (reason) {
+                msg = g_strdup_printf("%s (%s).", reason, done->host);
+                g_free(reason);
+            } else {
+                msg = g_strdup_printf(
+                    "Unreachable - check the host name and SSH access (%s).",
+                    done->host);
+            }
             gtk_label_set_text(done->au->result, msg);
             g_free(msg);
         }

@@ -856,7 +856,7 @@ private struct NewSessionScreen: View {
 /// SSH add sheet for the machine dropdown's Add row: display name,
 /// `user@hostname`-or-alias host, and default folder, backed by the
 /// core saved-hosts. Test dials the core tester off the main thread
-/// (reachable/unreachable plus the detected remote CLIs, stale arrivals
+/// (reachable plus the detected remote CLIs, or the core reason line,
 /// dropped); Save persists through the core and hands the host back so
 /// the dropdown picks it.
 private struct SshAddSheet: View {
@@ -900,7 +900,7 @@ private struct SshAddSheet: View {
                 Spacer()
                 Button("Test") { runTest() }
                     .disabled(testHost == nil || testing)
-                    .help("Probe this host once (reachable + remote CLIs)")
+                    .help("Probe this host once (reachable + remote CLIs, or the failure reason)")
                 Button("Cancel", role: .cancel) { isPresented = false }
                 Button("Save") { save() }
                     .keyboardShortcut(.defaultAction)
@@ -949,7 +949,7 @@ private struct SshAddSheet: View {
                         testStatus = "Reachable — \(names) available."
                     }
                 } else {
-                    testStatus = "Unreachable — check the host and SSH access."
+                    testStatus = result.message ?? "Unreachable — check the host and SSH access."
                 }
             }
         }

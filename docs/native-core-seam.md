@@ -437,6 +437,7 @@ plus the pre-existing `app`/`config`/`launch`/`embedded`/`parsers`/
 | `staap_selected` / `staap_select` / `staap_select_step` | core-owned selection |
 | `staap_last_error` | thread-local message; never null |
 | `staap_pty_free` | reaps the child; null no-op |
+| `staap_remote_test_json(host)` | add-dialog tester: owned `{reachable,reason,message,clis}` JSON from one bounded non-interactive `ssh` round trip (POSIX spelling, then PowerShell on Windows remotes); `reason` is a kebab-case `launch::SshFailureReason` code (`empty-host`, `missing-ssh-binary`, `unknown-host`, `timeout`, `auth-failure`, `remote-shell-error`, `unreachable`), `message` its render-ready line shells show verbatim; blank hosts and every failure degrade to unreachable + degraded catalog, never null; freed with `staap_screen_text_free` |
 
 ### C header (`include/staap.h`, hardened #61)
 

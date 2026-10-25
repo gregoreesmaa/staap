@@ -209,12 +209,18 @@ int main(void) {
         char *t = bridge_remote_test_json(NULL);
         CHECK(t && strstr(t, "\"reachable\":false"),
               "remote test null unreachable");
+        CHECK(t && strstr(t, "\"reason\":\"empty-host\""),
+              "remote test null names empty-host");
         bridge_string_free(t);
     }
     {
         char *t = bridge_remote_test_json("");
         CHECK(t && strstr(t, "\"reachable\":false"),
               "remote test blank unreachable");
+        CHECK(t && strstr(t, "\"reason\":\"empty-host\""),
+              "remote test blank names empty-host");
+        CHECK(t && strstr(t, "\"message\":\"no host entered"),
+              "remote test blank carries render copy");
         bridge_string_free(t);
     }
 

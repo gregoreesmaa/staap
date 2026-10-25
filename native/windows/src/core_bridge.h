@@ -108,8 +108,10 @@ char *bridge_remote_recent_json(const StaapCore *core, const char *host);
  * `[{"name","host","default_folder"|null}]` in saved order (`[]` when
  * none/null core); default-folder is owned or NULL (remote login dir);
  * list JSON is `[{"name","is_dir"}]` (`[]` on blank input/failure, never
- * an auth hang); test JSON is `{"reachable":bool,"clis":[...]}` (blank
- * hosts degrade to unreachable). Strings free with bridge_string_free();
+ * an auth hang); test JSON carries `reachable`, a kebab-case `reason`,
+ * a render-ready `message`, and the `clis` catalog (blank hosts degrade
+ * to unreachable with the `empty-host` reason, shown verbatim).
+ * Strings free with bridge_string_free();
  * add/remove report failures via `msg_out` (freed with free()). Callers
  * persist via bridge_core_save after mutations. Listing/testing block
  * for one bounded ssh round trip - call off the UI thread. */

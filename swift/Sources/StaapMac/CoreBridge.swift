@@ -58,7 +58,7 @@ import Foundation
     _ path: UnsafePointer<CChar>?
 ) -> UnsafeMutablePointer<CChar>?
 // Owned JSON of the add-dialog tester result
-// ({reachable,clis}); every failure degrades to unreachable.
+// ({reachable,reason,message,clis}); failures degrade to unreachable with a reason.
 // Blocking: call off the main thread, on tester-button press only.
 @_silgen_name("staap_remote_test_json") private func staap_remote_test_json(
     _ host: UnsafePointer<CChar>?
@@ -285,10 +285,12 @@ struct RemoteEntry: Decodable {
 }
 
 /// Add-dialog tester result decoded from `staap_remote_test_json`
-/// (`{reachable,clis}` from one bounded non-interactive `ssh` round
-/// trip). Unreachable hosts degrade to `reachable == false`.
+/// (`{reachable,reason,message,clis}` from one bounded `ssh` round
+/// trip). Failures degrade to unreachable with a reason code + message.
 struct RemoteTestResult: Decodable {
     var reachable: Bool
+    var reason: String?
+    var message: String?
     var clis: [CliRow]
 }
 
@@ -725,9 +727,9 @@ final class Core {
     /// Add-dialog tester result for one SSH host. Blocking: one bounded
     /// non-interactive `ssh` round trip — callers fetch this off the
     /// main thread, on tester-button press only. Degrades to unreachable
-    /// (never throws, never hangs on auth prompts).
+    /// with the core reason (never throws, never hangs on auth prompts).
     static func remoteTest(host: String) -> RemoteTestResult {
-        var result = RemoteTestResult(reachable: false, clis: [])
+        var result = RemoteTestResult(reachable: false, reason: nil, message: nil, clis: [])
         host.withCString { hostPtr in
             if let text = copyOwnedString(staap_remote_test_json(hostPtr)),
                let data = text.data(using: .utf8),

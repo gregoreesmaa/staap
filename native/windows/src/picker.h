@@ -1,6 +1,6 @@
 /* Two-dimensional new-session picker rows for the WinUI shell.
  *
- * Only the catalog/recents JSON shapes parse locally (native ComboBox
+ * The catalog/recents/tester-message JSON shapes parse locally (native ComboBox
  * rows need them); every rule — preview copy, yolo mapping, folder
  * trimming — lives once in the core (`staap_spawn_preview`,
  * `staap_yolo_value`, ...), pinned by `cargo test --lib` and the bridge
@@ -153,6 +153,52 @@ inline std::vector<CliRow> parse_clis(const std::string &json) {
         out.push_back(std::move(row));
     }
     return out;
+}
+
+/* Extract the core tester message from the bridge_remote_test_json payload
+ * ({"reachable":bool,"reason":...,"message":...,"clis":[...]}). Returns the
+ * render-ready core copy shells show verbatim, or empty when absent/null
+ * (callers fall back to their generic copy). Malformed input yields empty,
+ * never a throw. */
+inline std::string test_message(const std::string &json) {
+    std::size_t q = json.find("\"message\"");
+    if (q == std::string::npos) {
+        return {};
+    }
+    q = json.find(':', q + 9);
+    if (q == std::string::npos) {
+        return {};
+    }
+    ++q;
+    while (q < json.size() && (json[q] == ' ' || json[q] == '\t')) {
+        ++q;
+    }
+    if (q >= json.size() || json[q] != '"') {
+        return {};
+    }
+    ++q;
+    std::string val;
+    while (q < json.size() && json[q] != '"') {
+        if (json[q] != '\\') {
+            val += json[q++];
+            continue;
+        }
+        ++q;
+        if (q >= json.size()) {
+            return {};
+        }
+        char e = json[q++];
+        switch (e) {
+        case 'n': val += '\n'; break;
+        case 't': val += '\t'; break;
+        case 'r': val += '\r'; break;
+        default: val += e; break;
+        }
+    }
+    if (q >= json.size()) {
+        return {};
+    }
+    return val;
 }
 
 /* Parse the `bridge_recent_json` string array. Malformed input yields

@@ -295,12 +295,18 @@ static void ssh_picker_bridge_surface(void) {
         char *t = bridge_remote_test_json(nullptr);
         CHECK(t && std::strstr(t, "\"reachable\":false") != nullptr,
               "remote test null unreachable");
+        CHECK(t && std::strstr(t, "\"reason\":\"empty-host\"") != nullptr,
+              "remote test null names empty-host");
         bridge_string_free(t);
     }
     {
         char *t = bridge_remote_test_json("");
         CHECK(t && std::strstr(t, "\"reachable\":false") != nullptr,
               "remote test blank unreachable");
+        CHECK(t && std::strstr(t, "\"reason\":\"empty-host\"") != nullptr,
+              "remote test blank names empty-host");
+        CHECK(t && std::strstr(t, "\"message\":\"no host entered") != nullptr,
+              "remote test blank carries render copy");
         bridge_string_free(t);
     }
     bridge_core_free(core);
@@ -311,6 +317,28 @@ static void ssh_picker_bridge_surface(void) {
     }
 }
 
+static void tester_message_parses(void) {
+    /* Pure tester-message extraction (picker.h): the core copy renders
+     * verbatim; absent/null/unterminated yield empty for the generic
+     * fallback. */
+    CHECK(picker::test_message(
+              "{\"reachable\":false,\"reason\":\"auth-failure\","
+              "\"message\":\"auth failed - check keys\",\"clis\":[]}") ==
+              "auth failed - check keys",
+          "tester message extracts verbatim");
+    CHECK(picker::test_message(
+              "{\"reachable\":true,\"reason\":null,\"message\":null,"
+              "\"clis\":[]}")
+              .empty(),
+          "reachable null message empty");
+    CHECK(picker::test_message("{}").empty(), "missing message empty");
+    CHECK(picker::test_message("{\"message\":\"a\\\"b\\\\c\\nd\"}") ==
+              "a\"b\\c\nd",
+          "tester escapes resolve");
+    CHECK(picker::test_message("{\"message\":\"abc}").empty(),
+          "unterminated message empty");
+}
+
 int main(void) {
     catalog_parses_in_order();
     recents_parse();
@@ -318,6 +346,7 @@ int main(void) {
     remote_bridge_surface();
     saved_host_axis_parses();
     ssh_picker_bridge_surface();
+    tester_message_parses();
     shared_helpers_come_from_core();
     if (failures == 0) {
         std::printf("PICKER-OK\n");

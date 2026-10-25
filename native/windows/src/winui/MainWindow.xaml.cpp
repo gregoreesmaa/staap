@@ -1350,8 +1350,8 @@ namespace winrt::StaapWinUI::implementation
     /* SSH add dialog (opened from the machine dropdown's Add row):
      * display name, user@hostname-or-alias host, default folder,
      * Test/Save/Cancel. Save stores a saved host via the core; Test
-     * runs the core tester off-thread and reports reachable/unreachable
-     * plus detected CLIs. */
+     * runs the core tester off-thread and reports reachable plus CLIs,
+     * or the core reason line on failure. */
     fire_and_forget MainWindow::ShowAddMachineDialog() {
         auto lifetime = get_strong();
         if (!m_core || !m_pickerOpen) {
@@ -1462,9 +1462,16 @@ namespace winrt::StaapWinUI::implementation
                                 : winrt::hstring(
                                       L"Reachable - no known CLIs found."));
                     } else {
-                        result.Text(winrt::hstring(to_wide(
-                            "Unreachable - check the host name and SSH access (" +
-                            host + ").")));
+                        /* Failure copy renders the core message verbatim
+                         * (dumb-shell contract: no per-shell error parsing);
+                         * the host stays in parens as before for context. */
+                        std::string reason = picker::test_message(js);
+                        std::string line =
+                            reason.empty()
+                                ? "Unreachable - check the host name and SSH access (" +
+                                      host + ")."
+                                : reason + " (" + host + ").";
+                        result.Text(winrt::hstring(to_wide(line)));
                     }
                 });
             }).detach();

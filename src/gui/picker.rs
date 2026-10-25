@@ -624,7 +624,7 @@ impl ShellView {
 
     /// Run the add-dialog tester (SSH picker): one bounded non-blocking
     /// `ssh` round trip through the core tester. Blank hosts degrade to
-    /// unreachable without a spawn. Tests inject via
+    /// empty-host without a spawn. Tests inject via
     /// `apply_ssh_add_test`.
     // The early return is load-bearing in non-test builds (it skips the
     // probe thread); in test builds the trailing probe block compiles out
@@ -637,7 +637,7 @@ impl ShellView {
         let host = dialog.host_input.trim().to_string();
         dialog.in_flight = None;
         if host.is_empty() {
-            dialog.test = Some(crate::launch::reachability_from_probe(None));
+            dialog.test = Some(crate::launch::test_remote_host(&host));
             return;
         }
         #[cfg(not(test))]
@@ -653,7 +653,9 @@ impl ShellView {
                 .is_err()
             {
                 dialog.in_flight = None;
-                dialog.test = Some(crate::launch::reachability_from_probe(None));
+                dialog.test = Some(crate::launch::reachability_from_probe(Err(
+                    crate::launch::SshFailureReason::Unreachable,
+                )));
             }
         }
     }
@@ -700,8 +702,9 @@ impl ShellView {
     }
 
     /// One-line tester copy for the dialog (`reachable · muse, claude`
-    /// / `unreachable — check the host and keys`): text, never
-    /// color-only.
+    /// / the core reason line, e.g. `auth failed — …`): text, never
+    /// color-only. The failure copy renders the core `message` verbatim
+    /// (dumb-shell contract: no per-shell error parsing).
     pub(crate) fn ssh_add_test_label(&self) -> Option<String> {
         let dialog = self.picker_remote.ssh_add.as_ref()?;
         let result = dialog.test.as_ref()?;
@@ -718,7 +721,12 @@ impl ShellView {
                 Some(format!("reachable · {}", ids.join(", ")))
             }
         } else {
-            Some("unreachable — check the host and keys".to_string())
+            Some(
+                result
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "unreachable — check the host and keys".to_string()),
+            )
         }
     }
 
@@ -1475,7 +1483,7 @@ mod tests {
         view.test_ssh_add();
         assert!(view.apply_ssh_add_test(
             "dev@mybox",
-            crate::launch::reachability_from_probe(Some(
+            crate::launch::reachability_from_probe(Ok(
                 "muse:/bin/muse\nclaude:\nopencode:\ncodex:\n"
             ))
         ));
@@ -1498,7 +1506,12 @@ mod tests {
         let mut view = open_picker();
         view.open_ssh_add();
         view.picker_remote.ssh_add.as_mut().unwrap().host_input = "gone-box".to_string();
-        assert!(view.apply_ssh_add_test("gone-box", crate::launch::reachability_from_probe(None)));
+        assert!(view.apply_ssh_add_test(
+            "gone-box",
+            crate::launch::reachability_from_probe(Err(
+                crate::launch::SshFailureReason::Unreachable
+            ))
+        ));
         assert_eq!(
             view.ssh_add_test_label().as_deref(),
             Some("unreachable — check the host and keys")
@@ -1507,7 +1520,7 @@ mod tests {
         view.picker_remote.ssh_add.as_mut().unwrap().host_input = "other-box".to_string();
         assert!(!view.apply_ssh_add_test(
             "gone-box",
-            crate::launch::reachability_from_probe(Some("muse:/bin/muse\n"))
+            crate::launch::reachability_from_probe(Ok("muse:/bin/muse\n"))
         ));
         assert_eq!(
             view.ssh_add_test_label().as_deref(),
@@ -1516,13 +1529,38 @@ mod tests {
     }
 
     #[test]
-    fn ssh_add_blank_host_degrades_to_unreachable_without_spawn() {
+    fn ssh_add_tester_reports_each_reason_in_words() {
+        // Every core reason renders verbatim in the dialog (keyboard and
+        // non-color parity: the copy is the signal, not styling).
         let mut view = open_picker();
         view.open_ssh_add();
-        view.test_ssh_add(); // blank host: no thread, unreachable
+        view.picker_remote.ssh_add.as_mut().unwrap().host_input = "mybox".to_string();
+        for reason in [
+            crate::launch::SshFailureReason::UnknownHost,
+            crate::launch::SshFailureReason::Timeout,
+            crate::launch::SshFailureReason::AuthFailure,
+            crate::launch::SshFailureReason::MissingSshBinary,
+            crate::launch::SshFailureReason::RemoteShellError,
+            crate::launch::SshFailureReason::Unreachable,
+        ] {
+            assert!(view
+                .apply_ssh_add_test("mybox", crate::launch::reachability_from_probe(Err(reason))));
+            assert_eq!(
+                view.ssh_add_test_label().as_deref(),
+                Some(reason.message()),
+                "{reason:?} renders its core copy"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_add_blank_host_degrades_to_empty_host_without_spawn() {
+        let mut view = open_picker();
+        view.open_ssh_add();
+        view.test_ssh_add(); // blank host: no thread, empty-host
         assert_eq!(
             view.ssh_add_test_label().as_deref(),
-            Some("unreachable — check the host and keys")
+            Some(crate::launch::SshFailureReason::EmptyHost.message())
         );
     }
 
