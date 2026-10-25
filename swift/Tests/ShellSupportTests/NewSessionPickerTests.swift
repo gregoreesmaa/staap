@@ -156,7 +156,7 @@ final class NewSessionPickerTests: XCTestCase {
         XCTAssertNil(NewSessionPicker.remoteParent(of: "/"))
         XCTAssertNil(NewSessionPicker.remoteParent(of: ""))
         XCTAssertNil(NewSessionPicker.remoteParent(of: "bare"))
-        XCTAssertEqual(NewSessionPicker.remoteParent(of: "~/a/"), "~/a")
+        XCTAssertEqual(NewSessionPicker.remoteParent(of: "~/a/"), "~")
         XCTAssertEqual(NewSessionPicker.remoteJoin(base: "~/a", name: "b"), "~/a/b")
         XCTAssertEqual(NewSessionPicker.remoteJoin(base: "~/a/", name: "b"), "~/a/b")
         XCTAssertEqual(NewSessionPicker.remoteJoin(base: "", name: "b"), "b")
