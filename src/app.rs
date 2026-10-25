@@ -664,6 +664,23 @@ impl App {
         }
     }
 
+    /// Spawn command for real PTY spawns (native shells through the FFI,
+    /// the gpui shell directly): like [`Self::spawn_command_for`] but a
+    /// remote folder first detects the remote shell
+    /// ([`crate::launch::ssh_spawn_command_live`]), so Windows hosts get
+    /// the PowerShell spelling that `cmd.exe` runs. Previews keep the
+    /// pure [`Self::spawn_command_for`] so typing never waits on the
+    /// network; every real spawn (first runs and restarts) comes here.
+    pub fn spawn_command_for_live(&self, kind: &SpawnKind) -> (String, Vec<String>) {
+        match kind.remote_target() {
+            Some(target) => {
+                let (program, args) = self.local_command_for(kind);
+                crate::launch::ssh_spawn_command_live(target, &program, &args)
+            }
+            None => self.spawn_command_for(kind),
+        }
+    }
+
     /// Spawn command for a local `kind`: the CLI program plus the
     /// configured per-agent extra flags (issue #33) plus the yolo
     /// default/override (2D launch). Remote kinds resolve through their
@@ -1549,6 +1566,28 @@ mod tests {
         let (program, args) = app.spawn_command_for(&SpawnKind::New);
         assert_eq!(program, "muse");
         assert_eq!(args, vec!["--foo".to_string()]);
+    }
+
+    #[test]
+    fn spawn_command_for_live_matches_pure_without_a_remote_folder() {
+        // Local kinds and folder-less remote kinds never dial: the live
+        // funnel agrees with the pure preview builder exactly.
+        let app = App::new(vec![]);
+        assert_eq!(
+            app.spawn_command_for_live(&SpawnKind::New),
+            app.spawn_command_for(&SpawnKind::New)
+        );
+        let kind = SpawnKind::Remote {
+            inner: Box::new(SpawnKind::New),
+            target: crate::launch::SshTarget::new("mybox".to_string(), None),
+        };
+        assert_eq!(
+            app.spawn_command_for_live(&kind),
+            app.spawn_command_for(&kind)
+        );
+        let (program, args) = app.spawn_command_for_live(&kind);
+        assert_eq!(program, "ssh");
+        assert_eq!(args[..2], ["-t".to_string(), "mybox".to_string()]);
     }
 
     #[test]

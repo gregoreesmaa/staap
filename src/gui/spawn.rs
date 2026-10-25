@@ -45,9 +45,10 @@ impl ShellView {
             // session's folder rides along too (issue #48): one seam,
             // every backend, restarts included. Remote rows report `None`
             // from `session_cwd` (the dir rides inside the `ssh` command
-            // from `spawn_command_for`), so they spawn with an inherited
+            // from `spawn_command_for_live`, which detects the remote
+            // shell for folder spawns), so they spawn with an inherited
             // local cwd — the same two lines cover both seams.
-            let (program, args) = self.app.spawn_command_for(&kind);
+            let (program, args) = self.app.spawn_command_for_live(&kind);
             let spawned = match self.app.session_cwd(&run_id) {
                 Some(dir) => {
                     EmbeddedPty::spawn_with_cwd(&program, &args, self.cols, self.rows, Some(&dir))
