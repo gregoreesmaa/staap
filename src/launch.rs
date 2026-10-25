@@ -106,6 +106,29 @@ pub fn remote_probe_script() -> String {
     script
 }
 
+/// Remote probe for Windows SSH hosts (PowerShell default shell): emits
+/// the same `id:path-or-empty` rows as [`remote_probe_script`], so
+/// [`parse_remote_probe_output`] parses either spelling. `Get-Command`
+/// resolves through the remote `PATH` exactly like `command -v` does on
+/// POSIX remotes; rows split on the first `:` downstream, so Windows
+/// `C:\…` paths survive intact.
+pub fn remote_ps_probe_script() -> String {
+    // IDs ride single-quoted: bare words are commands in expression
+    // context, so unquoted ids are a parse error on the remote.
+    let mut script = String::from("foreach ($c in ");
+    script.push_str(
+        &SUPPORTED_CLIS
+            .iter()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    script.push_str(
+        ") { $p = Get-Command $c -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source; if ($p) { Write-Output ($c + ':' + $p) } else { Write-Output ($c + ':') } }",
+    );
+    script
+}
+
 /// `ssh` argv probing `host` for the supported CLIs: no pty (`-T`),
 /// non-interactive (`BatchMode=yes`, so the probe never blocks on a
 /// password prompt), and a short connect timeout. The interactive spawn
@@ -186,7 +209,7 @@ pub fn detect_remote_clis(host: &str) -> Vec<AvailableCli> {
     if target.is_empty() {
         return parse_remote_probe_output("");
     }
-    match run_remote_probe(target) {
+    match run_remote_posix_then_ps(target, &remote_probe_script(), &remote_ps_probe_script()) {
         Some(text) => parse_remote_probe_output(&text),
         None => parse_remote_probe_output(""),
     }
@@ -216,12 +239,19 @@ fn run_remote_command(host: &str, script: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// One `ssh` round trip for [`detect_remote_clis`]: `Some` stdout only on
-/// a zero-exit run, `None` on every failure (spawn error, signal,
-/// non-zero exit). Split from parsing so tests cover the pure half
-/// without touching the network.
-fn run_remote_probe(host: &str) -> Option<String> {
-    run_remote_command(host, &remote_probe_script())
+/// One `ssh` round trip with a PowerShell fallback for Windows SSH hosts:
+/// try the POSIX spelling first, and only when the remote shell rejects
+/// it (non-zero exit — e.g. a PowerShell/cmd default shell choking on
+/// `&&` or `command -v`) run the PowerShell spelling. Both spellings
+/// share one wire format, so callers parse either output identically.
+/// POSIX remotes pay one round trip as before; Windows remotes pay a
+/// second, fast-failing round trip per user action (probes and listings,
+/// never per-tick).
+fn run_remote_posix_then_ps(host: &str, posix_script: &str, ps_script: &str) -> Option<String> {
+    match run_remote_command(host, posix_script) {
+        Some(text) => Some(text),
+        None => run_remote_command(host, ps_script),
+    }
 }
 
 /// One remote directory entry from the listing probe (SSH picker): `name`
@@ -247,6 +277,61 @@ pub const MAX_REMOTE_LIST_ENTRIES: usize = 500;
 /// limitation, documented here rather than silently worked around.
 pub fn remote_list_script(path: &str) -> String {
     format!("{} && exec ls -1A -p", remote_cd_snippet(path))
+}
+
+/// Quote one word for a PowerShell remote snippet: single-quote wrap
+/// with embedded quotes doubled (`'` → `''`). Backslashes stay literal —
+/// single quotes never escape in PowerShell.
+fn ps_quote(word: &str) -> String {
+    let mut out = String::with_capacity(word.len() + 2);
+    out.push('\'');
+    out.push_str(&word.replace('\'', "''"));
+    out.push('\'');
+    out
+}
+
+/// `Set-Location` snippet for one remote directory (Windows SSH hosts):
+/// absolute paths ride single-quoted (see [`ps_quote`]); a leading `~`
+/// rewrites to `$HOME` in double quotes, mirroring [`remote_cd_snippet`]
+/// — PowerShell's own `~` handling varies across 5.1/7+, so the rewrite
+/// keeps home resolution explicit. Inside double quotes only the
+/// backtick, `$`, and `"` escape (backtick-prefixed); `\` is literal,
+/// and `/` separators work as-is.
+fn remote_ps_cd_snippet(dir: &str) -> String {
+    let mut snippet = String::from("Set-Location -LiteralPath ");
+    if let Some(rest) = dir.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') {
+            snippet.push_str("\"$HOME");
+            for c in rest.chars() {
+                match c {
+                    '`' | '$' | '"' => {
+                        snippet.push('`');
+                        snippet.push(c);
+                    }
+                    _ => snippet.push(c),
+                }
+            }
+            snippet.push('"');
+            return snippet;
+        }
+    }
+    snippet.push_str(&ps_quote(dir));
+    snippet
+}
+
+/// Remote shell snippet listing one directory on a Windows SSH host
+/// (PowerShell default shell): best-effort UTF-8 output, a strict
+/// directory change, then one `Name` per line with `/` appended to
+/// directories — the same wire format as [`remote_list_script`], so
+/// [`parse_remote_list_output`] parses either spelling.
+/// `-ErrorAction Stop` makes a missing dir exit non-zero (degrading to
+/// empty downstream, like the POSIX `cd` first); without it
+/// `Get-ChildItem` would list the *previous* directory on failure.
+pub fn remote_ps_list_script(path: &str) -> String {
+    format!(
+        "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{}}; {} -ErrorAction Stop; Get-ChildItem -LiteralPath . -Force | ForEach-Object {{ $_.Name + $(if ($_.PSIsContainer) {{ '/' }}) }}",
+        remote_ps_cd_snippet(path)
+    )
 }
 
 /// `ssh` argv listing `path` on `host` (SSH picker): no pty (`-T`),
@@ -299,22 +384,30 @@ pub fn parse_remote_list_output(text: &str) -> Vec<RemoteEntry> {
     out
 }
 
-/// List `path` on `host` over one bounded `ssh` round trip (SSH picker):
+/// List `path` on `host` over bounded `ssh` round trips (SSH picker):
 /// the folder-completion half of the picker, alongside the CLI catalog
-/// from [`detect_remote_clis`]. Blank hosts or paths and every failure
+/// from [`detect_remote_clis`]. The POSIX spelling runs first; when the
+/// remote shell rejects it (Windows SSH hosts) the PowerShell spelling
+/// [`remote_ps_list_script`] runs next — both parse through
+/// [`parse_remote_list_output`]. Blank hosts or paths and every failure
 /// (no `ssh` binary, unreachable host, missing dir, non-zero exit)
 /// degrade to empty: the picker offers no completions rather than an
 /// error, and the spawn path validates the folder separately.
 ///
-/// Blocking note for shells: one `ssh` round trip, bounded by the
-/// connect timeout in [`remote_list_command`]. Call it off the UI thread,
-/// on host/folder input — never on every picker open.
+/// Blocking note for shells: one `ssh` round trip on POSIX remotes (two
+/// fast ones on Windows remotes), bounded by the connect timeout in
+/// [`remote_list_command`]. Call it off the UI thread, on host/folder
+/// input — never on every picker open.
 pub fn list_remote_dir(host: &str, path: &str) -> Vec<RemoteEntry> {
     let (host, path) = (host.trim(), path.trim());
     if host.is_empty() || path.is_empty() {
         return Vec::new();
     }
-    match run_remote_command(host, &remote_list_script(path)) {
+    match run_remote_posix_then_ps(
+        host,
+        &remote_list_script(path),
+        &remote_ps_list_script(path),
+    ) {
         Some(text) => parse_remote_list_output(&text),
         None => Vec::new(),
     }
@@ -347,8 +440,9 @@ pub fn reachability_from_probe(output: Option<&str>) -> RemoteReachability {
     }
 }
 
-/// Test whether `host` answers one bounded non-interactive `ssh` round
-/// trip (SSH picker): the add-dialog tester. Same flags as
+/// Test whether `host` answers bounded non-interactive `ssh` round trips
+/// (SSH picker): the add-dialog tester. The POSIX probe runs first, then
+/// the PowerShell spelling on Windows SSH hosts. Same flags as
 /// [`remote_probe_command`], so auth prompts never hang the dialog —
 /// key-only hosts without keys report unreachable instead of blocking.
 /// Blank hosts and every failure degrade to unreachable plus the
@@ -362,7 +456,10 @@ pub fn test_remote_host(host: &str) -> RemoteReachability {
     if target.is_empty() {
         return reachability_from_probe(None);
     }
-    reachability_from_probe(run_remote_command(target, &remote_probe_script()).as_deref())
+    reachability_from_probe(
+        run_remote_posix_then_ps(target, &remote_probe_script(), &remote_ps_probe_script())
+            .as_deref(),
+    )
 }
 
 /// Resolve the picker's default remote folder for a host (SSH picker)
@@ -1421,6 +1518,55 @@ mod tests {
                 ("zeta.txt", false)
             ]
         );
+    }
+
+    #[test]
+    fn remote_ps_scripts_quote_and_share_the_posix_wire_format() {
+        // Single quotes double; backslashes stay literal.
+        assert_eq!(ps_quote("C:\\srv\\api"), "'C:\\srv\\api'");
+        assert_eq!(ps_quote("it's"), "'it''s'");
+        // Home rewrites to $HOME like the POSIX snippet; backslash
+        // separators survive (Windows users type them).
+        assert_eq!(
+            remote_ps_cd_snippet("~"),
+            "Set-Location -LiteralPath \"$HOME\""
+        );
+        assert_eq!(
+            remote_ps_cd_snippet("~\\srv\\api"),
+            "Set-Location -LiteralPath \"$HOME\\srv\\api\""
+        );
+        assert_eq!(
+            remote_ps_cd_snippet("C:\\srv\\it's"),
+            "Set-Location -LiteralPath 'C:\\srv\\it''s'"
+        );
+        // The listing spells a strict cd plus the same name/ wire format
+        // the POSIX parser reads, so one parser serves both remotes.
+        let script = remote_ps_list_script("C:\\srv\\api");
+        assert!(script.contains("-ErrorAction Stop"), "{script}");
+        assert!(
+            script.contains("Get-ChildItem -LiteralPath . -Force"),
+            "{script}"
+        );
+        assert!(script.contains("PSIsContainer"), "{script}");
+        let entries = parse_remote_list_output("Windows/\nnotes.txt\n");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.name.as_str(), e.is_dir))
+                .collect::<Vec<_>>(),
+            vec![("Windows", true), ("notes.txt", false)]
+        );
+        // The probe spells every supported CLI and emits id:path rows the
+        // POSIX probe parser reads — Windows C:\ paths survive the
+        // first-colon split.
+        let probe = remote_ps_probe_script();
+        for id in SUPPORTED_CLIS {
+            assert!(probe.contains(&format!("'{id}'")), "{probe}");
+        }
+        let clis = parse_remote_probe_output("muse:C:\\tools\\muse.exe\nclaude:\n");
+        assert!(clis[0].available);
+        assert_eq!(clis[0].path.as_deref(), Some("C:\\tools\\muse.exe"));
+        assert!(!clis[1].available);
     }
 
     #[test]
