@@ -58,6 +58,17 @@ import Foundation
     _ core: OpaquePointer?,
     _ host: UnsafePointer<CChar>?
 ) -> UnsafeMutablePointer<CChar>?
+// Owned last SSH host with a confirmed remote launch (what the machine
+// dropdown preselects, saved or not). Null when none was ever confirmed.
+@_silgen_name("staap_last_host") private func staap_last_host(
+    _ core: OpaquePointer?
+) -> UnsafeMutablePointer<CChar>?
+// Forget the remembered last SSH host (clears only when it points at
+// `host`; unknown/blank hosts are a no-op success). Nonzero reports.
+@_silgen_name("staap_forget_last_host") private func staap_forget_last_host(
+    _ core: OpaquePointer?,
+    _ host: UnsafePointer<CChar>?
+) -> Int32
 // Owned JSON of one remote directory listing ([{name,is_dir}]); every
 // failure degrades to []. Blocking: call off the main thread.
 @_silgen_name("staap_remote_list_json") private func staap_remote_list_json(
