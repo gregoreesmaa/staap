@@ -42,7 +42,7 @@ namespace winrt::StaapWinUI::implementation
                 &args);
         void MachineBox_KeyDown(
             Windows::Foundation::IInspectable const &sender,
-            Microsoft::UI::Xaml::Input.KeyRoutedEventArgs const &args);
+            Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const &args);
         void MachineEdit_Click(
             Windows::Foundation::IInspectable const &sender,
             Microsoft::UI::Xaml::RoutedEventArgs const &args);

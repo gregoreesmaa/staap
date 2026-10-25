@@ -459,8 +459,14 @@ impl ShellView {
             }
             self.commit_picker_host();
         } else if self.launch_picker.as_ref().is_some_and(|p| p.folder_focus) {
-            // folder → machine
+            // folder → machine (focus is exclusive: leaving the folder
+            // clears it, mirroring toggle_machine_dropdown and the
+            // machine → CLI arm below — otherwise a later tab overshoots
+            // the machine axis with the dropdown closed).
             self.picker_remote.host_focus = true;
+            if let Some(picker) = self.launch_picker.as_mut() {
+                picker.folder_focus = false;
+            }
             self.open_machine_dropdown();
         } else {
             // CLI → folder
