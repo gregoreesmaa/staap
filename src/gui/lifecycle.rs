@@ -267,6 +267,7 @@ mod tests {
             transcript: vec![],
             transcript_truncated: false,
             provider_session_id: Some("sess-abc".into()),
+            remote: None,
             title_locked: true,
             pending_input: String::new(),
             cwd: None,

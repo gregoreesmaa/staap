@@ -559,6 +559,7 @@ mod tests {
             title_locked: true,
             pending_input: String::new(),
             cwd: None,
+            remote: None,
         }
     }
 

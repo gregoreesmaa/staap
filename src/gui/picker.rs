@@ -118,16 +118,18 @@ impl ShellView {
         // used host so a repeat remote dial stays one Enter. A remembered
         // host commits immediately: the unchecked catalog shows meanwhile
         // and the background probe swaps the real one in on arrival.
-        self.picker_remote = PickerRemote {
-            host_input: self
-                .app
-                .config_last_host()
-                .map(str::to_string)
-                .unwrap_or_default(),
-            ..Default::default()
-        };
-        if !self.picker_remote.host_input.trim().is_empty() {
-            self.commit_picker_host();
+        self.picker_remote = PickerRemote::default();
+        // Preselect the last-used host so a repeat remote dial stays
+        // one Enter; routing through `set_picker_host` keeps the
+        // single commit funnel (unchecked meanwhile-catalog plus
+        // background probe).
+        let last = self
+            .app
+            .config_last_host()
+            .map(str::to_string)
+            .unwrap_or_default();
+        if !last.trim().is_empty() {
+            self.set_picker_host(&last);
         }
     }
 

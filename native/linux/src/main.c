@@ -286,6 +286,7 @@ static void apply_system_theme(Shell *sh) {
  * filter/sort callbacks read the same core state, so grouping is the
  * shared working → idle → history order (issue #105). */
 static void refresh_roster(Shell *sh);
+static char *trimmed_or_null(const char *raw);
 
 /* Subtitle: selection context + live-ness + attention count, all from
  * the core registry. */
@@ -944,7 +945,7 @@ static void picker_probe_remote(PickerUi *pu, const char *host) {
     }
     GError *err = NULL;
     GThread *th =
-        g_thread_new("staap-remote-probe", picker_probe_thread, req, &err);
+        g_thread_try_new("staap-remote-probe", picker_probe_thread, req, &err);
     g_clear_error(&err);
     if (!th) {
         gtk_label_set_text(pu->status,

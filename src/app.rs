@@ -570,9 +570,11 @@ impl App {
     }
 
     /// Mutable config for tests that set up launch scenarios (the FFI
-    /// tri-state test opts an agent into yolo). Production mutates via
-    /// the typed helpers (`set_config`, `note_launch`, …), never this.
-    #[cfg(test)]
+    /// tri-state test opts an agent into yolo; the gpui picker tests
+    /// seed per-host recents). Production run paths prefer the typed
+    /// helpers (`set_config`, `note_launch`, …).
+    // Unconditional (not `cfg(test)`): the gpui shell's own test
+    // target links the non-test lib build, where a gate hides it.
     pub fn config_mut(&mut self) -> &mut crate::config::Config {
         &mut self.config
     }
