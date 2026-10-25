@@ -1118,7 +1118,7 @@ static void picker_rebuild_machine(PickerUi *pu, const char *select_host) {
         pu->machine_hosts = NULL;
         pu->n_machine_rows = 0;
     }
-    pu->machine_hosts = g_calloc(n + 2, sizeof *pu->machine_hosts);
+    pu->machine_hosts = g_malloc0((n + 2) * sizeof *pu->machine_hosts);
     if (!pu->machine_hosts) {
         hosts_free(hosts, n);
         return;

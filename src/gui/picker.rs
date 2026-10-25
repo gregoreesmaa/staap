@@ -626,6 +626,10 @@ impl ShellView {
     /// `ssh` round trip through the core tester. Blank hosts degrade to
     /// unreachable without a spawn. Tests inject via
     /// `apply_ssh_add_test`.
+    // The early return is load-bearing in non-test builds (it skips the
+    // probe thread); in test builds the trailing probe block compiles out
+    // and clippy flags the return there — allowed, never removed.
+    #[allow(clippy::needless_return)]
     pub(crate) fn test_ssh_add(&mut self) {
         let Some(dialog) = self.picker_remote.ssh_add.as_mut() else {
             return;
@@ -671,15 +675,8 @@ impl ShellView {
             Some((host, result)) => {
                 if let Some(dialog) = self.picker_remote.ssh_add.as_mut() {
                     dialog.in_flight = None;
-                    if host != dialog.host_input.trim() {
-                        return false; // stale
-                    }
-                    dialog.test = Some(result);
-                    dialog.error = None;
-                    true
-                } else {
-                    false
                 }
+                self.apply_ssh_add_test(&host, result)
             }
         }
     }
