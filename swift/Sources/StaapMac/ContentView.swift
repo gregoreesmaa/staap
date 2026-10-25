@@ -697,17 +697,20 @@ private struct NewSessionScreen: View {
     }
 
     /// Forget a remembered-but-unsaved last host (Forget button /
-    /// Command-Delete): drop the shell-local memory and fall back to
-    /// This machine. The pick always equals the memory here (the block
-    /// renders only for that row), but the state call re-checks so a
-    /// newer launch recorded meanwhile survives.
+    /// Command-Delete): the core drops it and the dropdown falls back
+    /// to This machine. Failures report inline in words, never a
+    /// silent no-op.
     private func forgetUnsaved() {
-        state.forgetLastRemoteHost(machine)
-        machineError = nil
-        unsavedLastHost = ""
-        machine = ""
-        previousMachine = ""
-        hostChanged()
+        do {
+            try state.forgetLastRemoteHost(machine)
+            machineError = nil
+            unsavedLastHost = ""
+            machine = ""
+            previousMachine = ""
+            hostChanged()
+        } catch {
+            machineError = error.localizedDescription
+        }
     }
 
     /// Delete one saved machine (Delete button / Command-Delete): the

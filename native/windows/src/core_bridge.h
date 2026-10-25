@@ -120,6 +120,8 @@ int bridge_saved_host_add(StaapCore *core, const char *name, const char *host, c
 int bridge_saved_host_rename(StaapCore *core, const char *key, const char *name, const char *host, const char *default_folder, char **msg_out);
 int bridge_saved_host_remove(StaapCore *core, const char *key, char **msg_out);
 char *bridge_remote_default_folder(const StaapCore *core, const char *host);
+char *bridge_last_host(const StaapCore *core);
+int bridge_forget_last_host(StaapCore *core, const char *host, char **msg_out);
 char *bridge_remote_list_json(const char *host, const char *path);
 char *bridge_remote_test_json(const char *host);
 char *bridge_recent_json(const StaapCore *core);

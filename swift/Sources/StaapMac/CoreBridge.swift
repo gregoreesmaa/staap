@@ -663,6 +663,24 @@ final class Core {
         return result
     }
 
+    /// Last SSH host with a confirmed remote launch (what the machine
+    /// dropdown preselects, saved or not). "" when none was ever
+    /// confirmed; never throws. Recorded by the spawn funnel itself, so
+    /// this shell keeps no last-host memory of its own.
+    func lastHost() -> String {
+        copyOwnedString(staap_last_host(handle)) ?? ""
+    }
+
+    /// Forget the remembered last SSH host: clears it only when it
+    /// points at `host`, so a newer launch survives. Unknown hosts are
+    /// a no-op success; persisting is the caller's funnel (`save()`).
+    func forgetLastHost(_ host: String) throws {
+        let rc = host.withCString { staap_forget_last_host(handle, $0) }
+        if rc != 0 {
+            throw CoreError.spawn(message: Self.lastError())
+        }
+    }
+
     /// Saved SSH hosts for the machine dropdown (saved order). Decodes
     /// to [] when absent; never throws.
     func savedHosts() -> [SavedHost] {

@@ -476,6 +476,22 @@ impl Config {
         true
     }
 
+    /// Forget the remembered last SSH host (SSH picker): clears
+    /// `last_host` only when it points at `host` (trimmed) — a newer
+    /// launch recorded meanwhile survives, and blank hosts are a no-op.
+    /// Shells offer this for the remembered-but-unsaved last row; saved
+    /// rows go through [`Self::remove_saved_host`], which clears the
+    /// same way when it pointed at the removed host.
+    pub fn forget_last_host(&mut self, host: &str) {
+        let host = host.trim();
+        if host.is_empty() {
+            return;
+        }
+        if self.last_host.as_deref() == Some(host) {
+            self.last_host = None;
+        }
+    }
+
     /// Rename/edit a saved SSH host in place (SSH picker): `key` matches
     /// the current `host` or display `name` (trimmed, like
     /// [`Self::remove_saved_host`]); `new_name`/`new_host` replace the
@@ -686,6 +702,16 @@ mod tests {
         assert_eq!(back, cfg);
         let old: Config = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
         assert_eq!(old.last_host, None);
+        // Forgetting clears only the pointed-at host: other hosts and
+        // blanks are a no-op (a newer launch survives), and folder
+        // memory is untouched.
+        cfg.forget_last_host("other");
+        assert_eq!(cfg.last_host.as_deref(), Some("mybox"));
+        cfg.forget_last_host("   ");
+        assert_eq!(cfg.last_host.as_deref(), Some("mybox"));
+        cfg.forget_last_host("mybox");
+        assert_eq!(cfg.last_host, None);
+        assert_eq!(cfg.remote_recents_for("mybox")[0], "/d19");
         assert!(old.remote_folders.is_empty());
         // The persisted file carries hosts and dirs only — never secrets.
         let text = serde_json::to_string(&cfg).unwrap().to_lowercase();

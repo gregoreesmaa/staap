@@ -122,10 +122,11 @@ shells render rows and forward intents, never probe or resolve.
   + persist, falling back to This machine when the picked host dies).
   Every action is keyboard-reachable and reported in words, never
   color-only. StaapMac additionally rows the remembered-but-unsaved
-  last host (shell-local `UserDefaults` memory, not a core saved
-  host): picking it offers Save… (prefilled add sheet, creates the
-  row) and Forget (drops the memory, back to This machine) — a
-  persistent row is always manageable, saved or not.
+  last host (core `last_host` memory, recorded by the spawn funnel —
+  never a shell-local store): picking it offers Save… (prefilled add
+  sheet, creates the row) and Forget (`staap_forget_last_host`, back
+  to This machine) — a persistent row is always manageable, saved
+  or not.
 - Default folder (`launch::resolve_remote_default_folder`,
   `Config::remote_default_folder_for`): saved host default, then the
   host MRU head (`remote_folders`), then the remote home (`None`).

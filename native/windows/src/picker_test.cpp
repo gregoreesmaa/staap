@@ -307,6 +307,25 @@ static void ssh_picker_bridge_surface(void) {
         bridge_string_free(h);
     }
     {
+        /* Last-host memory lives in the core: null when nothing launched,
+         * forget of other hosts/blanks is a no-op success, nulls refuse.
+         * (The pointed-at clear is covered by the core suite.) */
+        char *none = bridge_last_host(core);
+        CHECK(none == nullptr, "last host fresh null");
+        char *err = nullptr;
+        CHECK(bridge_forget_last_host(core, "alice@prodbox", &err) == 0,
+              "last forget unknown ok");
+        CHECK(err == nullptr, "last forget unknown sets no error");
+        CHECK(bridge_forget_last_host(core, "   ", nullptr) == 0,
+              "last forget blank ok");
+        CHECK(bridge_forget_last_host(nullptr, "h", &err) != 0,
+              "last forget null core refuses");
+        free(err);
+        CHECK(bridge_forget_last_host(core, nullptr, nullptr) != 0,
+              "last forget null host refuses");
+        CHECK(bridge_last_host(nullptr) == nullptr, "last host null ok");
+    }
+    {
         char *l = bridge_remote_list_json(nullptr, "/x");
         CHECK(l && std::strcmp(l, "[]") == 0,
               "remote list null host empty");

@@ -143,6 +143,19 @@ char *bridge_remote_default_folder(const StaapCore *core, const char *host) {
     return staap_remote_default_folder(core, host);
 }
 
+char *bridge_last_host(const StaapCore *core) {
+    return staap_last_host(core);
+}
+
+int bridge_forget_last_host(StaapCore *core, const char *host,
+                             char **msg_out) {
+    int rc = staap_forget_last_host(core, host);
+    if (rc != 0 && msg_out) {
+        *msg_out = copy_last_error();
+    }
+    return rc;
+}
+
 char *bridge_remote_list_json(const char *host, const char *path) {
     return staap_remote_list_json(host, path);
 }

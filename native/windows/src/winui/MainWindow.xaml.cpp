@@ -92,9 +92,6 @@ namespace winrt::StaapWinUI::implementation
     constexpr double kSidebarMax = 480.0;
     constexpr double kSidebarKeyStep = 8.0;
     constexpr wchar_t const *kSidebarWidthKey = L"SidebarWidth";
-    /* Shell-local last SSH host (LocalSettings; the C ABI exposes no
-     * last-host getter, so this never leaves the shell). */
-    constexpr wchar_t const *kRemoteHostKey = L"RemoteHost";
 
     static std::wstring to_wide(std::string const &s) {
         if (s.empty()) {
@@ -1298,14 +1295,8 @@ namespace winrt::StaapWinUI::implementation
         free(done);
         if (!host.empty()) {
             line = picker::with_ssh_prefix(host, line);
-            /* Remember the host for next time (shell-local only). */
-            try {
-                Windows::Storage::ApplicationData::Current()
-                    .LocalSettings()
-                    .Values()
-                    .Insert(kRemoteHostKey, box_value(to_wide(host)));
-            } catch (...) {
-            }
+            /* Last-host memory lives in the core (recorded by the spawn
+             * funnel itself): no shell-local store here. */
         }
         SetStatus(winrt::hstring(to_wide(line)));
         CloseNewSession();
@@ -1359,18 +1350,15 @@ namespace winrt::StaapWinUI::implementation
         std::string recents_json = recents_raw ? recents_raw : "[]";
         bridge_string_free(recents_raw);
         m_pickerRecents = picker::parse_recents(recents_json);
-        /* Shell-local last SSH host (LocalSettings; the C ABI exposes
-         * no last-host getter). */
+        /* Last SSH host from the core (recorded by the spawn funnel):
+         * preselects when still saved, like every other shell. */
         std::string last_host;
-        try {
-            auto values = Windows::Storage::ApplicationData::Current()
-                              .LocalSettings()
-                              .Values();
-            if (values.HasKey(kRemoteHostKey)) {
-                last_host = to_utf8(
-                    unbox_value<hstring>(values.Lookup(kRemoteHostKey)));
+        {
+            char *last = bridge_last_host(m_core);
+            if (last) {
+                last_host = last;
+                bridge_string_free(last);
             }
-        } catch (...) {
         }
         /* Yolo tri-state (Default / On once / Off once), safe by
          * default; the preview line names the exact combination. */

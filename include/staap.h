@@ -529,6 +529,32 @@ int staap_saved_host_rename(struct StaapCore *core,
 char *staap_remote_default_folder(const struct StaapCore *core, const char *host);
 
 /**
+ * Owned last SSH host with a confirmed remote launch (SSH picker):
+ * what every new-session screen preselects, saved or not. Null when no
+ * remote launch was ever confirmed (or on null core) — never an error,
+ * never the network; free with [`staap_screen_text_free`]. Recorded by
+ * the spawn funnel itself (`App::start_launch` via
+ * [`staap_run_spawn_remote`]), so shells never store it themselves.
+ *
+ * # Safety
+ * `core` must be null or a live pointer from [`staap_core_new`].
+ */
+char *staap_last_host(const struct StaapCore *core);
+
+/**
+ * Forget the remembered last SSH host (SSH picker): clears it only when
+ * it points at `host` (trimmed), so a newer launch recorded meanwhile
+ * survives; blank hosts are a no-op success. For the
+ * remembered-but-unsaved last row; saved rows go through
+ * [`staap_saved_host_remove`]. Callers persist via [`staap_core_save`].
+ *
+ * # Safety
+ * `core` must be non-null and live; `host` must be null or a valid
+ * NUL-terminated C string.
+ */
+int staap_forget_last_host(struct StaapCore *core, const char *host);
+
+/**
  * Owned JSON of one remote directory listing (SSH picker):
  * `[{"name","is_dir"}]` from a single bounded `ssh` round trip
  * (`-T`, `BatchMode=yes`, `ConnectTimeout`, safe-quoted path — see

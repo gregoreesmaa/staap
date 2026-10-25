@@ -248,37 +248,32 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Last SSH host used for a remote launch (shell-local memory: the
-    /// core owns the per-host folder recents, but exposes no last-host
-    /// getter over the C ABI, so the screen preselects from here —
-    /// including hosts not yet saved, until one is picked).
-    private static let lastRemoteHostKey = "staap.lastRemoteHost"
-
+    /// Last SSH host with a confirmed remote launch, straight from the
+    /// core (`staap_last_host`): the screen preselects from here —
+    /// including hosts not yet saved, until one is picked. Recorded by
+    /// the spawn funnel itself, so this shell keeps no last-host memory
+    /// of its own.
     var lastRemoteHost: String {
-        UserDefaults.standard.string(forKey: Self.lastRemoteHostKey) ?? ""
+        core.lastHost()
     }
 
-    /// Forget the remembered last SSH host (unsaved-row management):
-    /// clears the shell-local memory only when it still points at
-    /// `host`, so a newer launch recorded meanwhile can never be
-    /// clobbered. Core folder memory is per-host and harmless without
-    /// the row; the next launch re-records.
-    func forgetLastRemoteHost(_ host: String) {
-        if lastRemoteHost == host {
-            UserDefaults.standard.removeObject(forKey: Self.lastRemoteHostKey)
-        }
+    /// Forget the remembered last SSH host (unsaved-row management),
+    /// then persist (same funnel as every close). The core clears only
+    /// when it still points there, so a newer launch survives.
+    func forgetLastRemoteHost(_ host: String) throws {
+        try core.forgetLastHost(host)
+        save()
     }
 
     /// Confirmed remote picker launch: SSH host + remote folder × CLI +
     /// tri-state yolo (same 1/-1/0 convention as the local funnel).
     /// Blank hosts refuse fail-visible in `pendingError`, never silently.
-    /// Records the host shell-locally so the next sheet preselects it;
-    /// the core records the per-host folder memory itself.
+    /// The core records the host (next sheet preselects it) plus the
+    /// per-host folder memory itself.
     func confirmRemotePicker(host: String, remoteCwd: String?, cli: String, yolo: Int32) {
         do {
             let id = try core.runSpawnRemote(host: host, remoteCwd: remoteCwd, cli: cli, yolo: yolo,
                                              cols: grid.cols, rows: grid.rows)
-            UserDefaults.standard.set(host, forKey: Self.lastRemoteHostKey)
             fedText[id] = ""
             feeds.removeValue(forKey: id)
             cursors.removeValue(forKey: id)

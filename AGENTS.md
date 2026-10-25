@@ -53,7 +53,12 @@ right shell — each owns its own sidebar/chrome.
 
 UIs are dumb shells: every UI renders what the Rust core reports and
 owns nothing else. Shells own widgets, event wiring, clipboard access,
-focus management, and byte transport — nothing else.
+focus management, and byte transport — nothing else. In particular, no
+behavior or state is ever shell-local: no per-shell memory of app state
+(no UserDefaults / LocalSettings / GSettings caches, no duplicated
+rules), no per-shell parsing, sorting, grouping, or error mapping. When
+a shell cannot reach core-owned state, the fix is new `shell_shared` or
+`staap_*` C ABI surface — never a shell-side workaround.
 
 Everything below lives in the core exactly once (native shells reach
 it via `shell_shared` or the `staap_*` C ABI; the gpui shell calls it

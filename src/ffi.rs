@@ -1376,6 +1376,61 @@ pub unsafe extern "C" fn staap_remote_default_folder(
     }
 }
 
+/// Owned last SSH host with a confirmed remote launch (SSH picker):
+/// what every new-session screen preselects, saved or not. Null when no
+/// remote launch was ever confirmed (or on null core) — never an error,
+/// never the network; free with [`staap_screen_text_free`]. Recorded by
+/// the spawn funnel itself (`App::start_launch` via
+/// [`staap_run_spawn_remote`]), so shells never store it themselves.
+///
+/// # Safety
+/// `core` must be null or a live pointer from [`staap_core_new`].
+#[no_mangle]
+pub unsafe extern "C" fn staap_last_host(core: *const StaapCore) -> *mut c_char {
+    if core.is_null() {
+        return std::ptr::null_mut();
+    }
+    match (*core).reg.app.config_last_host() {
+        Some(host) => match CString::new(host) {
+            Ok(s) => s.into_raw(),
+            Err(_) => {
+                set_error("staap_last_host: host contains NUL".to_string());
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Forget the remembered last SSH host (SSH picker): clears it only when
+/// it points at `host` (trimmed), so a newer launch recorded meanwhile
+/// survives; blank hosts are a no-op success. For the
+/// remembered-but-unsaved last row; saved rows go through
+/// [`staap_saved_host_remove`]. Callers persist via [`staap_core_save`].
+///
+/// # Safety
+/// `core` must be non-null and live; `host` must be null or a valid
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn staap_forget_last_host(
+    core: *mut StaapCore,
+    host: *const c_char,
+) -> c_int {
+    if core.is_null() || host.is_null() {
+        set_error("staap_forget_last_host: null core or host".to_string());
+        return StaapError::Null.code();
+    }
+    let host_str = match CStr::from_ptr(host).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_error("staap_forget_last_host: host is not valid UTF-8".to_string());
+            return StaapError::Utf8.code();
+        }
+    };
+    (*core).reg.app.config_mut().forget_last_host(host_str);
+    StaapError::Ok.code()
+}
+
 /// Owned JSON of one remote directory listing (SSH picker):
 /// `[{"name","is_dir"}]` from a single bounded `ssh` round trip
 /// (`-T`, `BatchMode=yes`, `ConnectTimeout`, safe-quoted path — see
@@ -2790,6 +2845,55 @@ mod tests {
             );
             staap_screen_text_free(raw);
             assert_eq!((*core_ptr).reg.app.config_last_host(), Some("mybox"));
+        }
+    }
+
+    #[test]
+    fn last_host_abi_gets_and_forgets_without_network() {
+        // Last-host memory over FFI: null when nothing launched, the host
+        // after a confirmed launch, conditional forget, null safety —
+        // shells preselect and forget through this, never local stores.
+        unsafe {
+            assert!(staap_last_host(std::ptr::null_mut()).is_null());
+            let mut core = Box::new(StaapCore {
+                reg: crate::runs::RunRegistry::new(vec![]),
+            });
+            let core_ptr: *mut StaapCore = &mut *core;
+            assert!(staap_last_host(core_ptr).is_null());
+            (*core_ptr)
+                .reg
+                .app
+                .config_mut()
+                .note_remote_launch("mybox", None);
+            let raw = staap_last_host(core_ptr);
+            assert_eq!(CStr::from_ptr(raw).to_string_lossy().into_owned(), "mybox");
+            staap_screen_text_free(raw);
+            // Forgetting another host or a blank is a no-op success.
+            assert_eq!(
+                staap_forget_last_host(core_ptr, c"other".as_ptr()),
+                StaapError::Ok.code()
+            );
+            assert_eq!(
+                staap_forget_last_host(core_ptr, c"   ".as_ptr()),
+                StaapError::Ok.code()
+            );
+            let raw = staap_last_host(core_ptr);
+            assert_eq!(CStr::from_ptr(raw).to_string_lossy().into_owned(), "mybox");
+            staap_screen_text_free(raw);
+            // Forgetting the pointed-at host clears; nulls report Null.
+            assert_eq!(
+                staap_forget_last_host(core_ptr, c"mybox".as_ptr()),
+                StaapError::Ok.code()
+            );
+            assert!(staap_last_host(core_ptr).is_null());
+            assert_eq!(
+                staap_forget_last_host(std::ptr::null_mut(), c"mybox".as_ptr()),
+                StaapError::Null.code()
+            );
+            assert_eq!(
+                staap_forget_last_host(core_ptr, std::ptr::null()),
+                StaapError::Null.code()
+            );
         }
     }
 
