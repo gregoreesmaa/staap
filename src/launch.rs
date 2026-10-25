@@ -129,6 +129,63 @@ pub fn remote_ps_probe_script() -> String {
     script
 }
 
+/// Standard-base64 encode (RFC 4648 section 4): no line wraps, `=`
+/// padding. Hand-rolled so the core gains no new dependency: the only
+/// base64 use is the cmd-safe PowerShell wrapper below.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut n: u32 = 0;
+        for (i, &b) in chunk.iter().enumerate() {
+            n |= (b as u32) << (16 - 8 * i);
+        }
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Wrap one PowerShell snippet so it also runs when the Windows SSH
+/// host's default shell is still `cmd.exe` (the out-of-box default).
+/// `powershell -EncodedCommand` takes a base64 UTF-16LE blob whose
+/// alphabet carries no cmd metachar (`|`, `&`, quotes, `$`, …), so
+/// `cmd /c` passes it through untouched. Output is the same wire
+/// format, so the same parser reads it. `powershell` (5.1) ships with
+/// Windows; `pwsh` need not exist. Progress records stay silenced so a
+/// cold module cache (`Preparing modules for first use.`) can never
+/// leak CLIXML into the redirected stdout the parser reads.
+fn powershell_encoded_command(ps_script: &str) -> String {
+    let silenced = format!("$ProgressPreference='SilentlyContinue';{ps_script}");
+    let utf16: Vec<u16> = silenced.encode_utf16().collect();
+    let mut bytes = Vec::with_capacity(utf16.len() * 2);
+    for unit in utf16 {
+        bytes.push((unit & 0xff) as u8);
+        bytes.push((unit >> 8) as u8);
+    }
+    format!(
+        "powershell -NoProfile -NonInteractive -EncodedCommand {}",
+        base64_encode(&bytes)
+    )
+}
+
+/// cmd-safe spelling of [`remote_ps_probe_script`]: same `id:path` rows
+/// through `cmd.exe` with no host-side change (sets neither
+/// `DefaultShell` nor the sshd config).
+pub fn remote_cmd_probe_script() -> String {
+    powershell_encoded_command(&remote_ps_probe_script())
+}
+
 /// `ssh` argv probing `host` for the supported CLIs: no pty (`-T`),
 /// non-interactive (`BatchMode=yes`, so the probe never blocks on a
 /// password prompt), and a short connect timeout. The interactive spawn
@@ -330,6 +387,8 @@ pub fn classify_probe_failure(failure: &ProbeFailure) -> SshFailureReason {
         || hay.contains("syntax error")
         || hay.contains("unexpected token")
         || hay.contains("parse error")
+        || hay.contains("was unexpected at this time")
+        || hay.contains("syntax of the command is incorrect")
     {
         SshFailureReason::RemoteShellError
     } else {
@@ -375,16 +434,17 @@ fn run_ssh_attempt(host: &str, script: &str) -> Result<String, ProbeFailure> {
     }
 }
 
-/// One `ssh` round trip with a PowerShell fallback for Windows SSH hosts:
-/// try the POSIX spelling first, and only when the remote shell rejects
-/// it (non-zero exit — e.g. a PowerShell/cmd default shell choking on
-/// `&&` or `command -v`) run the PowerShell spelling. Both spellings
-/// share one wire format, so callers parse either output identically.
-/// Both failures merge into one [`ProbeFailure`] (both stderrs, so the
-/// tester reports e.g. remote-shell-error instead of generic).
+/// `ssh` round trips with Windows fallbacks: try the POSIX spelling
+/// first, then the raw PowerShell spelling (PowerShell-default hosts),
+/// then the same PowerShell snippet via `powershell -EncodedCommand`
+/// (cmd.exe-default hosts, the out-of-box Windows default — no
+/// host-side change). All spellings share one wire format, so callers
+/// parse any success identically. Failures merge into one
+/// [`ProbeFailure`] (all stderrs, so the tester reports e.g.
+/// remote-shell-error instead of generic).
 /// POSIX remotes pay one round trip as before; Windows remotes pay a
-/// second, fast-failing round trip per user action (probes and listings,
-/// never per-tick).
+/// second (or third, when cmd is the default shell) fast-failing round
+/// trip per user action (probes and listings, never per-tick).
 fn run_remote_posix_then_ps(
     host: &str,
     posix_script: &str,
@@ -394,7 +454,10 @@ fn run_remote_posix_then_ps(
         Ok(text) => Ok(text),
         Err(first) => match run_ssh_attempt(host, ps_script) {
             Ok(text) => Ok(text),
-            Err(second) => Err(first.merged(second)),
+            Err(second) => match run_ssh_attempt(host, &powershell_encoded_command(ps_script)) {
+                Ok(text) => Ok(text),
+                Err(third) => Err(first.merged(second).merged(third)),
+            },
         },
     }
 }
@@ -477,6 +540,13 @@ pub fn remote_ps_list_script(path: &str) -> String {
         "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{}}; {} -ErrorAction Stop; Get-ChildItem -LiteralPath . -Force | ForEach-Object {{ $_.Name + $(if ($_.PSIsContainer) {{ '/' }}) }}",
         remote_ps_cd_snippet(path)
     )
+}
+
+/// cmd-safe spelling of [`remote_ps_list_script`]: same `name/` wire
+/// format through `cmd.exe` with no host-side change, via
+/// [`powershell_encoded_command`].
+pub fn remote_cmd_list_script(path: &str) -> String {
+    powershell_encoded_command(&remote_ps_list_script(path))
 }
 
 /// `ssh` argv listing `path` on `host` (SSH picker): no pty (`-T`),
@@ -1721,6 +1791,137 @@ mod tests {
         assert!(clis[0].available);
         assert_eq!(clis[0].path.as_deref(), Some("C:\\tools\\muse.exe"));
         assert!(!clis[1].available);
+    }
+
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn powershell_encoded_command_is_silenced_utf16le_base64() {
+        let cmd = powershell_encoded_command("a");
+        assert!(
+            cmd.starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "),
+            "{cmd}"
+        );
+        let payload = cmd.split_whitespace().last().unwrap();
+        // Progress silenced first, then the snippet verbatim.
+        assert_eq!(
+            decode_ps_encoded(payload),
+            "$ProgressPreference='SilentlyContinue';a"
+        );
+    }
+
+    /// Test-only base64 decoder (independent check that the wrapper
+    /// round-trips back to the raw PowerShell spelling).
+    fn base64_decode(s: &str) -> Vec<u8> {
+        fn val(c: u8) -> u8 {
+            match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => panic!("bad base64 char {c}"),
+            }
+        }
+        let bytes = s.as_bytes();
+        assert!(bytes.len().is_multiple_of(4));
+        let mut out = Vec::new();
+        for chunk in bytes.chunks(4) {
+            let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+            let mut n: u32 = 0;
+            for (i, &c) in chunk.iter().enumerate() {
+                if c != b'=' {
+                    n |= (val(c) as u32) << (18 - 6 * i);
+                }
+            }
+            out.push((n >> 16) as u8);
+            if pad < 2 {
+                out.push((n >> 8) as u8);
+            }
+            if pad < 1 {
+                out.push(n as u8);
+            }
+        }
+        out
+    }
+
+    fn decode_ps_encoded(payload: &str) -> String {
+        let bytes = base64_decode(payload);
+        assert!(bytes.len().is_multiple_of(2));
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16(&units).unwrap()
+    }
+
+    #[test]
+    fn cmd_wrapped_ps_probe_survives_cmd_default_shell() {
+        // cmd.exe-default Windows SSH hosts reject both raw spellings
+        // (`c was unexpected at this time.` / `'foreach' is not
+        // recognized...`); the EncodedCommand wrapper must carry no cmd
+        // metachars and must round-trip to the raw PowerShell spelling.
+        let wrapped = remote_cmd_probe_script();
+        assert!(
+            wrapped.starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "),
+            "{wrapped}"
+        );
+        let payload = wrapped.split_whitespace().last().unwrap();
+        assert!(
+            payload
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
+            "{payload}"
+        );
+        assert_eq!(
+            decode_ps_encoded(payload),
+            format!(
+                "$ProgressPreference='SilentlyContinue';{}",
+                remote_ps_probe_script()
+            )
+        );
+        // The listing wrapper round-trips too, including a unicode path.
+        let wrapped_list = remote_cmd_list_script("C:\\srv\\api\\t\u{f6}\u{f6}");
+        let payload = wrapped_list.split_whitespace().last().unwrap();
+        assert!(
+            payload
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
+            "{payload}"
+        );
+        assert_eq!(
+            decode_ps_encoded(payload),
+            format!(
+                "$ProgressPreference='SilentlyContinue';{}",
+                remote_ps_list_script("C:\\srv\\api\\t\u{f6}\u{f6}")
+            )
+        );
+    }
+
+    #[test]
+    fn classify_probe_failure_names_cmd_default_shell_errors() {
+        // Observed against a cmd.exe-default Windows SSH host: the POSIX
+        // spelling dies with `c was unexpected at this time.`
+        for stderr in [
+            "c was unexpected at this time.",
+            "The syntax of the command is incorrect.",
+        ] {
+            let got = classify_probe_failure(&ProbeFailure {
+                stderr: stderr.to_string(),
+                status: Some(1),
+                spawn_error: None,
+            });
+            assert_eq!(got, SshFailureReason::RemoteShellError, "{stderr:?}");
+        }
     }
 
     #[test]
