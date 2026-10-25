@@ -71,10 +71,11 @@ pub fn load_sessions_from(path: &Path) -> Vec<ChatSession> {
 }
 
 /// Fold `donor`'s retained state into `keep` without changing `keep`'s
-/// identity (issue #54): link lists union in first-seen order (so links
-/// that scrolled off keep surviving), an empty transcript fills from the
-/// donor, and the fresher activity stamp wins. Title, project, and status
-/// always stay `keep`'s — identity is the id, never the title.
+/// identity (issue #54): link lists union (so links that scrolled off
+/// keep surviving; display order is re-applied by `push_links`), an empty
+/// transcript fills from the donor, and the fresher activity stamp wins.
+/// Title, project, and status always stay `keep`'s — identity is the id,
+/// never the title.
 fn union_into(keep: &mut ChatSession, mut donor: ChatSession) {
     keep.push_links(
         std::mem::take(&mut donor.pr_links),
@@ -98,10 +99,11 @@ fn union_into(keep: &mut ChatSession, mut donor: ChatSession) {
 }
 
 /// Merge persisted sessions under historic discovery: discovered entries
-/// win on title/project (fresher), link lists union in first-seen order
-/// (so links that scrolled off keep surviving), transcripts fill in when
-/// discovery has none. Persisted ids with no discovered counterpart return
-/// as [`Status::Idle`] — they own no live PTY after a restart.
+/// win on title/project (fresher), link lists union (so links that
+/// scrolled off keep surviving; display order is re-applied),
+/// transcripts fill in when discovery has none. Persisted ids with no
+/// discovered counterpart return as [`Status::Idle`] — they own no live
+/// PTY after a restart.
 ///
 /// One row per id (issue #54): the same provider session can surface more
 /// than once in discovery (e.g. resumed under a second date dir), and two
@@ -132,6 +134,9 @@ pub fn merge_sessions(
             None => {
                 let mut saved = saved;
                 saved.status = Status::Idle;
+                // Pre-sort persisted rows converge loaded state with live
+                // rows without waiting for the next link arrival.
+                saved.sort_links();
                 out.push(saved);
             }
         }

@@ -272,8 +272,11 @@ pub fn remote_list_command(host: &str, path: &str) -> (String, Vec<String>) {
 /// Parse one remote listing run (`ls -1A -p`, one name per line,
 /// directories with a trailing `/`) into entries: blank lines and
 /// `.`/`..` are skipped, names keep every other byte (no trimming —
-/// remote names may carry spaces), and output caps at
-/// [`MAX_REMOTE_LIST_ENTRIES`]. Pure so tests cover it without a network.
+/// remote names may carry spaces), output caps at
+/// [`MAX_REMOTE_LIST_ENTRIES`], and entries sort directories-first,
+/// case-insensitively — the native Finder/Explorer/Nautilus order every
+/// shell's remote browser inherits with no per-shell sort. Pure so tests
+/// cover it without a network.
 pub fn parse_remote_list_output(text: &str) -> Vec<RemoteEntry> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -292,6 +295,7 @@ pub fn parse_remote_list_output(text: &str) -> Vec<RemoteEntry> {
             break;
         }
     }
+    out.sort_by_key(|e| (!e.is_dir, e.name.to_lowercase(), e.name.clone()));
     out
 }
 
@@ -1351,6 +1355,8 @@ mod tests {
 
     #[test]
     fn remote_list_output_parses_dirs_files_and_caps() {
+        // Sorted directories-first, case-insensitively: `.hidden`
+        // precedes `main.rs` once raw `ls` order no longer surfaces.
         let entries = parse_remote_list_output("src/\nmain.rs\n.hidden\n");
         assert_eq!(
             entries,
@@ -1360,11 +1366,11 @@ mod tests {
                     is_dir: true,
                 },
                 RemoteEntry {
-                    name: "main.rs".to_string(),
+                    name: ".hidden".to_string(),
                     is_dir: false,
                 },
                 RemoteEntry {
-                    name: ".hidden".to_string(),
+                    name: "main.rs".to_string(),
                     is_dir: false,
                 },
             ]
@@ -1397,6 +1403,24 @@ mod tests {
         let back: Vec<RemoteEntry> =
             serde_json::from_str(&serde_json::to_string(&entries).unwrap()).unwrap();
         assert_eq!(back, entries);
+    }
+
+    #[test]
+    fn remote_list_output_sorts_dirs_first_case_insensitively() {
+        let entries = parse_remote_list_output("zeta.txt\nAlpha/\nbeta.txt\nGamma/\n");
+        let names: Vec<(&str, bool)> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.is_dir))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("Alpha", true),
+                ("Gamma", true),
+                ("beta.txt", false),
+                ("zeta.txt", false)
+            ]
+        );
     }
 
     #[test]

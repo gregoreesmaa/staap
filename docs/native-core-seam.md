@@ -142,7 +142,8 @@ can link them.
   `classify_with_attention(bool, output_age, exited)`,
   `needs_attention(&str) -> bool`, `WORKING_WINDOW_SECS` (60),
   `harness_badge(&str)`, `short_cwd(&str)`, `MAX_STORED_LINKS` (50) /
-  `MAX_VISIBLE_LINKS` (20), `ChatSession::push_links`,
+  `MAX_VISIBLE_LINKS` (20), `ChatSession::push_links` (stored in
+  numeric-aware sorted display order), `ChatSession::sort_links`,
   `visible_links(&[String])`.
 
 ### Persistence (`persist`)
@@ -169,7 +170,7 @@ can link them.
 - `Parser` trait + `RegistryParser::default()` (fan-out; the seam for new
   content types — no new pipelines per type), `pr_links(&str)`,
   `related_links(&str)`, `github::{extract_pr_links,
-  extract_issue_links, extract_commit_links}`,
+  extract_issue_links, extract_commit_links, link_sort_key}`,
   `refs::extract_file_refs`, `Parsed { title, project, pr_links,
   related_links }`.
 

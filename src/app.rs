@@ -183,8 +183,12 @@ pub struct ChatSession {
 }
 
 impl ChatSession {
-    /// Merge freshly scanned links in first-seen order, capping each list
-    /// at [`MAX_STORED_LINKS`] and raising `links_truncated` on overflow.
+    /// Merge freshly scanned links, deduplicated and capped at
+    /// [`MAX_STORED_LINKS`] per list (the first-seen set wins on
+    /// overflow, raising `links_truncated`). Stored in
+    /// [`crate::parsers::github::link_sort_key`] display order —
+    /// numeric-aware and case-insensitive — so every shell renders
+    /// sorted rows straight from stored order with no per-shell sort.
     /// Underlying data is never dropped by the display cap: the panel
     /// folds extras behind `N more` via [`visible_links`].
     pub fn push_links(&mut self, pr_fresh: Vec<String>, related_fresh: Vec<String>) {
@@ -206,6 +210,16 @@ impl ChatSession {
                 }
             }
         }
+        self.sort_links();
+    }
+
+    /// Re-apply display order to both retained link lists (idempotent):
+    /// load/merge paths call this so pre-sort persisted state converges
+    /// with live rows.
+    pub fn sort_links(&mut self) {
+        let key = crate::parsers::github::link_sort_key;
+        self.pr_links.sort_by_key(|a| key(a));
+        self.related_links.sort_by_key(|a| key(a));
     }
 }
 
@@ -1204,6 +1218,35 @@ mod tests {
         s.push_links(vec![s.pr_links[0].clone()], related);
         assert_eq!(s.pr_links.len(), MAX_STORED_LINKS);
         assert_eq!(s.related_links.len(), MAX_STORED_LINKS);
+    }
+
+    #[test]
+    fn push_links_stores_numeric_sorted_display_order() {
+        let mut s = sess("a", Status::Working, 1);
+        s.push_links(
+            vec![
+                "https://github.com/acme/app/pull/42".to_string(),
+                "https://github.com/acme/app/pull/9".to_string(),
+            ],
+            vec!["src/app.rs:12".to_string(), "src/app.rs:9".to_string()],
+        );
+        assert_eq!(
+            s.pr_links,
+            vec![
+                "https://github.com/acme/app/pull/9",
+                "https://github.com/acme/app/pull/42"
+            ]
+        );
+        assert_eq!(s.related_links, vec!["src/app.rs:9", "src/app.rs:12"]);
+        // Idempotent: re-sorting loaded state is a no-op.
+        s.sort_links();
+        assert_eq!(
+            s.pr_links,
+            vec![
+                "https://github.com/acme/app/pull/9",
+                "https://github.com/acme/app/pull/42"
+            ]
+        );
     }
 
     #[test]

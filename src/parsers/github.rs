@@ -56,6 +56,25 @@ fn collect_unique(re: &Regex, text: &str) -> Vec<String> {
     out
 }
 
+/// Display sort key for accumulated sidepanel links: the lowercased link
+/// with any trailing ASCII digit run compared numerically, so
+/// `…/pull/9` sorts before `…/pull/42` and `src/app.rs:9` before
+/// `src/app.rs:12`. The shared prefix compares lexically, which groups by
+/// owner/repo/kind by construction. This is the single ordering rule
+/// behind [`crate::app::ChatSession::push_links`]: every shell renders
+/// stored order, so all sidepanels sort identically with no per-shell
+/// sort.
+pub fn link_sort_key(link: &str) -> (String, u64, String) {
+    let lower = link.to_lowercase();
+    let digits = lower.bytes().rev().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        (lower.clone(), u64::MAX, lower)
+    } else {
+        let (prefix, num) = lower.split_at(lower.len() - digits);
+        (prefix.to_string(), num.parse().unwrap_or(u64::MAX), lower)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +120,38 @@ mod tests {
     #[test]
     fn empty_in_empty_out() {
         assert!(extract_pr_links("").is_empty());
+    }
+
+    #[test]
+    fn link_sort_key_orders_trailing_numbers_numerically() {
+        let mut links = [
+            "https://github.com/acme/app/pull/42".to_string(),
+            "https://github.com/acme/app/pull/100".to_string(),
+            "https://github.com/acme/app/pull/9".to_string(),
+        ];
+        links.sort_by_key(|l| link_sort_key(l));
+        assert_eq!(
+            links,
+            [
+                "https://github.com/acme/app/pull/9".to_string(),
+                "https://github.com/acme/app/pull/42".to_string(),
+                "https://github.com/acme/app/pull/100".to_string()
+            ]
+        );
+        // Case-insensitive grouping: same repo in different cases stays
+        // adjacent, ordered by number.
+        let mut mixed = [
+            "https://github.com/ACME/app/pull/10".to_string(),
+            "https://github.com/acme/app/pull/2".to_string(),
+        ];
+        mixed.sort_by_key(|l| link_sort_key(l));
+        assert_eq!(mixed[0], "https://github.com/acme/app/pull/2");
+        // File refs sort by the same rule on their raw text.
+        let mut refs = ["src/app.rs:12".to_string(), "src/app.rs:9".to_string()];
+        refs.sort_by_key(|l| link_sort_key(l));
+        assert_eq!(
+            refs,
+            ["src/app.rs:9".to_string(), "src/app.rs:12".to_string()]
+        );
     }
 }

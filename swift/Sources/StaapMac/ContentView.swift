@@ -261,27 +261,37 @@ struct ContentView: View {
             .accessibilityHidden(true)
     }
 
-    /// Inline parsed-link list for an expanded row, with copy/open
-    /// actions per link (issue #103).
+    /// Inline parsed-link list for an expanded row: direct-tap links
+    /// plus a copy action per link (issue #103). Order arrives sorted
+    /// from the core (`push_links` display order); this shell never
+    /// re-sorts.
     private func linkList(_ row: SessionRow) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(allLinks(row), id: \.self) { link in
+                linkRow(link)
+            }
+        }
+    }
+
+    /// One parsed-link row: a direct-tap `Link` for URLs (native
+    /// single-click open, matching the gpui shell's click-to-open rows),
+    /// plain text for non-URL refs. Both carry the copy action.
+    private func linkRow(_ link: String) -> some View {
+        Group {
+            if let url = URL(string: link), url.scheme != nil {
+                Link(link, destination: url)
+            } else {
                 Text(link)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .contextMenu {
-                        Button("Copy link") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(link, forType: .string)
-                        }
-                        if let url = URL(string: link), url.scheme != nil {
-                            Button("Open link") {
-                                NSWorkspace.shared.open(url)
-                            }
-                        }
-                    }
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .truncationMode(.middle)
+        .contextMenu {
+            Button("Copy link") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(link, forType: .string)
             }
         }
     }
