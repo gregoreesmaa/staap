@@ -98,6 +98,35 @@ fail it silently.
   passphrases never touch staap state. Blank hosts refuse at spawn with a
   fail-visible error; discovery degrades to all-listed-none-available.
 
+## SSH picker (saved hosts + tester)
+
+The add-dialog model for picking a remote host lives in the core once;
+shells render rows and forward intents, never probe or resolve.
+
+- Saved hosts (`Config::saved_hosts`, `MAX_SAVED_HOSTS = 50`): display
+  name + SSH target (`user@host` or an ssh-config alias) + optional
+  per-host default folder. Add updates in place on a repeated host;
+  remove matches host or display name; past the cap only brand-new hosts
+  refuse. Old files without the key load empty; no secret field exists —
+  auth stays in the system ssh config.
+- Default folder (`launch::resolve_remote_default_folder`,
+  `Config::remote_default_folder_for`): saved host default, then the
+  host MRU head (`remote_folders`), then the remote home (`None`).
+- Folder completion (`launch::remote_list_command` /
+  `parse_remote_list_output` / `list_remote_dir`): one bounded
+  non-interactive `ssh` round trip (`-T`, `BatchMode=yes`,
+  `ConnectTimeout=5`, safe-quoted `cd <dir> && exec ls -1A -p`,
+  capped at `MAX_REMOTE_LIST_ENTRIES = 500`), degrading to empty on
+  every failure.
+- Tester (`launch::test_remote_host`): one bounded round trip reporting
+  `reachable` plus the detected CLI catalog — unreachable and the
+  all-listed-none-available catalog on blank hosts and every failure,
+  never an auth hang.
+- FFI: `staap_saved_hosts_json`, `staap_saved_host_add`,
+  `staap_saved_host_remove`, `staap_remote_default_folder`,
+  `staap_remote_list_json`, `staap_remote_test_json` (header
+  regenerated with cbindgen; persist via `staap_core_save`).
+
 ## Visual / triage
 
 - Rows keep the harness badge (glyph + short tag) + folder tail; picker

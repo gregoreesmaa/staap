@@ -192,20 +192,195 @@ pub fn detect_remote_clis(host: &str) -> Vec<AvailableCli> {
     }
 }
 
-/// One `ssh` round trip for [`detect_remote_clis`]: `Some` stdout only on
-/// a zero-exit run, `None` on every failure (spawn error, signal,
-/// non-zero exit). Split from parsing so tests cover the pure half
-/// without touching the network.
-fn run_remote_probe(host: &str) -> Option<String> {
-    let (program, args) = remote_probe_command(host);
-    let out = std::process::Command::new(&program)
-        .args(&args)
+/// One `ssh` round trip for the read-only remote probes
+/// ([`detect_remote_clis`], [`list_remote_dir`], [`test_remote_host`]):
+/// `Some` stdout only on a zero-exit run, `None` on every failure (spawn
+/// error, signal, non-zero exit). Split from parsing so tests cover the
+/// pure halves without touching the network.
+fn run_remote_command(host: &str, script: &str) -> Option<String> {
+    let out = std::process::Command::new("ssh")
+        .args([
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            host,
+            script,
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// One `ssh` round trip for [`detect_remote_clis`]: `Some` stdout only on
+/// a zero-exit run, `None` on every failure (spawn error, signal,
+/// non-zero exit). Split from parsing so tests cover the pure half
+/// without touching the network.
+fn run_remote_probe(host: &str) -> Option<String> {
+    run_remote_command(host, &remote_probe_script())
+}
+
+/// One remote directory entry from the listing probe (SSH picker): `name`
+/// without any `ls` indicator suffix, `is_dir` from the trailing `/`
+/// that `ls -p` appends to directories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// Cap for one parsed remote listing (SSH picker): bounded display over
+/// unbounded remote dirs — same rule as the folder MRU and link caps.
+pub const MAX_REMOTE_LIST_ENTRIES: usize = 500;
+
+/// Remote shell snippet listing one directory: `ls -1A -p` (one name per
+/// line, directories with a trailing `/`, dotfiles included, `.`/`..`
+/// excluded). The `cd` runs first so a missing dir fails before `ls`
+/// emits anything (degrading to empty downstream); the path is
+/// single-quote wrapped (see [`SshTarget`] quoting) so spaces and quotes
+/// survive the remote shell. Names containing newlines cannot round-trip
+/// through line output and split into two rows — an accepted `ls`
+/// limitation, documented here rather than silently worked around.
+pub fn remote_list_script(path: &str) -> String {
+    format!("{} && exec ls -1A -p", remote_cd_snippet(path))
+}
+
+/// `ssh` argv listing `path` on `host` (SSH picker): no pty (`-T`),
+/// non-interactive (`BatchMode=yes`, so the probe never blocks on a
+/// password prompt), and a short connect timeout — a single round trip.
+/// The host passes through untouched so system ssh config (`~/.ssh/config`,
+/// `user@`, jump aliases) keeps resolving.
+pub fn remote_list_command(host: &str, path: &str) -> (String, Vec<String>) {
+    (
+        "ssh".to_string(),
+        vec![
+            "-T".to_string(),
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "ConnectTimeout=5".to_string(),
+            host.to_string(),
+            remote_list_script(path),
+        ],
+    )
+}
+
+/// Parse one remote listing run (`ls -1A -p`, one name per line,
+/// directories with a trailing `/`) into entries: blank lines and
+/// `.`/`..` are skipped, names keep every other byte (no trimming —
+/// remote names may carry spaces), and output caps at
+/// [`MAX_REMOTE_LIST_ENTRIES`]. Pure so tests cover it without a network.
+pub fn parse_remote_list_output(text: &str) -> Vec<RemoteEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() || line == "." || line == ".." || line == "./" || line == "../" {
+            continue;
+        }
+        let (name, is_dir) = match line.strip_suffix('/') {
+            Some(dir) if !dir.is_empty() => (dir, true),
+            _ => (line, false),
+        };
+        out.push(RemoteEntry {
+            name: name.to_string(),
+            is_dir,
+        });
+        if out.len() >= MAX_REMOTE_LIST_ENTRIES {
+            break;
+        }
+    }
+    out
+}
+
+/// List `path` on `host` over one bounded `ssh` round trip (SSH picker):
+/// the folder-completion half of the picker, alongside the CLI catalog
+/// from [`detect_remote_clis`]. Blank hosts or paths and every failure
+/// (no `ssh` binary, unreachable host, missing dir, non-zero exit)
+/// degrade to empty: the picker offers no completions rather than an
+/// error, and the spawn path validates the folder separately.
+///
+/// Blocking note for shells: one `ssh` round trip, bounded by the
+/// connect timeout in [`remote_list_command`]. Call it off the UI thread,
+/// on host/folder input — never on every picker open.
+pub fn list_remote_dir(host: &str, path: &str) -> Vec<RemoteEntry> {
+    let (host, path) = (host.trim(), path.trim());
+    if host.is_empty() || path.is_empty() {
+        return Vec::new();
+    }
+    match run_remote_command(host, &remote_list_script(path)) {
+        Some(text) => parse_remote_list_output(&text),
+        None => Vec::new(),
+    }
+}
+
+/// Result of the add-dialog tester round trip (SSH picker): whether
+/// `host` answered one bounded non-interactive `ssh` round trip, plus
+/// the CLI catalog parsed from the same run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteReachability {
+    pub reachable: bool,
+    pub clis: Vec<AvailableCli>,
+}
+
+/// Pure half of [`test_remote_host`]: `Some` probe output means the host
+/// answered (reachable, with the parsed catalog); `None` (spawn error,
+/// signal, non-zero exit) means unreachable with the
+/// all-listed-none-available catalog. Split so tests cover the mapping
+/// without touching the network.
+pub fn reachability_from_probe(output: Option<&str>) -> RemoteReachability {
+    match output {
+        Some(text) => RemoteReachability {
+            reachable: true,
+            clis: parse_remote_probe_output(text),
+        },
+        None => RemoteReachability {
+            reachable: false,
+            clis: parse_remote_probe_output(""),
+        },
+    }
+}
+
+/// Test whether `host` answers one bounded non-interactive `ssh` round
+/// trip (SSH picker): the add-dialog tester. Same flags as
+/// [`remote_probe_command`], so auth prompts never hang the dialog —
+/// key-only hosts without keys report unreachable instead of blocking.
+/// Blank hosts and every failure degrade to unreachable plus the
+/// all-listed-none-available catalog: the tester reports, never throws.
+///
+/// Blocking note for shells: one `ssh` round trip, bounded by the
+/// connect timeout. Call it off the UI thread, on tester-button press
+/// only — never on picker open or per keystroke.
+pub fn test_remote_host(host: &str) -> RemoteReachability {
+    let target = host.trim();
+    if target.is_empty() {
+        return reachability_from_probe(None);
+    }
+    reachability_from_probe(run_remote_command(target, &remote_probe_script()).as_deref())
+}
+
+/// Resolve the picker's default remote folder for a host (SSH picker)
+/// through one documented fallback chain: the saved host default wins,
+/// then the most recent folder used on that host, then `None` (the remote
+/// login directory / home). Pure so every shell shares the chain; blank
+/// entries at any step fall through to the next, and every input blank
+/// resolves to home.
+///
+/// Resolution order mirrors the local picker (configured default, then
+/// recent, then inherit) so both axes feel like one rule.
+pub fn resolve_remote_default_folder(
+    host_default: Option<&str>,
+    mru_first: Option<&str>,
+) -> Option<String> {
+    [host_default, mru_first]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .next()
 }
 
 /// First available CLI id, if any (repeat-last / default resolution falls
@@ -325,6 +500,32 @@ fn shell_quote(word: &str) -> String {
     out
 }
 
+/// `cd` snippet for one remote directory: absolute paths ride single-quoted
+/// (see [`shell_quote`]); a leading `~` must stay expandable, so `~` and
+/// `~/…` rewrite to `$HOME` with the remainder double-quoted — single quotes
+/// would suppress tilde expansion and `cd '~'` fails on the remote.
+fn remote_cd_snippet(dir: &str) -> String {
+    let mut snippet = String::from("cd ");
+    if let Some(rest) = dir.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            snippet.push_str("\"$HOME");
+            for c in rest.chars() {
+                match c {
+                    '"' | '$' | '`' | '\\' => {
+                        snippet.push('\\');
+                        snippet.push(c);
+                    }
+                    _ => snippet.push(c),
+                }
+            }
+            snippet.push('"');
+            return snippet;
+        }
+    }
+    snippet.push_str(&shell_quote(dir));
+    snippet
+}
+
 /// Build the interactive spawn `(program, args)` for a remote target over
 /// an already-resolved inner CLI command: `ssh -t <host> <cli> <args…>`.
 /// `-t` forces a remote pty so interactive auth prompts and the agent
@@ -359,8 +560,7 @@ pub fn ssh_spawn_command(
             ("ssh".to_string(), args)
         }
         Some(dir) => {
-            let mut snippet = String::from("cd ");
-            snippet.push_str(&shell_quote(dir));
+            let mut snippet = remote_cd_snippet(dir);
             snippet.push_str(" && exec ");
             snippet.push_str(&shell_quote(inner_program));
             for arg in inner_args {
@@ -1091,5 +1291,172 @@ mod tests {
         let muse = clis.iter().find(|c| c.id == "muse").unwrap();
         assert!(!muse.available || muse.path.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_cd_keeps_tilde_expandable_and_quotes_the_rest() {
+        // `~` and `~/…` rewrite to expandable `$HOME` (single quotes would
+        // suppress tilde expansion: `cd '~'` fails on the remote).
+        assert_eq!(remote_cd_snippet("~"), "cd \"$HOME\"");
+        assert_eq!(remote_cd_snippet("~/"), "cd \"$HOME/\"");
+        assert_eq!(remote_cd_snippet("~/srv/api"), "cd \"$HOME/srv/api\"");
+        // Spaces ride double-quoted; `$`, backtick, quote, and backslash
+        // stay inert instead of executing on the remote shell.
+        assert_eq!(remote_cd_snippet("~/my dir"), "cd \"$HOME/my dir\"");
+        assert_eq!(
+            remote_cd_snippet("~/$x `id` \"q\" \\"),
+            "cd \"$HOME/\\$x \\`id\\` \\\"q\\\" \\\\\""
+        );
+        // Anything else keeps the exact single-quoted behavior.
+        assert_eq!(remote_cd_snippet("/srv/api"), "cd '/srv/api'");
+        assert_eq!(remote_cd_snippet("~otheruser"), "cd '~otheruser'");
+        // Both consumers quote through the one helper.
+        assert_eq!(remote_list_script("~"), "cd \"$HOME\" && exec ls -1A -p");
+        let (program, args) = ssh_spawn_command(
+            &SshTarget::new("mybox".to_string(), Some("~".to_string())),
+            "muse",
+            &[],
+        );
+        assert_eq!(program, "ssh");
+        assert_eq!(args[2], "cd \"$HOME\" && exec 'muse'");
+    }
+
+    #[test]
+    fn remote_list_command_is_single_bounded_noninteractive_round_trip() {
+        let (program, args) = remote_list_command("mybox", "/srv/api");
+        assert_eq!(program, "ssh");
+        // No pty, no password prompts, bounded connect: the listing probe
+        // never hangs the picker on auth the way an interactive spawn may.
+        assert!(args.contains(&"-T".to_string()));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        assert!(args.contains(&"mybox".to_string()));
+        // Exactly one remote script arg (a single round trip), quoting the
+        // path and listing with `ls -1A -p` after a gating `cd`.
+        let script = args.last().unwrap();
+        assert_eq!(
+            script, "cd '/srv/api' && exec ls -1A -p",
+            "one script, one round trip: {script}"
+        );
+        // The host passes through untouched (user@, ssh-config aliases).
+        let (_, alias_args) = remote_list_command("dev@jump-box", "/x");
+        assert!(alias_args.contains(&"dev@jump-box".to_string()));
+        // Quoting survives spaces and single quotes in the path.
+        let (_, quoted) = remote_list_command("mybox", "/srv/my api's");
+        assert_eq!(
+            quoted.last().unwrap(),
+            "cd '/srv/my api'\"'\"'s' && exec ls -1A -p"
+        );
+    }
+
+    #[test]
+    fn remote_list_output_parses_dirs_files_and_caps() {
+        let entries = parse_remote_list_output("src/\nmain.rs\n.hidden\n");
+        assert_eq!(
+            entries,
+            vec![
+                RemoteEntry {
+                    name: "src".to_string(),
+                    is_dir: true,
+                },
+                RemoteEntry {
+                    name: "main.rs".to_string(),
+                    is_dir: false,
+                },
+                RemoteEntry {
+                    name: ".hidden".to_string(),
+                    is_dir: false,
+                },
+            ]
+        );
+        // Blanks and dot entries never surface; a bare `/` stays a file
+        // row rather than vanishing into an empty dir name.
+        let edge = parse_remote_list_output("\n.\n..\n/\n");
+        assert_eq!(
+            edge,
+            vec![RemoteEntry {
+                name: "/".to_string(),
+                is_dir: false,
+            }]
+        );
+        // Names keep interior bytes (no trimming — remote names may carry
+        // spaces); only the `ls -p` dir marker is stripped.
+        let spaced = parse_remote_list_output("my dir/\nnotes.txt\n");
+        assert_eq!(spaced[0].name, "my dir");
+        assert!(spaced[0].is_dir);
+        // Bounded: huge remote dirs cannot grow the picker without limit.
+        let big = (0..MAX_REMOTE_LIST_ENTRIES + 50)
+            .map(|i| format!("f{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            parse_remote_list_output(&big).len(),
+            MAX_REMOTE_LIST_ENTRIES
+        );
+        // Serde round-trip for the FFI JSON shape.
+        let back: Vec<RemoteEntry> =
+            serde_json::from_str(&serde_json::to_string(&entries).unwrap()).unwrap();
+        assert_eq!(back, entries);
+    }
+
+    #[test]
+    fn remote_list_degrades_to_empty_without_network() {
+        // Blank hosts and blank paths never spawn ssh: the picker offers
+        // no completions rather than an error, with zero network touch.
+        assert!(list_remote_dir("", "/srv/api").is_empty());
+        assert!(list_remote_dir("   ", "/srv/api").is_empty());
+        assert!(list_remote_dir("mybox", "").is_empty());
+        assert!(list_remote_dir("mybox", "   ").is_empty());
+    }
+
+    #[test]
+    fn reachability_maps_probe_output_without_network() {
+        // Pure half: answered output means reachable with the parsed
+        // catalog; no output means unreachable with the degraded catalog.
+        let up = reachability_from_probe(Some("muse:/bin/muse\nclaude:\n"));
+        assert!(up.reachable);
+        assert!(up.clis[0].available);
+        assert!(!up.clis[1].available);
+        let down = reachability_from_probe(None);
+        assert!(!down.reachable);
+        assert!(down.clis.iter().all(|c| !c.available));
+        // Blank hosts never spawn ssh: unreachable + degraded catalog.
+        for host in ["", "   "] {
+            let t = test_remote_host(host);
+            assert!(!t.reachable, "blank host reports unreachable");
+            let ids: Vec<&str> = t.clis.iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(ids, SUPPORTED_CLIS);
+            assert!(t.clis.iter().all(|c| !c.available));
+        }
+        // Serde round-trip for the tester JSON shape.
+        let back: RemoteReachability =
+            serde_json::from_str(&serde_json::to_string(&up).unwrap()).unwrap();
+        assert_eq!(back, up);
+    }
+
+    #[test]
+    fn remote_default_folder_falls_back_host_default_then_mru_then_home() {
+        // Saved host default wins over everything.
+        assert_eq!(
+            resolve_remote_default_folder(Some("/srv/api"), Some("/srv/other")),
+            Some("/srv/api".to_string())
+        );
+        // Blank defaults fall through to the host MRU.
+        assert_eq!(
+            resolve_remote_default_folder(Some("   "), Some("/srv/other")),
+            Some("/srv/other".to_string())
+        );
+        assert_eq!(
+            resolve_remote_default_folder(None, Some("/srv/other")),
+            Some("/srv/other".to_string())
+        );
+        // Everything blank resolves to home (None = remote login dir).
+        assert_eq!(resolve_remote_default_folder(None, None), None);
+        assert_eq!(resolve_remote_default_folder(Some(""), Some("  ")), None);
+        // Surrounding whitespace never leaks into the resolved folder.
+        assert_eq!(
+            resolve_remote_default_folder(Some("  /srv/api  "), None),
+            Some("/srv/api".to_string())
+        );
     }
 }

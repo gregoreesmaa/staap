@@ -34,6 +34,14 @@
 #define PAGE_STEP 5
 
 /**
+ * Ceiling for the saved-host list (SSH picker): same bounded-growth
+ * rule as the folder MRUs. Updates to an already-saved host always
+ * succeed; only brand-new hosts beyond the cap refuse (with a message
+ * naming the fix), so a save never silently drops an existing entry.
+ */
+#define MAX_SAVED_HOSTS 50
+
+/**
  * Lines of scrollback retained by the vt100 emulator.
  */
 #define SCROLLBACK_LINES 2000
@@ -43,6 +51,12 @@
  * bounded display over unbounded data — same rule as link caps).
  */
 #define MAX_RECENT_FOLDERS 10
+
+/**
+ * Cap for one parsed remote listing (SSH picker): bounded display over
+ * unbounded remote dirs — same rule as the folder MRU and link caps.
+ */
+#define MAX_REMOTE_LIST_ENTRIES 500
 
 /**
  * Lines of output retained for the pager (mirrors the vt100 buffer size).
@@ -439,6 +453,88 @@ int staap_run_spawn_remote(struct StaapCore *core,
  * must be null or a valid NUL-terminated C string.
  */
 char *staap_remote_recent_json(const struct StaapCore *core, const char *host);
+
+/**
+ * Owned JSON of the saved SSH hosts (SSH picker):
+ * `[{"name","host","default_folder"|null}]` in saved order. Null core
+ * yields `[]`, never UB; free with [`staap_screen_text_free`].
+ *
+ * # Safety
+ * `core` must be null or a live pointer from [`staap_core_new`].
+ */
+char *staap_saved_hosts_json(const struct StaapCore *core);
+
+/**
+ * Save an SSH host for the picker (SSH picker): `name` is the display
+ * label, `host` the SSH target (`user@host` or an ssh-config alias),
+ * `default_folder` null/empty clears the per-host default. An already
+ * saved host (same trimmed `host`) updates in place; brand-new hosts
+ * past [`crate::config::MAX_SAVED_HOSTS`] refuse. Blank names/hosts
+ * (or null/invalid strings) report [`StaapError::Spawn`] with a message
+ * naming the fix. Callers persist via [`staap_core_save`].
+ *
+ * # Safety
+ * `core` must be non-null and live; `name`/`host`/`default_folder` must
+ * be null or valid NUL-terminated C strings.
+ */
+int staap_saved_host_add(struct StaapCore *core,
+                         const char *name,
+                         const char *host,
+                         const char *default_folder);
+
+/**
+ * Remove a saved SSH host by `host` or display `name` (SSH picker).
+ * Unknown keys report [`StaapError::Spawn`] with a message (fail-visible
+ * "no such host"); null core/key is [`StaapError::Null`], invalid UTF-8
+ * is [`StaapError::Utf8`]. Callers persist via [`staap_core_save`].
+ *
+ * # Safety
+ * `core` must be non-null and live; `key` must be null or a valid
+ * NUL-terminated C string.
+ */
+int staap_saved_host_remove(struct StaapCore *core, const char *key);
+
+/**
+ * Owned default remote folder for `host` (SSH picker): the saved host
+ * default, else the host MRU head, else null (the remote login directory
+ * / home — a null return, not an error). Null core/host and blank hosts
+ * yield null; free with [`staap_screen_text_free`].
+ *
+ * # Safety
+ * `core`/`host` must be null or valid (`host` a NUL-terminated C string,
+ * `core` a live pointer from [`staap_core_new`]).
+ */
+char *staap_remote_default_folder(const struct StaapCore *core, const char *host);
+
+/**
+ * Owned JSON of one remote directory listing (SSH picker):
+ * `[{"name","is_dir"}]` from a single bounded `ssh` round trip
+ * (`-T`, `BatchMode=yes`, `ConnectTimeout`, safe-quoted path — see
+ * [`launch::remote_list_command`]). Null/blank hosts or paths and every
+ * probe failure degrade to `[]`, never null (allocation aside) and never
+ * an auth hang; non-UTF-8 args report null with a message. Free with
+ * [`staap_screen_text_free`]. Blocking: shells call this off the UI
+ * thread, on host/folder input — never on every picker open.
+ *
+ * # Safety
+ * `host`/`path` must be null or valid NUL-terminated C strings.
+ */
+char *staap_remote_list_json(const char *host, const char *path);
+
+/**
+ * Owned JSON of the add-dialog tester result (SSH picker):
+ * `{"reachable":bool,"clis":[...]}` from one bounded non-interactive
+ * `ssh` round trip (see [`launch::test_remote_host`]). Null/blank hosts
+ * and every probe failure degrade to `{"reachable":false,
+ * all-listed-none-available}`, never null (allocation aside); non-UTF-8
+ * hosts report null with a message. Free with
+ * [`staap_screen_text_free`]. Blocking: shells call this off the UI
+ * thread, on tester-button press only.
+ *
+ * # Safety
+ * `host` must be null or a valid NUL-terminated C string.
+ */
+char *staap_remote_test_json(const char *host);
 
 /**
  * Spawn a PTY and attach it to an existing roster row (restart a dead

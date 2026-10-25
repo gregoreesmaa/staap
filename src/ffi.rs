@@ -1149,6 +1149,251 @@ pub unsafe extern "C" fn staap_remote_recent_json(
     }
 }
 
+// --- SSH picker: saved hosts, default folder, listing, tester ----------------
+//
+// The add-dialog model for the SSH picker lives in the core once
+// (`config::SavedHost`, `launch::resolve_remote_default_folder`,
+// `launch::list_remote_dir`, `launch::test_remote_host`); shells only
+// render rows and forward intents here. No secret parameter exists on any
+// entry point by design: auth stays in the system ssh config.
+
+/// Owned JSON of the saved SSH hosts (SSH picker):
+/// `[{"name","host","default_folder"|null}]` in saved order. Null core
+/// yields `[]`, never UB; free with [`staap_screen_text_free`].
+///
+/// # Safety
+/// `core` must be null or a live pointer from [`staap_core_new`].
+#[no_mangle]
+pub unsafe extern "C" fn staap_saved_hosts_json(core: *const StaapCore) -> *mut c_char {
+    let hosts: Vec<crate::config::SavedHost> = if core.is_null() {
+        Vec::new()
+    } else {
+        (*core).reg.app.config_saved_hosts().to_vec()
+    };
+    match serde_json::to_string(&hosts) {
+        Ok(doc) => match CString::new(doc) {
+            Ok(s) => s.into_raw(),
+            Err(_) => {
+                set_error("staap_saved_hosts_json: hosts contain NUL".to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_error(format!("staap_saved_hosts_json: {e:#}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Save an SSH host for the picker (SSH picker): `name` is the display
+/// label, `host` the SSH target (`user@host` or an ssh-config alias),
+/// `default_folder` null/empty clears the per-host default. An already
+/// saved host (same trimmed `host`) updates in place; brand-new hosts
+/// past [`crate::config::MAX_SAVED_HOSTS`] refuse. Blank names/hosts
+/// (or null/invalid strings) report [`StaapError::Spawn`] with a message
+/// naming the fix. Callers persist via [`staap_core_save`].
+///
+/// # Safety
+/// `core` must be non-null and live; `name`/`host`/`default_folder` must
+/// be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn staap_saved_host_add(
+    core: *mut StaapCore,
+    name: *const c_char,
+    host: *const c_char,
+    default_folder: *const c_char,
+) -> c_int {
+    if core.is_null() {
+        set_error("staap_saved_host_add: null core".to_string());
+        return StaapError::Null.code();
+    }
+    if name.is_null() || host.is_null() {
+        set_error("staap_saved_host_add: null name or host".to_string());
+        return StaapError::Null.code();
+    }
+    let (name, host) = match (CStr::from_ptr(name).to_str(), CStr::from_ptr(host).to_str()) {
+        (Ok(name), Ok(host)) => (name, host),
+        _ => {
+            set_error("staap_saved_host_add: name or host is not valid UTF-8".to_string());
+            return StaapError::Utf8.code();
+        }
+    };
+    let folder = if default_folder.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(default_folder).to_str() {
+            Ok(s) => Some(s),
+            Err(_) => {
+                set_error("staap_saved_host_add: default_folder is not valid UTF-8".to_string());
+                return StaapError::Utf8.code();
+            }
+        }
+    };
+    match (*core)
+        .reg
+        .app
+        .config_mut()
+        .add_saved_host(name, host, folder)
+    {
+        Ok(()) => StaapError::Ok.code(),
+        Err(msg) => {
+            set_error(format!("staap_saved_host_add: {msg}"));
+            StaapError::Spawn.code()
+        }
+    }
+}
+
+/// Remove a saved SSH host by `host` or display `name` (SSH picker).
+/// Unknown keys report [`StaapError::Spawn`] with a message (fail-visible
+/// "no such host"); null core/key is [`StaapError::Null`], invalid UTF-8
+/// is [`StaapError::Utf8`]. Callers persist via [`staap_core_save`].
+///
+/// # Safety
+/// `core` must be non-null and live; `key` must be null or a valid
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn staap_saved_host_remove(
+    core: *mut StaapCore,
+    key: *const c_char,
+) -> c_int {
+    if core.is_null() || key.is_null() {
+        set_error("staap_saved_host_remove: null core or key".to_string());
+        return StaapError::Null.code();
+    }
+    let key_str = match CStr::from_ptr(key).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_error("staap_saved_host_remove: key is not valid UTF-8".to_string());
+            return StaapError::Utf8.code();
+        }
+    };
+    if (*core).reg.app.config_mut().remove_saved_host(key_str) {
+        StaapError::Ok.code()
+    } else {
+        set_error("staap_saved_host_remove: no such saved host".to_string());
+        StaapError::Spawn.code()
+    }
+}
+
+/// Owned default remote folder for `host` (SSH picker): the saved host
+/// default, else the host MRU head, else null (the remote login directory
+/// / home — a null return, not an error). Null core/host and blank hosts
+/// yield null; free with [`staap_screen_text_free`].
+///
+/// # Safety
+/// `core`/`host` must be null or valid (`host` a NUL-terminated C string,
+/// `core` a live pointer from [`staap_core_new`]).
+#[no_mangle]
+pub unsafe extern "C" fn staap_remote_default_folder(
+    core: *const StaapCore,
+    host: *const c_char,
+) -> *mut c_char {
+    if core.is_null() || host.is_null() {
+        return std::ptr::null_mut();
+    }
+    let folder = match CStr::from_ptr(host).to_str() {
+        Ok(s) => (*core).reg.app.config_remote_default_folder(s),
+        Err(_) => {
+            set_error("staap_remote_default_folder: host is not valid UTF-8".to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match folder {
+        Some(dir) => match CString::new(dir) {
+            Ok(s) => s.into_raw(),
+            Err(_) => {
+                set_error("staap_remote_default_folder: folder contains NUL".to_string());
+                std::ptr::null_mut()
+            }
+        },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Owned JSON of one remote directory listing (SSH picker):
+/// `[{"name","is_dir"}]` from a single bounded `ssh` round trip
+/// (`-T`, `BatchMode=yes`, `ConnectTimeout`, safe-quoted path — see
+/// [`launch::remote_list_command`]). Null/blank hosts or paths and every
+/// probe failure degrade to `[]`, never null (allocation aside) and never
+/// an auth hang; non-UTF-8 args report null with a message. Free with
+/// [`staap_screen_text_free`]. Blocking: shells call this off the UI
+/// thread, on host/folder input — never on every picker open.
+///
+/// # Safety
+/// `host`/`path` must be null or valid NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn staap_remote_list_json(
+    host: *const c_char,
+    path: *const c_char,
+) -> *mut c_char {
+    let (host_str, path_str) = if host.is_null() || path.is_null() {
+        (Some(""), Some(""))
+    } else {
+        match (CStr::from_ptr(host).to_str(), CStr::from_ptr(path).to_str()) {
+            (Ok(h), Ok(p)) => (Some(h), Some(p)),
+            _ => {
+                set_error("staap_remote_list_json: argument is not valid UTF-8".to_string());
+                return std::ptr::null_mut();
+            }
+        }
+    };
+    // Blank short-circuits before any spawn (see `list_remote_dir`), so
+    // null/blank inputs never touch the network.
+    let entries = launch::list_remote_dir(host_str.unwrap_or(""), path_str.unwrap_or(""));
+    match serde_json::to_string(&entries) {
+        Ok(doc) => match CString::new(doc) {
+            Ok(s) => s.into_raw(),
+            Err(_) => {
+                set_error("staap_remote_list_json: entries contain NUL".to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_error(format!("staap_remote_list_json: {e:#}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Owned JSON of the add-dialog tester result (SSH picker):
+/// `{"reachable":bool,"clis":[...]}` from one bounded non-interactive
+/// `ssh` round trip (see [`launch::test_remote_host`]). Null/blank hosts
+/// and every probe failure degrade to `{"reachable":false,
+/// all-listed-none-available}`, never null (allocation aside); non-UTF-8
+/// hosts report null with a message. Free with
+/// [`staap_screen_text_free`]. Blocking: shells call this off the UI
+/// thread, on tester-button press only.
+///
+/// # Safety
+/// `host` must be null or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn staap_remote_test_json(host: *const c_char) -> *mut c_char {
+    let probe = if host.is_null() {
+        launch::test_remote_host("")
+    } else {
+        match CStr::from_ptr(host).to_str() {
+            Ok(s) => launch::test_remote_host(s),
+            Err(_) => {
+                set_error("staap_remote_test_json: host is not valid UTF-8".to_string());
+                return std::ptr::null_mut();
+            }
+        }
+    };
+    match serde_json::to_string(&probe) {
+        Ok(doc) => match CString::new(doc) {
+            Ok(s) => s.into_raw(),
+            Err(_) => {
+                set_error("staap_remote_test_json: result contains NUL".to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_error(format!("staap_remote_test_json: {e:#}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Spawn a PTY and attach it to an existing roster row (restart a dead
 /// run, resume a historic entry): drops the dead PTY if any, spawns the
 /// row's spawn kind on the same id, attaches on success. Unknown or live
@@ -2874,6 +3119,150 @@ mod tests {
             (*core).reg.app.sessions.clear();
             assert!(!staap_needs_quit_confirm(core));
             staap_core_free(core);
+        }
+    }
+
+    #[test]
+    fn ssh_picker_abi_saved_hosts_default_listing_tester() {
+        // SSH picker over FFI: saved-hosts CRUD round-trips as JSON, the
+        // default-folder chain resolves without a network, and the listing
+        // + tester degrade without spawning ssh (null/blank inputs
+        // short-circuit before any process starts).
+        use crate::launch::SUPPORTED_CLIS;
+        unsafe {
+            // Null core: empty host list, null default, never UB.
+            let raw = staap_saved_hosts_json(std::ptr::null());
+            assert!(!raw.is_null());
+            assert_eq!(CStr::from_ptr(raw).to_string_lossy().into_owned(), "[]");
+            staap_screen_text_free(raw);
+            assert!(staap_remote_default_folder(std::ptr::null(), std::ptr::null()).is_null());
+            // Null guards on the mutating entries.
+            assert_eq!(
+                staap_saved_host_add(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null()
+                ),
+                StaapError::Null.code()
+            );
+            assert_eq!(
+                staap_saved_host_remove(std::ptr::null_mut(), std::ptr::null()),
+                StaapError::Null.code()
+            );
+            let mut core = Box::new(StaapCore {
+                reg: crate::runs::RunRegistry::new(vec![]),
+            });
+            let core_ptr: *mut StaapCore = &mut *core;
+            // Null name/host are null errors; blank name/host refuse
+            // with a message (fail-visible add).
+            for (name, host) in [
+                (std::ptr::null(), c"h".as_ptr()),
+                (c"n".as_ptr(), std::ptr::null()),
+            ] {
+                assert_eq!(
+                    staap_saved_host_add(core_ptr, name, host, std::ptr::null()),
+                    StaapError::Null.code()
+                );
+            }
+            let blank_name = CString::new("  ").unwrap();
+            let blank_host = CString::new("   ").unwrap();
+            assert_eq!(
+                staap_saved_host_add(
+                    core_ptr,
+                    blank_name.as_ptr(),
+                    c"h".as_ptr(),
+                    std::ptr::null()
+                ),
+                StaapError::Spawn.code()
+            );
+            assert_eq!(
+                staap_saved_host_add(
+                    core_ptr,
+                    c"n".as_ptr(),
+                    blank_host.as_ptr(),
+                    std::ptr::null()
+                ),
+                StaapError::Spawn.code()
+            );
+            let msg = CStr::from_ptr(staap_last_error())
+                .to_string_lossy()
+                .into_owned();
+            assert!(msg.contains("staap_saved_host_add"), "last_error: {msg:?}");
+            // Add with a per-host default, then list as JSON.
+            let name = CString::new("prod box").unwrap();
+            let host = CString::new("dev@jump-box").unwrap();
+            let folder = CString::new("/srv/api").unwrap();
+            assert_eq!(
+                staap_saved_host_add(core_ptr, name.as_ptr(), host.as_ptr(), folder.as_ptr()),
+                StaapError::Ok.code()
+            );
+            let raw = staap_saved_hosts_json(core_ptr);
+            let text = CStr::from_ptr(raw).to_string_lossy().into_owned();
+            staap_screen_text_free(raw);
+            let docs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0]["name"], "prod box");
+            assert_eq!(docs[0]["host"], "dev@jump-box");
+            assert_eq!(docs[0]["default_folder"], "/srv/api");
+            // Default-folder chain: saved default wins, null clears to
+            // home here (no MRU recorded), blank hosts yield null.
+            let raw = staap_remote_default_folder(core_ptr, host.as_ptr());
+            assert_eq!(
+                CStr::from_ptr(raw).to_string_lossy().into_owned(),
+                "/srv/api"
+            );
+            staap_screen_text_free(raw);
+            assert!(staap_remote_default_folder(core_ptr, c"unknown".as_ptr()).is_null());
+            assert!(staap_remote_default_folder(core_ptr, c"  ".as_ptr()).is_null());
+            assert!(staap_remote_default_folder(core_ptr, std::ptr::null()).is_null());
+            // Remove by display name; unknown keys fail visibly.
+            let key = CString::new("prod box").unwrap();
+            assert_eq!(
+                staap_saved_host_remove(core_ptr, key.as_ptr()),
+                StaapError::Ok.code()
+            );
+            assert_eq!(
+                staap_saved_host_remove(core_ptr, key.as_ptr()),
+                StaapError::Spawn.code()
+            );
+            let raw = staap_saved_hosts_json(core_ptr);
+            assert_eq!(CStr::from_ptr(raw).to_string_lossy().into_owned(), "[]");
+            staap_screen_text_free(raw);
+            // Listing degrades to `[]` without spawning ssh (null and
+            // blank inputs short-circuit before any process starts).
+            for (h, p) in [
+                (std::ptr::null(), std::ptr::null()),
+                (c"".as_ptr(), c"/srv".as_ptr()),
+                (c"mybox".as_ptr(), c"  ".as_ptr()),
+            ] {
+                let raw = staap_remote_list_json(h, p);
+                assert!(!raw.is_null());
+                assert_eq!(CStr::from_ptr(raw).to_string_lossy().into_owned(), "[]");
+                staap_screen_text_free(raw);
+            }
+            // Tester degrades to unreachable + degraded catalog without
+            // spawning ssh on null/blank hosts.
+            for h in [std::ptr::null(), c"".as_ptr(), c"   ".as_ptr()] {
+                let raw = staap_remote_test_json(h);
+                assert!(!raw.is_null());
+                let text = CStr::from_ptr(raw).to_string_lossy().into_owned();
+                staap_screen_text_free(raw);
+                let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(doc["reachable"], false);
+                let ids: Vec<&str> = doc["clis"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|d| d["id"].as_str().unwrap())
+                    .collect();
+                assert_eq!(ids, SUPPORTED_CLIS);
+                assert!(doc["clis"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|d| d["available"] == false));
+            }
         }
     }
 

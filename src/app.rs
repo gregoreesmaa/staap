@@ -550,6 +550,17 @@ impl App {
         self.config.remote_recents_for(host)
     }
 
+    /// Saved SSH hosts in saved order (SSH picker): what the picker lists.
+    pub fn config_saved_hosts(&self) -> &[crate::config::SavedHost] {
+        self.config.saved_hosts()
+    }
+
+    /// Default remote folder for `host` (SSH picker) through the shared
+    /// fallback chain (saved default, then host MRU, then home).
+    pub fn config_remote_default_folder(&self, host: &str) -> Option<String> {
+        self.config.remote_default_folder_for(host)
+    }
+
     /// Test helper: seed folder recents (production reaches them through
     /// confirmed launches via `note_launch`).
     #[cfg(test)]

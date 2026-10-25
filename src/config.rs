@@ -19,6 +19,31 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// One saved SSH host for the picker (SSH picker): a display name, the
+/// SSH target as typed (`mybox`, `dev@jump-box`, an ssh-config alias),
+/// and an optional per-host default folder. No secrets ever: auth rides
+/// the user's own ssh setup (config file, agent, interactive prompts),
+/// so only `host` + `default_folder` persist here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedHost {
+    /// Display name shown in the picker (e.g. `"prod jump box"`).
+    pub name: String,
+    /// SSH target as typed for `ssh`: `user@` prefixes and ssh-config
+    /// aliases keep resolving through the system ssh config untouched.
+    pub host: String,
+    /// Default folder on this host (`None`/blank = fall through to the
+    /// host MRU, then the remote home — see
+    /// [`Config::remote_default_folder_for`]).
+    #[serde(default)]
+    pub default_folder: Option<String>,
+}
+
+/// Ceiling for the saved-host list (SSH picker): same bounded-growth
+/// rule as the folder MRUs. Updates to an already-saved host always
+/// succeed; only brand-new hosts beyond the cap refuse (with a message
+/// naming the fix), so a save never silently drops an existing entry.
+pub const MAX_SAVED_HOSTS: usize = 50;
+
 /// Startup flags for one agent binary (keyed by program name, e.g.
 /// `"muse"` or `"claude"`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +112,12 @@ pub struct Config {
     /// `other:/srv/api` never mix.
     #[serde(default)]
     pub remote_folders: HashMap<String, Vec<String>>,
+    /// Saved SSH hosts for the picker (SSH picker): display name + SSH
+    /// target + optional per-host default folder, in saved order. Hosts
+    /// and folders only — auth stays in the user's own ssh setup, so
+    /// passwords, keys, and passphrases never touch this file.
+    #[serde(default)]
+    pub saved_hosts: Vec<SavedHost>,
 }
 
 /// Default terminal-pane font: OFL-licensed, full box-drawing + block
@@ -260,6 +291,7 @@ impl Default for Config {
             recent_folders: Vec::new(),
             last_host: None,
             remote_folders: HashMap::new(),
+            saved_hosts: Vec::new(),
         }
     }
 }
@@ -358,6 +390,111 @@ impl Config {
             .get(host)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Saved SSH hosts in saved order (SSH picker). What the picker
+    /// lists; shells render it and forward add/remove intents here.
+    pub fn saved_hosts(&self) -> &[SavedHost] {
+        &self.saved_hosts
+    }
+
+    /// Save an SSH host for the picker (SSH picker): `name` is the display
+    /// label, `host` the SSH target (`user@host` or an ssh-config alias),
+    /// `default_folder` the per-host default (`None`/blank clears it). A
+    /// host already saved (same trimmed `host`) updates in place and never
+    /// counts against the cap; brand-new hosts past [`MAX_SAVED_HOSTS`]
+    /// refuse with a message naming the fix. Blank names/hosts refuse the
+    /// same way. No secret parameter exists by design: auth stays in the
+    /// system ssh config, never in this file.
+    pub fn add_saved_host(
+        &mut self,
+        name: &str,
+        host: &str,
+        default_folder: Option<&str>,
+    ) -> Result<(), String> {
+        let name = name.trim();
+        let host = host.trim();
+        if name.is_empty() {
+            return Err("set a display name first".to_string());
+        }
+        if host.is_empty() {
+            return Err("set an SSH host first".to_string());
+        }
+        let folder = default_folder
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
+        if let Some(existing) = self.saved_hosts.iter_mut().find(|h| h.host == host) {
+            existing.name = name.to_string();
+            existing.default_folder = folder;
+            return Ok(());
+        }
+        if self.saved_hosts.len() >= MAX_SAVED_HOSTS {
+            return Err(format!(
+                "at {MAX_SAVED_HOSTS} saved hosts — remove one first"
+            ));
+        }
+        self.saved_hosts.push(SavedHost {
+            name: name.to_string(),
+            host: host.to_string(),
+            default_folder: folder,
+        });
+        Ok(())
+    }
+
+    /// Remove a saved SSH host by `host` or display `name` (SSH picker).
+    /// True when an entry matched (either key compares trimmed); false
+    /// when nothing was saved under `key` — shells surface that as a
+    /// fail-visible "no such host" flash, never a silent no-op.
+    pub fn remove_saved_host(&mut self, key: &str) -> bool {
+        let key = key.trim();
+        if key.is_empty() {
+            return false;
+        }
+        let before = self.saved_hosts.len();
+        self.saved_hosts.retain(|h| h.host != key && h.name != key);
+        self.saved_hosts.len() != before
+    }
+
+    /// Replace the per-host default folder of an already-saved host (SSH
+    /// picker): `None`/blank clears it back to the MRU/home fallback.
+    /// False when `host` is not saved — shells surface that like
+    /// [`Self::remove_saved_host`]; use [`Self::add_saved_host`] for new
+    /// hosts instead of growing the list here.
+    pub fn set_host_default_folder(&mut self, host: &str, folder: Option<&str>) -> bool {
+        let host = host.trim();
+        match self.saved_hosts.iter_mut().find(|h| h.host == host) {
+            Some(saved) => {
+                saved.default_folder = folder
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .map(str::to_string);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Default remote folder for `host` (SSH picker) through the shared
+    /// fallback chain (see `launch::resolve_remote_default_folder`): the
+    /// saved host default wins, then the host MRU head, then `None` (the
+    /// remote login directory / home). Blank hosts resolve to home —
+    /// never an error, never a network touch.
+    pub fn remote_default_folder_for(&self, host: &str) -> Option<String> {
+        let key = host.trim();
+        if key.is_empty() {
+            return None;
+        }
+        let saved = self
+            .saved_hosts
+            .iter()
+            .find(|h| h.host == key)
+            .and_then(|h| h.default_folder.as_deref());
+        let mru = self
+            .remote_folders
+            .get(key)
+            .and_then(|dirs| dirs.first().map(String::as_str));
+        crate::launch::resolve_remote_default_folder(saved, mru)
     }
 }
 
@@ -462,6 +599,107 @@ mod tests {
         assert!(!text.contains("password"));
         assert!(!text.contains("secret"));
         assert!(!text.contains("private_key") && !text.contains("privatekey"));
+    }
+
+    #[test]
+    fn saved_hosts_crud_defaults_cap_and_no_secrets() {
+        // SSH picker: the store starts empty and old files without the
+        // key still load (serde default).
+        let mut cfg = Config::default();
+        assert!(cfg.saved_hosts().is_empty());
+        let old: Config = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
+        assert!(old.saved_hosts().is_empty());
+        // Add trims, stores the per-host default, and updates in place on
+        // a repeated host (rename + folder replace, no duplicate row).
+        cfg.add_saved_host("  prod box ", " dev@jump-box ", Some(" /srv/api "))
+            .unwrap();
+        cfg.add_saved_host("prod", "dev@jump-box", None).unwrap();
+        assert_eq!(cfg.saved_hosts().len(), 1);
+        assert_eq!(cfg.saved_hosts()[0].name, "prod");
+        assert_eq!(cfg.saved_hosts()[0].host, "dev@jump-box");
+        assert_eq!(cfg.saved_hosts()[0].default_folder, None);
+        // Blank defaults clear; unknown hosts never grow the list here.
+        assert!(!cfg.set_host_default_folder("ghost", Some("/x")));
+        assert!(cfg.set_host_default_folder("dev@jump-box", Some("/srv/v2")));
+        assert_eq!(
+            cfg.saved_hosts()[0].default_folder.as_deref(),
+            Some("/srv/v2")
+        );
+        assert!(cfg.set_host_default_folder("dev@jump-box", Some("   ")));
+        assert_eq!(cfg.saved_hosts()[0].default_folder, None);
+        // Blank names/hosts refuse with a message (fail-visible add).
+        assert!(cfg.add_saved_host("  ", "h", None).is_err());
+        assert!(cfg.add_saved_host("n", "  ", None).is_err());
+        // Remove matches host or display name (trimmed); unknown keys and
+        // blanks report false instead of silently succeeding.
+        cfg.add_saved_host("staging", "staging-box", None).unwrap();
+        assert!(cfg.remove_saved_host(" staging-box "));
+        assert!(cfg.remove_saved_host("prod"));
+        assert!(!cfg.remove_saved_host("prod"));
+        assert!(!cfg.remove_saved_host("   "));
+        assert!(cfg.saved_hosts().is_empty());
+        // Bounded: brand-new hosts past the cap refuse, while updates to
+        // an already-saved host still succeed (never silently dropped).
+        for i in 0..crate::config::MAX_SAVED_HOSTS {
+            cfg.add_saved_host(&format!("box {i}"), &format!("box-{i}"), None)
+                .unwrap();
+        }
+        assert!(cfg.add_saved_host("one more", "box-new", None).is_err());
+        assert!(cfg.add_saved_host("renamed", "box-0", None).is_ok());
+        assert_eq!(cfg.saved_hosts().len(), crate::config::MAX_SAVED_HOSTS);
+        // Round-trips; the persisted file carries names/hosts/folders
+        // only — never secrets (no secret field exists on the struct, and
+        // the serialized text proves it).
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+        let text = serde_json::to_string(&cfg).unwrap().to_lowercase();
+        assert!(!text.contains("password"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("private_key") && !text.contains("privatekey"));
+        assert!(!text.contains("passphrase"));
+        // `user@` targets and aliases persist verbatim (ssh resolves them).
+        let mut alias = Config::default();
+        alias.add_saved_host("alias", "my-alias", None).unwrap();
+        alias.add_saved_host("jump", "dev@jump-box", None).unwrap();
+        let back: Config = serde_json::from_str(&serde_json::to_string(&alias).unwrap()).unwrap();
+        assert_eq!(back.saved_hosts()[0].host, "my-alias");
+        assert_eq!(back.saved_hosts()[1].host, "dev@jump-box");
+    }
+
+    #[test]
+    fn remote_default_folder_falls_back_default_then_mru_then_home() {
+        // SSH picker: saved host default wins, then the host MRU head,
+        // then home (None = remote login directory). No network, ever.
+        let mut cfg = Config::default();
+        assert_eq!(cfg.remote_default_folder_for("mybox"), None);
+        assert_eq!(cfg.remote_default_folder_for(""), None);
+        assert_eq!(cfg.remote_default_folder_for("   "), None);
+        cfg.note_remote_launch("mybox", Some("/srv/mru"));
+        assert_eq!(
+            cfg.remote_default_folder_for("mybox").as_deref(),
+            Some("/srv/mru")
+        );
+        cfg.add_saved_host("box", "mybox", Some("/srv/pinned"))
+            .unwrap();
+        assert_eq!(
+            cfg.remote_default_folder_for("  mybox ").as_deref(),
+            Some("/srv/pinned")
+        );
+        // Clearing the saved default falls back to the MRU, not home.
+        assert!(cfg.set_host_default_folder("mybox", None));
+        assert_eq!(
+            cfg.remote_default_folder_for("mybox").as_deref(),
+            Some("/srv/mru")
+        );
+        // Hosts never mix: other hosts still resolve to home.
+        assert_eq!(cfg.remote_default_folder_for("other"), None);
+        // Round-trips through JSON with the rest of the config.
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(
+            back.remote_default_folder_for("mybox").as_deref(),
+            Some("/srv/mru")
+        );
     }
 
     #[test]
