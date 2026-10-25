@@ -274,8 +274,9 @@ struct ContentView: View {
     }
 
     /// One parsed-link row: a direct-tap `Link` for URLs (native
-    /// single-click open, matching the gpui shell's click-to-open rows),
-    /// plain text for non-URL refs. Both carry the copy action.
+    /// single-click open, matching the click-to-open rows in the
+    /// other shells), plain text for non-URL refs. Both carry the
+    /// copy action.
     private func linkRow(_ link: String) -> some View {
         Group {
             if let url = URL(string: link), url.scheme != nil {
