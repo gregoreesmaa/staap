@@ -386,6 +386,45 @@ pub unsafe extern "C" fn staap_clis_json() -> *mut c_char {
     }
 }
 
+/// Owned JSON of the remote CLI catalog for one SSH host (2D launch):
+/// same shape as [`staap_clis_json`], availability probed on the remote
+/// `PATH` via [`launch::detect_remote_clis`]. Null/blank hosts and every
+/// probe failure degrade to the all-listed-none-available catalog, never
+/// null (allocation aside); non-UTF-8 hosts report null with a message.
+/// Free with [`staap_screen_text_free`]. Blocking: one bounded `ssh` round
+/// trip — shells call this off the UI thread when the host is picked, not
+/// on every picker open.
+///
+/// # Safety
+/// `host` must be null or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn staap_remote_clis_json(host: *const c_char) -> *mut c_char {
+    let catalog = if host.is_null() {
+        launch::detect_remote_clis("")
+    } else {
+        match CStr::from_ptr(host).to_str() {
+            Ok(s) => launch::detect_remote_clis(s),
+            Err(_) => {
+                set_error("staap_remote_clis_json: host is not valid UTF-8".to_string());
+                return std::ptr::null_mut();
+            }
+        }
+    };
+    match serde_json::to_string(&catalog) {
+        Ok(doc) => match CString::new(doc) {
+            Ok(s) => s.into_raw(),
+            Err(_) => {
+                set_error("staap_remote_clis_json: catalog contains NUL".to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_error(format!("staap_remote_clis_json: {e:#}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Owned JSON of the persisted folder recents (2D launch): a string array,
 /// MRU-first. Null core yields an empty list, never UB; free with
 /// [`staap_screen_text_free`].
@@ -909,6 +948,205 @@ pub unsafe extern "C" fn staap_run_spawn(
     std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, id_out, n);
     *id_out.add(n) = 0;
     StaapError::Ok.code()
+}
+
+/// Spawn a remote session over SSH and attach it to a new roster row,
+/// under the shared live-run cap. `host` names the SSH host (required:
+/// blank hosts refuse with [`StaapError::Spawn`] before any spawn is
+/// attempted); `remote_cwd` is null (remote login directory) or the
+/// working directory on the host; `cli`/`yolo` follow the
+/// [`staap_run_spawn`] convention. The local PTY runs `ssh -t <host>
+/// <cli…>` (see [`launch::ssh_spawn_command`]) so interactive auth prompts
+/// (password, 2FA, host-key acceptance) surface in the terminal — never
+/// `BatchMode`. The target persists on the row, so restarts redial it,
+/// and per-host folder memory refreshes like the local MRU. On success
+/// the row id is written to `id_out` (up to `id_cap` bytes incl. NUL) and
+/// an [`StaapError::Ok`] code returns; the cap/eviction rule matches
+/// [`staap_run_spawn`].
+///
+/// # Safety
+/// `core` must be a live pointer from [`staap_core_new`]; `id_out` must point
+/// to `id_cap` writable bytes; `host`/`remote_cwd`/`cli` must be null or valid
+/// NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn staap_run_spawn_remote(
+    core: *mut StaapCore,
+    host: *const c_char,
+    remote_cwd: *const c_char,
+    cli: *const c_char,
+    yolo: c_int,
+    cols: u16,
+    rows: u16,
+    id_out: *mut c_char,
+    id_cap: usize,
+) -> c_int {
+    if core.is_null() || id_out.is_null() || id_cap == 0 {
+        set_error("staap_run_spawn_remote: null core or id buffer".to_string());
+        return StaapError::Null.code();
+    }
+    let host_raw = if host.is_null() {
+        ""
+    } else {
+        match CStr::from_ptr(host).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                set_error("staap_run_spawn_remote: host is not valid UTF-8".to_string());
+                return StaapError::Utf8.code();
+            }
+        }
+    };
+    // Blank hosts refuse before any spawn: never emit a bare `ssh ""`.
+    if host_raw.trim().is_empty() {
+        set_error("staap_run_spawn_remote: set an SSH host first".to_string());
+        return StaapError::Spawn.code();
+    }
+    let remote_dir = if remote_cwd.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(remote_cwd).to_str() {
+            Ok(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Err(_) => {
+                set_error("staap_run_spawn_remote: remote_cwd is not valid UTF-8".to_string());
+                return StaapError::Utf8.code();
+            }
+        }
+    };
+    let reg = &mut (*core).reg;
+    if reg.live_count() >= crate::shell_shared::MAX_LIVE_RUNS {
+        match reg.make_room() {
+            Some(title) if !title.is_empty() => {
+                // Reaped room: fall through to the spawn below.
+                let _ = title;
+            }
+            // `Some("")` means under the cap after all (races with
+            // closes); `None` means every live run is still running.
+            Some(_) => {}
+            None => {
+                set_error(format!(
+                    "at {} live runs — close one first",
+                    crate::shell_shared::MAX_LIVE_RUNS
+                ));
+                return StaapError::Spawn.code();
+            }
+        }
+    }
+    // Resolve the inner spawn exactly like `staap_run_spawn` (same CLI/yolo
+    // rule), then wrap it in `SpawnKind::Remote` — one funnel, so the FFI
+    // row and the attached PTY can never desync.
+    let cli_str = if cli.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(cli).to_str() {
+            Ok(s) => Some(s),
+            Err(_) => {
+                set_error("staap_run_spawn_remote: cli is not valid UTF-8".to_string());
+                return StaapError::Utf8.code();
+            }
+        }
+    };
+    let app = &reg.app;
+    let resolved_cli = launch::resolve_effective_cli(
+        cli_str.filter(|s| !s.is_empty()),
+        app.config_last_cli(),
+        app.config_default_cli(),
+        &launch::detect_available_clis(),
+    );
+    let harness = crate::embedded::Harness::from_id(&resolved_cli);
+    let yolo_on = if yolo > 0 {
+        true
+    } else if yolo < 0 {
+        false
+    } else {
+        app.config_yolo_default(harness.id())
+    };
+    let inner = if harness == crate::embedded::Harness::Muse && !yolo_on {
+        // `yolo_on` here is the resolved default/override for this spawn;
+        // the plain-`muse` fast path matches `App::start_launch`.
+        SpawnKind::New
+    } else {
+        SpawnKind::NewOn {
+            harness,
+            yolo: yolo_on,
+        }
+    };
+    let target = crate::launch::SshTarget::new(host_raw.trim().to_string(), remote_dir);
+    let kind = SpawnKind::Remote {
+        inner: Box::new(inner),
+        target: target.clone(),
+    };
+    let (program, args) = app.spawn_command_for(&kind);
+    // The local PTY just inherits its cwd: the remote dir rides inside
+    // the `ssh` command, never in the local spawn.
+    let pty = match EmbeddedPty::spawn_with_cwd(&program, &args, cols, rows, None) {
+        Ok(pty) => pty,
+        Err(e) => {
+            set_error(format!("staap_run_spawn_remote: {e:#}"));
+            return StaapError::Spawn.code();
+        }
+    };
+    // Same memory update as the picker funnel (repeat-last + folder MRU,
+    // plus the per-host remote memory).
+    let selection = crate::launch::LaunchSelection::new_remote(resolved_cli, yolo_on, target);
+    reg.app.start_launch(&selection);
+    let id = reg
+        .app
+        .sessions
+        .last()
+        .map(|s| s.id.clone())
+        .unwrap_or_default();
+    reg.attach(&id.clone(), pty);
+    let bytes = id.as_bytes();
+    let n = bytes.len().min(id_cap - 1);
+    std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, id_out, n);
+    *id_out.add(n) = 0;
+    StaapError::Ok.code()
+}
+
+/// Owned JSON of the persisted remote folder recents for one SSH host
+/// (2D launch): a string array, MRU-first. Null core, null/blank hosts,
+/// and unknown hosts yield an empty list, never UB or network; non-UTF-8
+/// hosts report null with a message. Free with
+/// [`staap_screen_text_free`].
+///
+/// # Safety
+/// `core` must be null or a live pointer from [`staap_core_new`]; `host`
+/// must be null or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn staap_remote_recent_json(
+    core: *const StaapCore,
+    host: *const c_char,
+) -> *mut c_char {
+    let recents: Vec<String> = if core.is_null() || host.is_null() {
+        Vec::new()
+    } else {
+        match CStr::from_ptr(host).to_str() {
+            Ok(s) => (*core).reg.app.config_remote_recents(s).to_vec(),
+            Err(_) => {
+                set_error("staap_remote_recent_json: host is not valid UTF-8".to_string());
+                return std::ptr::null_mut();
+            }
+        }
+    };
+    match serde_json::to_string(&recents) {
+        Ok(doc) => match CString::new(doc) {
+            Ok(s) => s.into_raw(),
+            Err(_) => {
+                set_error("staap_remote_recent_json: recents contain NUL".to_string());
+                std::ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_error(format!("staap_remote_recent_json: {e:#}"));
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Spawn a PTY and attach it to an existing roster row (restart a dead
@@ -1902,6 +2140,7 @@ mod tests {
                 pending_input: String::new(),
                 provider_session_id: None,
                 cwd: None,
+                remote: None,
             }
         }
         let core = StaapCore {
@@ -2113,6 +2352,7 @@ mod tests {
                 pending_input: String::new(),
                 provider_session_id: None,
                 cwd: None,
+                remote: None,
             }
         }
         let core = StaapCore {
@@ -2141,6 +2381,99 @@ mod tests {
                 .into_owned();
             assert!(msg.contains("staap_session_json"), "last_error: {msg:?}");
             assert!(staap_session_json(std::ptr::null(), 0).is_null());
+        }
+    }
+
+    #[test]
+    fn remote_clis_abi_degrades_without_a_probe() {
+        // Remote catalog over FFI: null and blank hosts never touch the
+        // network — every CLI listed, none available, same order as local.
+        use crate::launch::SUPPORTED_CLIS;
+        unsafe {
+            for host in [std::ptr::null(), c"".as_ptr(), c"   ".as_ptr()] {
+                let raw = staap_remote_clis_json(host);
+                assert!(!raw.is_null());
+                let text = CStr::from_ptr(raw).to_string_lossy().into_owned();
+                staap_screen_text_free(raw);
+                let docs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+                let ids: Vec<&str> = docs.iter().map(|d| d["id"].as_str().unwrap()).collect();
+                assert_eq!(ids, SUPPORTED_CLIS);
+                assert!(docs.iter().all(|d| d["available"] == false));
+            }
+        }
+    }
+
+    #[test]
+    fn remote_spawn_refuses_blank_host_and_reports_recents() {
+        // Remote spawn over FFI: null handles are null errors, blank hosts
+        // refuse before any spawn is attempted (no row, no PTY, no `ssh`
+        // process), and per-host recents report without touching the
+        // network. A confirmed remote launch feeds the recents funnel.
+        use crate::launch::{LaunchSelection, SshTarget};
+        unsafe {
+            let out: *mut StaapPty = std::ptr::null_mut();
+            assert_eq!(
+                staap_run_spawn_remote(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    80,
+                    24,
+                    out as *mut c_char,
+                    64,
+                ),
+                StaapError::Null.code()
+            );
+            let mut core = Box::new(StaapCore {
+                reg: crate::runs::RunRegistry::new(vec![]),
+            });
+            let core_ptr: *mut StaapCore = &mut *core;
+            for host in [std::ptr::null(), c"".as_ptr(), c"   ".as_ptr()] {
+                let mut id_buf = [0 as c_char; 64];
+                assert_eq!(
+                    staap_run_spawn_remote(
+                        core_ptr,
+                        host,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        0,
+                        80,
+                        24,
+                        id_buf.as_mut_ptr(),
+                        id_buf.len(),
+                    ),
+                    StaapError::Spawn.code()
+                );
+            }
+            assert!((*core_ptr).reg.app.sessions.is_empty());
+            assert_eq!((*core_ptr).reg.live_count(), 0);
+            for (host, expect) in [
+                (std::ptr::null(), "[]"),
+                (c"".as_ptr(), "[]"),
+                (c"mybox".as_ptr(), "[]"),
+            ] {
+                let raw = staap_remote_recent_json(core_ptr, host);
+                assert!(!raw.is_null());
+                assert_eq!(CStr::from_ptr(raw).to_string_lossy().into_owned(), expect);
+                staap_screen_text_free(raw);
+            }
+            (*core_ptr)
+                .reg
+                .app
+                .start_launch(&LaunchSelection::new_remote(
+                    "muse".to_string(),
+                    false,
+                    SshTarget::new("mybox".to_string(), Some("/srv/api".to_string())),
+                ));
+            let raw = staap_remote_recent_json(core_ptr, c"mybox".as_ptr());
+            assert_eq!(
+                CStr::from_ptr(raw).to_string_lossy().into_owned(),
+                r#"["/srv/api"]"#
+            );
+            staap_screen_text_free(raw);
+            assert_eq!((*core_ptr).reg.app.config_last_host(), Some("mybox"));
         }
     }
 
@@ -2498,6 +2831,7 @@ mod tests {
                 pending_input: String::new(),
                 provider_session_id: None,
                 cwd: None,
+                remote: None,
             });
             staap_pty_free(pty);
             (*core).reg.runs.remove(id);

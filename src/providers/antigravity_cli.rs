@@ -281,6 +281,7 @@ impl Provider for AntigravityCliProvider {
                 title_locked: true,
                 pending_input: String::new(),
                 cwd: None,
+                remote: None,
             });
         }
         out

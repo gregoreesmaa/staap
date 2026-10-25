@@ -157,6 +157,14 @@ pub enum SpawnKind {
         harness: Harness,
         session_id: String,
     },
+    /// Run any of the above on a remote host over SSH: the local PTY runs
+    /// `ssh -t <host> <cli…>` (see [`crate::launch::ssh_spawn_command`])
+    /// instead of the CLI directly. New, additive, and orthogonal —
+    /// existing constructors and matches keep compiling untouched.
+    Remote {
+        inner: Box<SpawnKind>,
+        target: crate::launch::SshTarget,
+    },
 }
 
 impl SpawnKind {
@@ -169,6 +177,9 @@ impl SpawnKind {
                 harness,
                 session_id,
             } => harness.resume_command(session_id),
+            // The inner CLI command (`ssh` wrapping happens in
+            // `App::spawn_command_for`, which owns extra_args + yolo).
+            SpawnKind::Remote { inner, .. } => inner.command(),
         }
     }
 
@@ -180,6 +191,7 @@ impl SpawnKind {
             SpawnKind::NewOn { harness, .. } => *harness,
             SpawnKind::Resume { .. } => Harness::Muse,
             SpawnKind::ResumeOn { harness, .. } => *harness,
+            SpawnKind::Remote { inner, .. } => inner.harness(),
         }
     }
 
@@ -192,8 +204,22 @@ impl SpawnKind {
     pub fn yolo_once(&self) -> bool {
         match self {
             SpawnKind::NewOn { yolo, .. } => *yolo,
+            SpawnKind::Remote { inner, .. } => inner.yolo_once(),
             _ => false,
         }
+    }
+
+    /// Remote target this spawn dials, if any.
+    pub fn remote_target(&self) -> Option<&crate::launch::SshTarget> {
+        match self {
+            SpawnKind::Remote { target, .. } => Some(target),
+            _ => None,
+        }
+    }
+
+    /// True for any remote spawn (local PTY runs `ssh`, not the CLI).
+    pub fn is_remote(&self) -> bool {
+        self.remote_target().is_some_and(|t| t.is_valid())
     }
 }
 
@@ -1019,6 +1045,52 @@ mod tests {
         assert_eq!(Harness::from_id("antigravity"), Harness::Antigravity);
         assert_eq!(Harness::Antigravity.program(), "agy");
         assert_eq!(Harness::Antigravity.yolo_flag(), None);
+    }
+
+    #[test]
+    fn remote_spawn_delegates_inner_command_and_harness() {
+        // `Remote` wraps any inner kind orthogonally: `command()` stays
+        // the local CLI command (the `ssh` wrap lives in
+        // `App::spawn_command_for`), harness/yolo delegate inward, and
+        // local kinds report no target.
+        use crate::launch::SshTarget;
+        let target = SshTarget::new("mybox".to_string(), Some("/srv/api".to_string()));
+        let kind = SpawnKind::Remote {
+            inner: Box::new(SpawnKind::NewOn {
+                harness: Harness::Claude,
+                yolo: true,
+            }),
+            target: target.clone(),
+        };
+        assert_eq!(kind.command(), ("claude".to_string(), Vec::new()));
+        assert_eq!(kind.harness(), Harness::Claude);
+        assert_eq!(kind.cli_id(), "claude");
+        assert!(kind.yolo_once());
+        assert!(kind.is_remote());
+        assert_eq!(kind.remote_target(), Some(&target));
+        let resume = SpawnKind::Remote {
+            inner: Box::new(SpawnKind::Resume {
+                session_id: "s-1".to_string(),
+            }),
+            target,
+        };
+        assert_eq!(
+            resume.command(),
+            (
+                "muse".to_string(),
+                vec!["--resume".to_string(), "s-1".to_string()]
+            )
+        );
+        assert!(!resume.yolo_once());
+        assert!(resume.is_remote());
+        assert!(!SpawnKind::New.is_remote());
+        assert_eq!(SpawnKind::New.remote_target(), None);
+        // Blank hosts never count as remote (fail-visible local fallback).
+        let blank = SpawnKind::Remote {
+            inner: Box::new(SpawnKind::New),
+            target: SshTarget::new("  ".to_string(), None),
+        };
+        assert!(!blank.is_remote());
     }
 
     #[test]

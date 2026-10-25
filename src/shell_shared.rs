@@ -722,6 +722,7 @@ mod tests {
             pending_input: String::new(),
             provider_session_id: None,
             cwd: None,
+            remote: None,
         }
     }
 

@@ -198,6 +198,21 @@ char *staap_effective_cli(const struct StaapCore *core, const char *cli);
 char *staap_clis_json(void);
 
 /**
+ * Owned JSON of the remote CLI catalog for one SSH host (2D launch):
+ * same shape as [`staap_clis_json`], availability probed on the remote
+ * `PATH` via [`launch::detect_remote_clis`]. Null/blank hosts and every
+ * probe failure degrade to the all-listed-none-available catalog, never
+ * null (allocation aside); non-UTF-8 hosts report null with a message.
+ * Free with [`staap_screen_text_free`]. Blocking: one bounded `ssh` round
+ * trip — shells call this off the UI thread when the host is picked, not
+ * on every picker open.
+ *
+ * # Safety
+ * `host` must be null or a valid NUL-terminated C string.
+ */
+char *staap_remote_clis_json(const char *host);
+
+/**
  * Owned JSON of the persisted folder recents (2D launch): a string array,
  * MRU-first. Null core yields an empty list, never UB; free with
  * [`staap_screen_text_free`].
@@ -381,6 +396,49 @@ int staap_run_spawn(struct StaapCore *core,
                     uint16_t rows,
                     char *id_out,
                     uintptr_t id_cap);
+
+/**
+ * Spawn a remote session over SSH and attach it to a new roster row,
+ * under the shared live-run cap. `host` names the SSH host (required:
+ * blank hosts refuse with [`StaapError::Spawn`] before any spawn is
+ * attempted); `remote_cwd` is null (remote login directory) or the
+ * working directory on the host; `cli`/`yolo` follow the
+ * [`staap_run_spawn`] convention. The local PTY runs `ssh -t <host>
+ * <cli…>` (see [`launch::ssh_spawn_command`]) so interactive auth prompts
+ * (password, 2FA, host-key acceptance) surface in the terminal — never
+ * `BatchMode`. The target persists on the row, so restarts redial it,
+ * and per-host folder memory refreshes like the local MRU. On success
+ * the row id is written to `id_out` (up to `id_cap` bytes incl. NUL) and
+ * an [`StaapError::Ok`] code returns; the cap/eviction rule matches
+ * [`staap_run_spawn`].
+ *
+ * # Safety
+ * `core` must be a live pointer from [`staap_core_new`]; `id_out` must point
+ * to `id_cap` writable bytes; `host`/`remote_cwd`/`cli` must be null or valid
+ * NUL-terminated C strings.
+ */
+int staap_run_spawn_remote(struct StaapCore *core,
+                           const char *host,
+                           const char *remote_cwd,
+                           const char *cli,
+                           int yolo,
+                           uint16_t cols,
+                           uint16_t rows,
+                           char *id_out,
+                           uintptr_t id_cap);
+
+/**
+ * Owned JSON of the persisted remote folder recents for one SSH host
+ * (2D launch): a string array, MRU-first. Null core, null/blank hosts,
+ * and unknown hosts yield an empty list, never UB or network; non-UTF-8
+ * hosts report null with a message. Free with
+ * [`staap_screen_text_free`].
+ *
+ * # Safety
+ * `core` must be null or a live pointer from [`staap_core_new`]; `host`
+ * must be null or a valid NUL-terminated C string.
+ */
+char *staap_remote_recent_json(const struct StaapCore *core, const char *host);
 
 /**
  * Spawn a PTY and attach it to an existing roster row (restart a dead

@@ -89,6 +89,125 @@ pub fn detect_with_path(path_value: &std::ffi::OsStr) -> Vec<AvailableCli> {
     out
 }
 
+/// Remote shell snippet probing every supported CLI with `command -v`,
+/// one `id:path` line per CLI (`id:` when missing). Built from
+/// [`SUPPORTED_CLIS`] so the probe and the picker never drift apart.
+pub fn remote_probe_script() -> String {
+    let mut script = String::from("for c in");
+    for id in SUPPORTED_CLIS {
+        script.push(' ');
+        script.push_str(id);
+    }
+    script.push_str(
+        "; do p=$(command -v \"$c\" 2>/dev/null); \
+         if [ -n \"$p\" ]; then printf '%s:%s\\n' \"$c\" \"$p\"; \
+         else printf '%s:\\n' \"$c\"; fi; done",
+    );
+    script
+}
+
+/// `ssh` argv probing `host` for the supported CLIs: no pty (`-T`),
+/// non-interactive (`BatchMode=yes`, so the probe never blocks on a
+/// password prompt), and a short connect timeout. The interactive spawn
+/// path deliberately uses none of these: auth prompts surface in the
+/// terminal there. `host` passes through untouched so system ssh config
+/// (`~/.ssh/config`, `user@`, jump aliases) keeps resolving.
+pub fn remote_probe_command(host: &str) -> (String, Vec<String>) {
+    (
+        "ssh".to_string(),
+        vec![
+            "-T".to_string(),
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "ConnectTimeout=5".to_string(),
+            host.to_string(),
+            remote_probe_script(),
+        ],
+    )
+}
+
+/// Parse one remote probe run into the picker catalog: same rows and order
+/// as [`detect_available_clis`], availability from the remote `PATH`.
+/// Unknown ids are ignored, blank/malformed lines are skipped, the first
+/// hit per id wins, and missing ids stay listed as not installed (never
+/// hidden — same fail-visible rule as the local catalog).
+pub fn parse_remote_probe_output(text: &str) -> Vec<AvailableCli> {
+    use std::collections::HashMap;
+    let mut found: HashMap<&str, Option<String>> = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((id, path)) = line.split_once(':') else {
+            continue;
+        };
+        let id = id.trim();
+        if !SUPPORTED_CLIS.contains(&id) || found.contains_key(id) {
+            continue;
+        }
+        let path = path.trim();
+        found.insert(
+            id,
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            },
+        );
+    }
+    SUPPORTED_CLIS
+        .iter()
+        .map(|id| match found.remove(*id) {
+            Some(Some(path)) => AvailableCli {
+                id: id.to_string(),
+                program: id.to_string(),
+                path: Some(path),
+                available: true,
+            },
+            _ => AvailableCli::missing(id),
+        })
+        .collect()
+}
+
+/// Run the remote probe over `ssh` and parse it. Blank hosts and every
+/// failure (no `ssh` binary, unreachable host, key-only auth without
+/// keys, non-zero exit) degrade to the all-listed-none-available catalog:
+/// discovery never fails, the picker stays usable, and the spawn error
+/// surfaces visibly at launch like a missing local CLI.
+///
+/// Blocking note for shells: this runs one `ssh` round trip (bounded by
+/// the connect timeout in [`remote_probe_command`]). Call it when the
+/// remote host is picked — not on every local picker open — and off the
+/// UI thread, showing [`parse_remote_probe_output`]`("")` meanwhile.
+pub fn detect_remote_clis(host: &str) -> Vec<AvailableCli> {
+    let target = host.trim();
+    if target.is_empty() {
+        return parse_remote_probe_output("");
+    }
+    match run_remote_probe(target) {
+        Some(text) => parse_remote_probe_output(&text),
+        None => parse_remote_probe_output(""),
+    }
+}
+
+/// One `ssh` round trip for [`detect_remote_clis`]: `Some` stdout only on
+/// a zero-exit run, `None` on every failure (spawn error, signal,
+/// non-zero exit). Split from parsing so tests cover the pure half
+/// without touching the network.
+fn run_remote_probe(host: &str) -> Option<String> {
+    let (program, args) = remote_probe_command(host);
+    let out = std::process::Command::new(&program)
+        .args(&args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// First available CLI id, if any (repeat-last / default resolution falls
 /// back to this before the hardcoded `"muse"`).
 pub fn first_available(clis: &[AvailableCli]) -> Option<String> {
@@ -160,21 +279,146 @@ impl YoloChoice {
     }
 }
 
+/// Remote SSH target for a launch: one manually entered host, resolved
+/// entirely through the user's own ssh setup (`~/.ssh/config`, agents,
+/// `user@` prefixes, jump aliases all keep working untouched).
+///
+/// No daemon, no stored secrets: the local PTY runs `ssh <host> <cli…>`
+/// and interactive auth prompts (password, 2FA, host-key acceptance)
+/// surface in that terminal. Only the host name and the remote folder
+/// persist (see `config::Config::remote_folders`); passwords and keys
+/// never touch staap state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshTarget {
+    /// Manual host as typed (`mybox`, `dev@jump-box`, an ssh-config alias).
+    pub host: String,
+    /// Working directory on the remote host (`None` = the remote login
+    /// directory). Encoded into the remote command (`cd … && exec …`),
+    /// never into the local PTY's cwd.
+    #[serde(default)]
+    pub remote_cwd: Option<String>,
+}
+
+impl SshTarget {
+    pub fn new(host: String, remote_cwd: Option<String>) -> Self {
+        Self { host, remote_cwd }
+    }
+
+    /// True when there is a host to dial (blank input means "not remote").
+    pub fn is_valid(&self) -> bool {
+        !self.host.trim().is_empty()
+    }
+
+    /// Host with surrounding whitespace removed (what `ssh` receives).
+    pub fn normalized_host(&self) -> String {
+        self.host.trim().to_string()
+    }
+}
+
+/// Quote one shell word for the remote `cd … && exec …` snippet:
+/// single-quote wrap with embedded quotes escaped (`'` → `'"'"'`).
+fn shell_quote(word: &str) -> String {
+    let mut out = String::with_capacity(word.len() + 2);
+    out.push('\'');
+    out.push_str(&word.replace('\'', "'\"'\"'"));
+    out.push('\'');
+    out
+}
+
+/// Build the interactive spawn `(program, args)` for a remote target over
+/// an already-resolved inner CLI command: `ssh -t <host> <cli> <args…>`.
+/// `-t` forces a remote pty so interactive auth prompts and the agent
+/// TUI render; the probe-only flags (`-T`, `BatchMode=yes`,
+/// `ConnectTimeout`) deliberately stay on [`remote_probe_command`], never
+/// here — a spawn must surface auth, never fail it silently. With a remote
+/// folder the command becomes `ssh -t <host> 'cd <dir> && exec <cli> …'`
+/// (one remote-shell snippet: `ssh` joins argv into one remote shell
+/// anyway). A blank host falls back to the inner command unchanged (never
+/// emit a bare `ssh ""`); shells validate the host before spawning.
+pub fn ssh_spawn_command(
+    target: &SshTarget,
+    inner_program: &str,
+    inner_args: &[String],
+) -> (String, Vec<String>) {
+    let host = target.normalized_host();
+    if host.is_empty() {
+        return (inner_program.to_string(), inner_args.to_vec());
+    }
+    let dir = target
+        .remote_cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    match dir {
+        None => {
+            let mut args = Vec::with_capacity(inner_args.len() + 2);
+            args.push("-t".to_string());
+            args.push(host);
+            args.push(inner_program.to_string());
+            args.extend(inner_args.iter().cloned());
+            ("ssh".to_string(), args)
+        }
+        Some(dir) => {
+            let mut snippet = String::from("cd ");
+            snippet.push_str(&shell_quote(dir));
+            snippet.push_str(" && exec ");
+            snippet.push_str(&shell_quote(inner_program));
+            for arg in inner_args {
+                snippet.push(' ');
+                snippet.push_str(&shell_quote(arg));
+            }
+            ("ssh".to_string(), vec!["-t".to_string(), host, snippet])
+        }
+    }
+}
+
 /// A confirmed 2D launch: where the child spawns, with what, how freely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSelection {
     pub cli: String,
     pub cwd: Option<String>,
     pub yolo: bool,
+    /// Remote SSH target (`None` = local spawn). Remote runs keep the
+    /// local `cwd` empty (the local PTY just inherits) and carry the
+    /// folder on the target instead (see [`SshTarget::remote_cwd`]).
+    pub remote: Option<SshTarget>,
 }
 
 impl LaunchSelection {
     pub fn new(cli: String, cwd: Option<String>, yolo: bool) -> Self {
-        Self { cli, cwd, yolo }
+        Self {
+            cli,
+            cwd,
+            yolo,
+            remote: None,
+        }
+    }
+
+    /// Remote launch: local `cwd` stays empty, the folder rides on the
+    /// target. Blank hosts still construct (validation lives at spawn).
+    pub fn new_remote(cli: String, yolo: bool, remote: SshTarget) -> Self {
+        Self {
+            cli,
+            cwd: None,
+            yolo,
+            remote: Some(remote),
+        }
+    }
+
+    /// Builder for attaching a remote target to a local selection.
+    pub fn with_remote(mut self, remote: SshTarget) -> Self {
+        self.remote = Some(remote);
+        self
+    }
+
+    /// True when this launch dials a remote host.
+    pub fn is_remote(&self) -> bool {
+        self.remote.as_ref().is_some_and(|t| t.is_valid())
     }
 
     /// One-line spawn preview for the picker + status flash
-    /// (`muse --yolo in ~/api`), so the launch is verifiable before it runs.
+    /// (`muse --yolo in ~/api`, remote `ssh mybox: muse --yolo in ~/api`),
+    /// so the launch is verifiable before it runs.
     pub fn preview(&self) -> String {
         let mut cmd = self.cli.clone();
         if self.yolo {
@@ -183,9 +427,23 @@ impl LaunchSelection {
                 cmd.push_str(flag);
             }
         }
-        match &self.cwd {
+        let local = match &self.cwd {
             Some(dir) => format!("{cmd} in {dir}"),
             None => cmd,
+        };
+        match &self.remote {
+            Some(target) if target.is_valid() => {
+                let dir = target
+                    .remote_cwd
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty());
+                match dir {
+                    Some(dir) => format!("ssh {}: {local} in {dir}", target.normalized_host()),
+                    None => format!("ssh {}: {local}", target.normalized_host()),
+                }
+            }
+            _ => local,
         }
     }
 }
@@ -352,6 +610,9 @@ impl LaunchPicker {
             cli: self.selected_cli().id.clone(),
             cwd: crate::app::expand_cwd_input(&self.folder_input),
             yolo: self.yolo.resolve(yolo_default),
+            // The local picker stays local: remote targets arrive via
+            // `new_remote` / `with_remote` (shells with a host field).
+            remote: None,
         }
     }
 
@@ -611,6 +872,198 @@ mod tests {
         picker.folder_focus = true;
         assert!(picker.key("down", None, false, false));
         assert_eq!(picker.folder_input, "/tmp");
+    }
+
+    #[test]
+    fn remote_probe_command_names_ssh_with_bounded_noninteractive_opts() {
+        let (program, args) = remote_probe_command("mybox");
+        assert_eq!(program, "ssh");
+        // No pty, no password prompts, bounded connect: the probe never
+        // hangs the picker on auth the way an interactive spawn may.
+        assert!(args.contains(&"-T".to_string()));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        assert!(args.contains(&"mybox".to_string()));
+        // The remote script covers every supported CLI with `command -v`.
+        let script = args.last().unwrap();
+        for id in SUPPORTED_CLIS {
+            assert!(script.contains(id), "probe script covers {id}");
+        }
+        assert!(script.contains("command -v"));
+        // The host passes through untouched (user@, ssh-config aliases).
+        let (_, alias_args) = remote_probe_command("dev@jump-box");
+        assert!(alias_args.contains(&"dev@jump-box".to_string()));
+    }
+
+    #[test]
+    fn remote_probe_output_parses_per_host_availability_in_order() {
+        let out = "muse:/usr/local/bin/muse\nclaude:\nopencode:/home/u/.local/bin/opencode\ncodex:/usr/bin/codex\n";
+        let clis = parse_remote_probe_output(out);
+        let ids: Vec<&str> = clis.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, SUPPORTED_CLIS);
+        assert!(clis[0].available);
+        assert_eq!(clis[0].path.as_deref(), Some("/usr/local/bin/muse"));
+        assert!(!clis[1].available);
+        assert_eq!(clis[1].path, None);
+        assert!(clis[2].available);
+        assert!(clis[3].available);
+    }
+
+    #[test]
+    fn remote_probe_output_ignores_noise_and_keeps_first_hit() {
+        // Banners, unknown ids, blanks, and malformed lines never leak
+        // into the catalog; duplicates keep the first hit.
+        let out = "Warning: Permanently added 'mybox' (ED25519).\n\
+                   future:/opt/future/bin/cli\n\
+                   muse:/bin/muse\n\
+                   not-a-pair\n\
+                   muse:/other/muse\n\
+                   claude:  \n";
+        let clis = parse_remote_probe_output(out);
+        assert_eq!(clis[0].path.as_deref(), Some("/bin/muse"));
+        assert!(!clis[1].available);
+        assert!(!clis[2].available);
+        assert!(!clis[3].available);
+    }
+
+    #[test]
+    fn remote_probe_empty_host_and_output_degrade_to_all_listed() {
+        // Blank hosts never spawn ssh: the catalog still lists every CLI
+        // as not installed, so the picker stays usable and fail-visible.
+        for clis in [
+            detect_remote_clis(""),
+            detect_remote_clis("   "),
+            parse_remote_probe_output(""),
+        ] {
+            let ids: Vec<&str> = clis.iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(ids, SUPPORTED_CLIS);
+            assert!(clis.iter().all(|c| !c.available && c.path.is_none()));
+        }
+    }
+
+    #[test]
+    fn ssh_target_validates_and_normalizes_host() {
+        let t = SshTarget::new("  dev@jump-box ".to_string(), None);
+        assert!(t.is_valid());
+        assert_eq!(t.normalized_host(), "dev@jump-box");
+        assert!(!SshTarget::new("".to_string(), None).is_valid());
+        assert!(!SshTarget::new("   ".to_string(), None).is_valid());
+        // Host-only target: no remote dir means the remote login directory.
+        assert_eq!(t.remote_cwd, None);
+        // Serde round-trip; old files without `remote_cwd` still load.
+        let back: SshTarget = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back, t);
+        let legacy: SshTarget = serde_json::from_str(r#"{"host":"mybox"}"#).unwrap();
+        assert_eq!(legacy.remote_cwd, None);
+    }
+
+    #[test]
+    fn ssh_spawn_wraps_inner_command_without_probe_flags() {
+        let inner = vec!["--yolo".to_string()];
+        // No remote dir: plain `ssh -t <host> <cli> <args…>`.
+        let (program, args) =
+            ssh_spawn_command(&SshTarget::new("mybox".to_string(), None), "muse", &inner);
+        assert_eq!(program, "ssh");
+        assert_eq!(args, vec!["-t", "mybox", "muse", "--yolo"]);
+        // Interactive auth must surface: none of the probe-only flags
+        // (`-T`, `BatchMode=yes`, timeouts) ride the spawn.
+        assert!(!args.iter().any(|a| a.contains("BatchMode")));
+        assert!(!args.iter().any(|a| a == "-T"));
+        assert!(!args.iter().any(|a| a.contains("ConnectTimeout")));
+        // Host passes through untouched (user@, ssh-config aliases).
+        let (_, alias_args) = ssh_spawn_command(
+            &SshTarget::new("dev@jump-box".to_string(), None),
+            "claude",
+            &[],
+        );
+        assert_eq!(alias_args, vec!["-t", "dev@jump-box", "claude"]);
+        // Yolo/extra args stay on the inner CLI, never interpreted by ssh.
+        let (_, codex_args) = ssh_spawn_command(
+            &SshTarget::new("mybox".to_string(), None),
+            "codex",
+            &["--dangerously-bypass-approvals-and-sandbox".to_string()],
+        );
+        assert_eq!(
+            codex_args,
+            vec![
+                "-t",
+                "mybox",
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox"
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_spawn_encodes_remote_dir_as_cd_exec_snippet() {
+        let inner = vec!["--yolo".to_string()];
+        let (program, args) = ssh_spawn_command(
+            &SshTarget::new("mybox".to_string(), Some("/srv/api".to_string())),
+            "muse",
+            &inner,
+        );
+        assert_eq!(program, "ssh");
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], "-t");
+        assert_eq!(args[1], "mybox");
+        assert_eq!(args[2], "cd '/srv/api' && exec 'muse' '--yolo'");
+        // Quoting survives spaces and single quotes in dir and args.
+        let (_, quoted) = ssh_spawn_command(
+            &SshTarget::new("mybox".to_string(), Some("/srv/my api's".to_string())),
+            "muse",
+            &["it's".to_string()],
+        );
+        assert_eq!(
+            quoted[2],
+            "cd '/srv/my api'\"'\"'s' && exec 'muse' 'it'\"'\"'s'"
+        );
+        // Blank remote dir behaves like no dir (remote login directory).
+        let (_, blank) = ssh_spawn_command(
+            &SshTarget::new("mybox".to_string(), Some("   ".to_string())),
+            "muse",
+            &[],
+        );
+        assert_eq!(blank, vec!["-t", "mybox", "muse"]);
+    }
+
+    #[test]
+    fn ssh_spawn_blank_host_falls_back_to_inner_command() {
+        // Never emit a bare `ssh ""`: shells validate first, and the core
+        // degrades to the local command instead of a broken spawn.
+        let inner = vec!["--yolo".to_string()];
+        let (program, args) =
+            ssh_spawn_command(&SshTarget::new("   ".to_string(), None), "muse", &inner);
+        assert_eq!(program, "muse");
+        assert_eq!(args, inner);
+    }
+
+    #[test]
+    fn selection_preview_names_remote_host_and_dir() {
+        // Local selections preview exactly as before (no `ssh:` prefix).
+        let local = LaunchSelection::new("muse".to_string(), Some("/tmp/api".to_string()), true);
+        assert_eq!(local.preview(), "muse --yolo in /tmp/api");
+        assert!(!local.is_remote());
+        // Remote: `ssh host: cli in dir`; yolo flag still names the inner CLI.
+        let remote = LaunchSelection::new_remote(
+            "muse".to_string(),
+            true,
+            SshTarget::new("mybox".to_string(), Some("/srv/api".to_string())),
+        );
+        assert_eq!(remote.preview(), "ssh mybox: muse --yolo in /srv/api");
+        assert!(remote.is_remote());
+        assert_eq!(remote.cwd, None);
+        // No remote dir: the remote login directory, no `in` suffix.
+        let nodir = LaunchSelection::new_remote(
+            "claude".to_string(),
+            false,
+            SshTarget::new("mybox".to_string(), None),
+        );
+        assert_eq!(nodir.preview(), "ssh mybox: claude");
+        // Blank host is not remote: preview stays local and fail-visible.
+        let blank = LaunchSelection::new("muse".to_string(), None, false)
+            .with_remote(SshTarget::new("  ".to_string(), None));
+        assert!(!blank.is_remote());
+        assert_eq!(blank.preview(), "muse");
     }
 
     #[test]

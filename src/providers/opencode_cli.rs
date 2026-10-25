@@ -205,6 +205,7 @@ impl Provider for OpencodeCliProvider {
                 title_locked: true,
                 pending_input: String::new(),
                 cwd: None,
+                remote: None,
             });
         }
         out
@@ -418,6 +419,7 @@ fi
             pending_input: String::new(),
             provider_session_id: None,
             cwd: None,
+            remote: None,
         };
         assert!(!p.hydrate(&mut muse_row));
         assert!(muse_row.transcript.is_empty());

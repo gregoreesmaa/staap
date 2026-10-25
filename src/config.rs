@@ -74,6 +74,19 @@ pub struct Config {
     /// display (never blocking launch on a stale entry).
     #[serde(default)]
     pub recent_folders: Vec<String>,
+    /// Last remote SSH host typed in the picker (2D launch): preselects
+    /// the host axis like `last_cli` does for CLIs. Host names only —
+    /// passwords, keys, and passphrases never touch this file (auth rides
+    /// the user's own ssh setup: config, agent, interactive prompts).
+    #[serde(default)]
+    pub last_host: Option<String>,
+    /// Most-recently-used remote folders per SSH host (2D launch):
+    /// host → MRU-first remote dirs, each capped at
+    /// `launch::MAX_RECENT_FOLDERS`. Same bounded-display rule as
+    /// `recent_folders`, keyed by host so `mybox:/srv/api` and
+    /// `other:/srv/api` never mix.
+    #[serde(default)]
+    pub remote_folders: HashMap<String, Vec<String>>,
 }
 
 /// Default terminal-pane font: OFL-licensed, full box-drawing + block
@@ -245,6 +258,8 @@ impl Default for Config {
             default_cwd: None,
             last_cli: None,
             recent_folders: Vec::new(),
+            last_host: None,
+            remote_folders: HashMap::new(),
         }
     }
 }
@@ -314,6 +329,36 @@ impl Config {
             crate::launch::push_recent_folder(&mut self.recent_folders, dir);
         }
     }
+
+    /// Record a confirmed remote launch (2D launch): last-used host plus
+    /// the per-host folder MRU. Host keys are trimmed (so ` mybox ` and
+    /// `mybox` share one memory); blank hosts record nothing. Called by
+    /// the spawn path alongside [`Self::note_launch`].
+    pub fn note_remote_launch(&mut self, host: &str, remote_cwd: Option<&str>) {
+        let host = host.trim();
+        if host.is_empty() {
+            return;
+        }
+        self.last_host = Some(host.to_string());
+        if let Some(dir) = remote_cwd {
+            let entry = self.remote_folders.entry(host.to_string()).or_default();
+            crate::launch::push_recent_folder(entry, dir);
+        }
+    }
+
+    /// MRU-first remote folders for `host` (2D launch): what the picker
+    /// offers on the folder axis once a host is picked. Empty for unknown
+    /// or blank hosts — never an error, never a network touch.
+    pub fn remote_recents_for(&self, host: &str) -> &[String] {
+        let host = host.trim();
+        if host.is_empty() {
+            return &[];
+        }
+        self.remote_folders
+            .get(host)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +418,50 @@ mod tests {
         let old: Config = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
         assert_eq!(old.default_cli, None);
         assert!(old.recent_folders.is_empty());
+    }
+
+    #[test]
+    fn remote_memory_tracks_host_and_per_host_folder_mru() {
+        // 2D remote launch: every confirmed spawn refreshes the last host
+        // plus the per-host folder MRU — capped, deduped, host-trimmed —
+        // with no secrets anywhere in the persisted file.
+        let mut cfg = Config::default();
+        assert_eq!(cfg.last_host, None);
+        assert!(cfg.remote_recents_for("mybox").is_empty());
+        cfg.note_remote_launch("  mybox ", Some("/srv/api"));
+        assert_eq!(cfg.last_host.as_deref(), Some("mybox"));
+        assert_eq!(cfg.remote_recents_for("mybox"), vec!["/srv/api"]);
+        // Hosts never mix folders.
+        cfg.note_remote_launch("other", Some("/srv/api"));
+        assert_eq!(cfg.last_host.as_deref(), Some("other"));
+        assert_eq!(cfg.remote_recents_for("other"), vec!["/srv/api"]);
+        assert_eq!(cfg.remote_recents_for("mybox"), vec!["/srv/api"]);
+        // Dedupes, ignores blanks, caps per host — and blank hosts record
+        // nothing at all.
+        cfg.note_remote_launch("mybox", Some("/srv/api"));
+        cfg.note_remote_launch("mybox", Some("   "));
+        assert_eq!(cfg.remote_recents_for("mybox"), vec!["/srv/api"]);
+        cfg.note_remote_launch("   ", Some("/srv/x"));
+        assert!(cfg.remote_recents_for("").is_empty());
+        for i in 0..20 {
+            cfg.note_remote_launch("mybox", Some(&format!("/d{i}")));
+        }
+        assert_eq!(
+            cfg.remote_recents_for("mybox").len(),
+            crate::launch::MAX_RECENT_FOLDERS
+        );
+        assert_eq!(cfg.remote_recents_for("mybox")[0], "/d19");
+        // Round-trips; old files without the keys still load empty.
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+        let old: Config = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
+        assert_eq!(old.last_host, None);
+        assert!(old.remote_folders.is_empty());
+        // The persisted file carries hosts and dirs only — never secrets.
+        let text = serde_json::to_string(&cfg).unwrap().to_lowercase();
+        assert!(!text.contains("password"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("private_key") && !text.contains("privatekey"));
     }
 
     #[test]

@@ -173,6 +173,13 @@ pub struct ChatSession {
     /// save/load with the rest of run state (local-only, plain file).
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Remote SSH target for runs started over SSH (`None` = local).
+    /// Persisted with the rest of run state so restarts redial the same
+    /// host and folder; serde-defaulted so older files load as local.
+    /// Host + folder only — never credentials (see
+    /// [`crate::launch::SshTarget`]).
+    #[serde(default)]
+    pub remote: Option<crate::launch::SshTarget>,
 }
 
 impl ChatSession {
@@ -532,6 +539,17 @@ impl App {
         &self.config.recent_folders
     }
 
+    /// Last remote SSH host typed in the picker, if any (2D launch).
+    pub fn config_last_host(&self) -> Option<&str> {
+        self.config.last_host.as_deref()
+    }
+
+    /// MRU-first remote folders for `host` (2D launch): what the picker
+    /// offers on the folder axis once a host is picked.
+    pub fn config_remote_recents(&self, host: &str) -> &[String] {
+        self.config.remote_recents_for(host)
+    }
+
     /// Test helper: seed folder recents (production reaches them through
     /// confirmed launches via `note_launch`).
     #[cfg(test)]
@@ -609,12 +627,28 @@ impl App {
     /// deduped against an identical user-configured `extra_args` entry so
     /// enabling yolo twice never doubles the flag.
     pub fn spawn_command_for(&self, kind: &SpawnKind) -> (String, Vec<String>) {
+        let (program, args) = self.local_command_for(kind);
+        // Remote spawns wrap the fully resolved inner CLI command
+        // (extra_args + yolo already applied above, so they ride the
+        // inner CLI — never interpreted by `ssh` itself).
+        match kind.remote_target() {
+            Some(target) => crate::launch::ssh_spawn_command(target, &program, &args),
+            None => (program, args),
+        }
+    }
+
+    /// Spawn command for a local `kind`: the CLI program plus the
+    /// configured per-agent extra flags (issue #33) plus the yolo
+    /// default/override (2D launch). Remote kinds resolve through their
+    /// inner kind here; [`Self::spawn_command_for`] adds the `ssh` wrap.
+    fn local_command_for(&self, kind: &SpawnKind) -> (String, Vec<String>) {
         let (program, mut args) = kind.command();
         args.extend(self.config.extra_args_for(&program));
         let yolo_on = match kind {
             SpawnKind::NewOn { harness, yolo } => {
                 *yolo || self.config.yolo_default_for(harness.id())
             }
+            SpawnKind::Remote { inner, .. } => self.local_yolo_for(inner),
             _ => self.config.yolo_default_for(&program),
         };
         if yolo_on {
@@ -625,6 +659,18 @@ impl App {
             }
         }
         (program, args)
+    }
+
+    /// Yolo resolution for a kind nested inside [`SpawnKind::Remote`]:
+    /// same rule as the top level, one step inward.
+    fn local_yolo_for(&self, kind: &SpawnKind) -> bool {
+        match kind {
+            SpawnKind::NewOn { harness, yolo } => {
+                *yolo || self.config.yolo_default_for(harness.id())
+            }
+            SpawnKind::Remote { inner, .. } => self.local_yolo_for(inner),
+            _ => self.config.yolo_default_for(kind.cli_id()),
+        }
     }
 
     /// One-line spawn description for UI affordances (`muse --yolo`).
@@ -797,7 +843,8 @@ impl App {
     /// everything else as `muse --resume <id>`.
     pub fn respawn_kind(&self, run_id: &str) -> SpawnKind {
         use crate::embedded::Harness;
-        match self.sessions.iter().find(|s| s.id == run_id) {
+        let session = self.sessions.iter().find(|s| s.id == run_id);
+        let inner = match session {
             Some(s) if s.provider_session_id.is_some() => {
                 let session_id = s.provider_session_id.clone().unwrap_or_default();
                 match Harness::from_id(&s.harness) {
@@ -809,6 +856,17 @@ impl App {
                 }
             }
             _ => SpawnKind::New,
+        };
+        // Remote rows redial the same host and folder: the restart kind
+        // carries the stored target, so every spawn seam (in-process
+        // retry, FFI `staap_run_restart`) resumes over SSH without
+        // per-shell logic.
+        match session.and_then(|s| s.remote.clone()) {
+            Some(target) if target.is_valid() => SpawnKind::Remote {
+                inner: Box::new(inner),
+                target,
+            },
+            _ => inner,
         }
     }
 
@@ -961,11 +1019,14 @@ impl App {
     }
 
     /// Create a new live-run entry from a confirmed 2D [`LaunchSelection`]
-    /// (folder × CLI + yolo): records the harness, queues the spawn kind,
-    /// and notes the launch for repeat-last memory + folder MRU. This is
-    /// the single funnel every new-run path uses (`n`, `+ New`, picker).
-    /// Unknown CLI ids fall back to the historic muse harness (same rule
-    /// as [`crate::embedded::Harness::from_id`]), never a broken row.
+    /// (folder × CLI + yolo, optionally remote). It records the harness,
+    /// queues the spawn kind, and notes the launch for repeat-last memory
+    /// and folder MRU, funneling every new-run path (`n`, `+ New`, picker)
+    /// through one place. Unknown CLI ids fall back to the historic muse
+    /// harness (same rule as [`crate::embedded::Harness::from_id`]), never
+    /// a broken row. Remote selections wrap the kind in
+    /// [`SpawnKind::Remote`] (so the local PTY runs `ssh`) and persist
+    /// the target on the row for restarts.
     pub fn start_launch(&mut self, selection: &crate::launch::LaunchSelection) {
         use crate::embedded::Harness;
         let harness = if crate::launch::SUPPORTED_CLIS.contains(&selection.cli.as_str()) {
@@ -973,7 +1034,7 @@ impl App {
         } else {
             Harness::Muse
         };
-        let kind = if harness == Harness::Muse && !selection.yolo {
+        let inner = if harness == Harness::Muse && !selection.yolo {
             SpawnKind::New
         } else {
             SpawnKind::NewOn {
@@ -981,15 +1042,31 @@ impl App {
                 yolo: selection.yolo,
             }
         };
+        // A blank host is not a remote launch: fall through to the local
+        // kind (fail-visible) instead of queueing a bare `ssh ""`.
+        let remote = selection.remote.clone().filter(|t| t.is_valid());
+        let kind = match remote.clone() {
+            Some(target) => SpawnKind::Remote {
+                inner: Box::new(inner),
+                target,
+            },
+            None => inner,
+        };
         let cli = harness.id().to_string();
         self.next_run += 1;
         let n = self.next_run;
+        // The row label names the folder the agent works in: the local
+        // pick when set, else the remote dir, else the app directory.
+        let project_dir = selection
+            .cwd
+            .as_deref()
+            .or_else(|| remote.as_ref().and_then(|t| t.remote_cwd.as_deref()));
         self.sessions.push(ChatSession {
             // UUID row key (issue #54): never reused, so a restart can
             // never mint an id that collides with a persisted row.
             id: new_session_id(),
             title: animal_name(n),
-            project: project_name_for(selection.cwd.as_deref()),
+            project: project_name_for(project_dir),
             // A fresh run has produced no output yet, so it reads Idle
             // until the pump sees activity (issues #103/#105).
             status: Status::Idle,
@@ -1004,20 +1081,29 @@ impl App {
             title_locked: false,
             pending_input: String::new(),
             cwd: selection.cwd.clone(),
+            remote,
         });
         self.selected = self.sessions.len() - 1;
         self.pending_spawn = Some(kind);
         self.focus = Focus::Terminal;
         self.config.note_launch(&cli, selection.cwd.as_deref());
+        if let Some(target) = selection.remote.as_ref().filter(|t| t.is_valid()) {
+            self.config
+                .note_remote_launch(&target.host, target.remote_cwd.as_deref());
+        }
     }
 
     /// Working directory recorded on `run_id`, if the session picked one
     /// (issue #48). The spawn seam reads this so every backend launches
-    /// in the chosen folder without per-backend handling.
+    /// in the chosen folder without per-backend handling. Remote rows
+    /// report `None`: the local PTY just inherits while the remote folder
+    /// rides inside the `ssh` command (see
+    /// [`crate::launch::ssh_spawn_command`]).
     pub fn session_cwd(&self, run_id: &str) -> Option<std::path::PathBuf> {
         self.sessions
             .iter()
             .find(|s| s.id == run_id)
+            .filter(|s| s.remote.as_ref().is_none_or(|t| !t.is_valid()))
             .and_then(|s| s.cwd.as_deref())
             .map(std::path::PathBuf::from)
     }
@@ -1085,6 +1171,7 @@ mod tests {
             title_locked: true,
             pending_input: String::new(),
             cwd: None,
+            remote: None,
         }
     }
 
@@ -1312,6 +1399,173 @@ mod tests {
         assert_eq!(dir_name("C:\\projects\\baseui").as_deref(), Some("baseui"));
         assert_eq!(dir_name("/").as_deref(), None);
         assert_eq!(dir_name("").as_deref(), None);
+    }
+
+    #[test]
+    fn start_launch_remote_queues_ssh_wrap_and_records_row() {
+        use crate::embedded::Harness;
+        use crate::launch::{LaunchSelection, SshTarget};
+        let mut app = App::new(vec![]);
+        let sel = LaunchSelection::new_remote(
+            "claude".to_string(),
+            true,
+            SshTarget::new("mybox".to_string(), Some("/srv/api".to_string())),
+        );
+        app.start_launch(&sel);
+        assert_eq!(app.sessions.len(), 1);
+        let row = &app.sessions[0];
+        // The target persists on the row; the local cwd stays empty (the
+        // local PTY just inherits) while the label names the remote dir.
+        assert_eq!(
+            row.remote,
+            Some(SshTarget::new(
+                "mybox".to_string(),
+                Some("/srv/api".to_string())
+            ))
+        );
+        assert_eq!(row.cwd, None);
+        assert_eq!(row.project, "api");
+        assert_eq!(
+            app.take_pending_spawn(),
+            Some(SpawnKind::Remote {
+                inner: Box::new(SpawnKind::NewOn {
+                    harness: Harness::Claude,
+                    yolo: true,
+                }),
+                target: SshTarget::new("mybox".to_string(), Some("/srv/api".to_string())),
+            })
+        );
+        // Per-host memory refreshes alongside the CLI/folder memory.
+        assert_eq!(app.config.last_host.as_deref(), Some("mybox"));
+        assert_eq!(
+            app.config.remote_recents_for("mybox"),
+            vec!["/srv/api".to_string()]
+        );
+        // `respawn_kind` for a live row renews fresh (`New`, the same rule
+        // as local rows): the wrap still dials the stored host and dir,
+        // with no probe-only flags.
+        let id = app.sessions.last().map(|s| s.id.clone()).unwrap();
+        let (program, args) = app.spawn_command_for(&app.respawn_kind(&id));
+        assert_eq!(program, "ssh");
+        assert_eq!(args, vec!["-t", "mybox", "cd '/srv/api' && exec 'muse'"]);
+        assert!(!args.iter().any(|a| a.contains("BatchMode")));
+    }
+
+    #[test]
+    fn spawn_command_for_remote_wraps_inner_with_yolo_and_extra_args() {
+        use crate::config::{AgentConfig, Config};
+        use crate::embedded::Harness;
+        use crate::launch::SshTarget;
+        let mut app = App::new(vec![]);
+        let mut cfg = Config::default();
+        cfg.agents.insert(
+            "muse".to_string(),
+            AgentConfig {
+                extra_args: vec!["--foo".to_string()],
+                yolo: false,
+            },
+        );
+        app.set_config(cfg);
+        let kind = SpawnKind::Remote {
+            inner: Box::new(SpawnKind::NewOn {
+                harness: Harness::Muse,
+                yolo: true,
+            }),
+            target: SshTarget::new("mybox".to_string(), None),
+        };
+        // extra_args + the canonical yolo flag ride the inner CLI; the
+        // outer program is `ssh -t <host>` with no BatchMode.
+        let (program, args) = app.spawn_command_for(&kind);
+        assert_eq!(program, "ssh");
+        assert_eq!(args, vec!["-t", "mybox", "muse", "--foo", "--yolo"]);
+        // With a remote dir the inner command folds into a cd/exec snippet.
+        let dir_kind = SpawnKind::Remote {
+            inner: Box::new(SpawnKind::New),
+            target: SshTarget::new("mybox".to_string(), Some("/srv/api".to_string())),
+        };
+        let (program, args) = app.spawn_command_for(&dir_kind);
+        assert_eq!(program, "ssh");
+        assert_eq!(
+            args,
+            vec!["-t", "mybox", "cd '/srv/api' && exec 'muse' '--foo'"]
+        );
+        // Local kinds are untouched by the wrap.
+        let (program, args) = app.spawn_command_for(&SpawnKind::New);
+        assert_eq!(program, "muse");
+        assert_eq!(args, vec!["--foo".to_string()]);
+    }
+
+    #[test]
+    fn respawn_kind_preserves_remote_target_for_restarts() {
+        use crate::launch::SshTarget;
+        let mut app = App::new(vec![sess("a", Status::Idle, 1)]);
+        // Historic remote row (provider session known): resume over SSH.
+        app.sessions[0].provider_session_id = Some("s-9".into());
+        app.sessions[0].remote = Some(SshTarget::new(
+            "mybox".to_string(),
+            Some("/srv/api".to_string()),
+        ));
+        assert_eq!(
+            app.respawn_kind("a"),
+            SpawnKind::Remote {
+                inner: Box::new(SpawnKind::Resume {
+                    session_id: "s-9".into()
+                }),
+                target: SshTarget::new("mybox".to_string(), Some("/srv/api".to_string())),
+            }
+        );
+        // Live remote row (no provider session): fresh spawn over SSH.
+        app.sessions[0].provider_session_id = None;
+        assert_eq!(
+            app.respawn_kind("a"),
+            SpawnKind::Remote {
+                inner: Box::new(SpawnKind::New),
+                target: SshTarget::new("mybox".to_string(), Some("/srv/api".to_string())),
+            }
+        );
+        // Local rows keep their plain kinds; unknown ids stay `New`.
+        app.sessions[0].remote = None;
+        app.sessions[0].provider_session_id = Some("s-9".into());
+        assert_eq!(
+            app.respawn_kind("a"),
+            SpawnKind::Resume {
+                session_id: "s-9".into()
+            }
+        );
+        assert_eq!(app.respawn_kind("missing"), SpawnKind::New);
+    }
+
+    #[test]
+    fn session_cwd_stays_local_for_remote_rows() {
+        use crate::launch::SshTarget;
+        let mut app = App::new(vec![sess("a", Status::Idle, 1), sess("b", Status::Idle, 2)]);
+        // `App::new` sorts newest-first, so reach rows by id, not index.
+        let local = app.sessions.iter_mut().find(|s| s.id == "a").unwrap();
+        local.cwd = Some("/tmp/local".to_string());
+        assert_eq!(
+            app.session_cwd("a"),
+            Some(std::path::PathBuf::from("/tmp/local"))
+        );
+        // A remote row reports no local cwd even if one were set: the
+        // remote dir lives inside the `ssh` command.
+        let remote = app.sessions.iter_mut().find(|s| s.id == "b").unwrap();
+        remote.cwd = Some("/tmp/local".to_string());
+        remote.remote = Some(SshTarget::new("mybox".to_string(), None));
+        assert_eq!(app.session_cwd("b"), None);
+        assert_eq!(app.session_cwd("missing"), None);
+    }
+
+    #[test]
+    fn legacy_sessions_without_remote_load_as_local() {
+        // Files written before the `remote` key (or with it absent) still
+        // load, defaulting to local rows.
+        let legacy = r#"[{"id":"old","title":"old","project":"p","status":"Idle",
+            "last_active":1,"pr_links":[],"related_links":[]}]"#;
+        let sessions: Vec<ChatSession> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].remote, None);
+        let app = App::new(sessions);
+        assert_eq!(app.respawn_kind("old"), SpawnKind::New);
     }
 
     #[test]

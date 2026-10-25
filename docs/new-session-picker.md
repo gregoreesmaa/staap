@@ -63,9 +63,40 @@ resolved below.
   flatpak exports, user `~/.local/bin`). No `--version` subprocess, no
   background threads, no cache file — re-run on open so the list never
   goes stale. Zero cost at idle.
+- Remote hosts probe differently: one bounded `ssh -T -o BatchMode=yes
+  -o ConnectTimeout=5 <host>` round trip running `command -v` per CLI
+  (see `remote_probe_command` / `parse_remote_probe_output`). Blank hosts
+  and every probe failure degrade to all-listed-none-available, never an
+  empty picker; shells run it off the UI thread on host pick and show the
+  unchecked catalog meanwhile.
 - Rows show all four CLIs in fixed order with `ready` / `not installed`;
   spawn of a missing CLI stays possible (explicit pick) and fails
   visibly at spawn with Retry, like today.
+
+## Remote sessions (SSH)
+
+One manual host, no remote daemon: the local PTY runs `ssh -t <host>
+<cli…>` and the agent TUI renders through it. Auth rides the user's own
+ssh setup only (`~/.ssh/config`, agents, `user@`, jump aliases all keep
+resolving; interactive password/2FA/host-key prompts surface in the
+terminal). The spawn deliberately carries none of the probe-only flags
+(`-T`, `BatchMode=yes`, timeouts) — a spawn must surface auth, never
+fail it silently.
+
+- Core owns everything portable: `SshTarget { host, remote_cwd }` +
+  `ssh_spawn_command` (`launch`), the `SpawnKind::Remote` wrapper and its
+  `ssh -t` synthesis in `App::spawn_command_for` (extra_args + yolo still
+  apply to the inner CLI), per-run target on `ChatSession`, per-host
+  folder recents + last host in `Config`, FFI `staap_run_spawn_remote` /
+  `staap_remote_recent_json`. Shells only render.
+- The remote folder never touches the local PTY cwd: without one the
+  spawn is `ssh -t <host> <cli> <args…>`; with one it folds into
+  `ssh -t <host> 'cd <dir> && exec <cli> …'` (quoted). Preview reads
+  `ssh <host>: <cli> [--flag] in <dir>`.
+- Persisted state is host + folder only (serde-defaulted, old files load
+  as local; restarts redial the stored target). Passwords, keys, and
+  passphrases never touch staap state. Blank hosts refuse at spawn with a
+  fail-visible error; discovery degrades to all-listed-none-available.
 
 ## Visual / triage
 

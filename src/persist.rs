@@ -84,6 +84,14 @@ fn union_into(keep: &mut ChatSession, mut donor: ChatSession) {
         keep.transcript = donor.transcript;
         keep.transcript_truncated = donor.transcript_truncated;
     }
+    // A merged row keeps its remote target: discovery never reports one,
+    // so a local discovery copy must not wipe the persisted target (the
+    // restart would otherwise redial locally instead of over SSH).
+    if keep.remote.as_ref().is_none_or(|t| !t.is_valid())
+        && donor.remote.as_ref().is_some_and(|t| t.is_valid())
+    {
+        keep.remote = donor.remote;
+    }
     if donor.last_active > keep.last_active {
         keep.last_active = donor.last_active;
     }
@@ -242,6 +250,7 @@ mod tests {
             title_locked: true,
             pending_input: String::new(),
             cwd: None,
+            remote: None,
         }
     }
 
@@ -273,6 +282,39 @@ mod tests {
         let legacy_back = load_sessions_from(&legacy_path);
         assert_eq!(legacy_back.len(), 1);
         assert_eq!(legacy_back[0].cwd, None);
+    }
+
+    #[test]
+    fn remote_target_survives_a_save_load_roundtrip() {
+        // The SSH target is run state like the folder: host + remote dir
+        // persist local-only, merge keeps a discovered copy from wiping
+        // it, and pre-target files still load as local.
+        use crate::launch::SshTarget;
+        let mut with_remote = sess("a");
+        with_remote.remote = Some(SshTarget::new(
+            "mybox".to_string(),
+            Some("/srv/api".to_string()),
+        ));
+        let path = tmp_path("runs.json");
+        save_sessions_to(&path, &[with_remote]).unwrap();
+        let back = load_sessions_from(&path);
+        assert_eq!(
+            back[0].remote,
+            Some(SshTarget::new(
+                "mybox".to_string(),
+                Some("/srv/api".to_string())
+            ))
+        );
+        // Merge: a discovered local copy never clears the stored target.
+        let mut local = sess("a");
+        local.last_active = 9;
+        let merged = merge_sessions(vec![local], back);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].remote.as_ref().map(|t| t.host.as_str()),
+            Some("mybox")
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
