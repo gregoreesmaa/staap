@@ -138,23 +138,48 @@ public struct NewSessionPicker {
         return nil
     }
 
+    /// A drive row (`C:` from a root listing on a Windows host) maps
+    /// back to its own root (`C:/`); anything else yields nil. Drive
+    /// letters are ASCII-only by construction (`Get-PSDrive` names).
+    private static func driveRoot(of entry: String) -> String? {
+        var stripped = entry.trimmingCharacters(in: .whitespaces)
+        while stripped.hasSuffix("/") { stripped.removeLast() }
+        guard stripped.count == 2, stripped.hasSuffix(":"),
+            let first = stripped.first, first.isASCII, first.isLetter else { return nil }
+        return stripped + "/"
+    }
+
     /// Parent of a remote path ("~/a/b" -> "~/a", "~/a" -> "~",
     /// "/a" -> "/"). Nil means already at the top ("~", "/", a bare
-    /// name, or blank): the Up button hides there.
+    /// name, or blank): the Up button hides there. Drive roots live
+    /// at the filesystem root ("C:/" -> "/") and drive parents keep
+    /// their slash ("C:/Users" -> "C:/", never bare "C:").
     public static func remoteParent(of path: String) -> String? {
         var current = path.trimmingCharacters(in: .whitespaces)
         while current.hasSuffix("/") && current.count > 1 { current.removeLast() }
         guard !current.isEmpty, current != "~", current != "/" else { return nil }
+        if driveRoot(of: current) != nil { return "/" }
         guard let slash = current.lastIndex(of: "/") else { return nil }
         let parent = String(current[..<slash])
-        return parent.isEmpty ? "/" : parent
+        if parent.isEmpty { return "/" }
+        if driveRoot(of: parent) != nil { return parent + "/" }
+        return parent
     }
 
     /// Join a browser entry onto its directory ("~/a" + "b" -> "~/a/b").
+    /// Joining at "/" never doubles the slash ("/" + "Users" ->
+    /// "/Users", which the Windows host resolves on its current drive);
+    /// a drive row joined at the root becomes its own root ("/" + "C:"
+    /// -> "C:/").
     public static func remoteJoin(base: String, name: String) -> String {
         var cleaned = base.trimmingCharacters(in: .whitespaces)
         while cleaned.hasSuffix("/") && cleaned.count > 1 { cleaned.removeLast() }
+        let entry = name.trimmingCharacters(in: .whitespaces)
+        if let drive = driveRoot(of: entry), cleaned.isEmpty || cleaned == "/" {
+            return drive
+        }
         if cleaned.isEmpty { return name }
+        if cleaned == "/" { return "/" + entry }
         return cleaned + "/" + name
     }
 

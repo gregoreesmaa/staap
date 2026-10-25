@@ -190,9 +190,17 @@ static void saved_host_axis_parses(void) {
     CHECK(picker::parse_remote_list("nope").empty(), "malformed listing");
     CHECK(picker::remote_join("/srv", "api") == "/srv/api", "join slash");
     CHECK(picker::remote_join("/srv/", "api") == "/srv/api", "join trailing");
+    CHECK(picker::remote_join("/", "Users") == "/Users", "join root no double slash");
+    CHECK(picker::remote_join("/", "C:") == "C:/", "join drive at root");
+    CHECK(picker::remote_join("", "C:") == "C:/", "join drive at empty");
+    CHECK(!picker::is_drive_row("Users"), "not a drive");
+    CHECK(picker::is_drive_row("C:"), "drive row");
     CHECK(picker::remote_parent("/srv/api") == "/srv", "parent dir");
     CHECK(picker::remote_parent("/") == "/", "parent root");
     CHECK(picker::remote_parent("api").empty(), "parent relative none");
+    CHECK(picker::remote_parent("C:/") == "/", "parent drive root");
+    CHECK(picker::remote_parent("C:") == "/", "parent bare drive");
+    CHECK(picker::remote_parent("C:/Users") == "C:/", "parent keeps drive slash");
 }
 
 static void ssh_picker_bridge_surface(void) {
