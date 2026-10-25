@@ -535,10 +535,20 @@ fn remote_ps_cd_snippet(dir: &str) -> String {
 /// `-ErrorAction Stop` makes a missing dir exit non-zero (degrading to
 /// empty downstream, like the POSIX `cd` first); without it
 /// `Get-ChildItem` would list the *previous* directory on failure.
+/// The filesystem root (`/` or `\`) additionally lists every
+/// filesystem drive as an `X:/` row — Windows has no single root dir,
+/// so drives are the only way to offer drive selection; the parser
+/// reads the trailing `/` as is_dir and the shells join `X:` back to
+/// `X:/`. Non-root listings are unchanged.
 pub fn remote_ps_list_script(path: &str) -> String {
+    let drives = match path.trim() {
+        "/" | "\\" => "Get-PSDrive -PSProvider FileSystem | ForEach-Object { $_.Name + ':/' }; ",
+        _ => "",
+    };
     format!(
-        "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{}}; {} -ErrorAction Stop; Get-ChildItem -LiteralPath . -Force | ForEach-Object {{ $_.Name + $(if ($_.PSIsContainer) {{ '/' }}) }}",
-        remote_ps_cd_snippet(path)
+        "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{}}; {} -ErrorAction Stop; {}Get-ChildItem -LiteralPath . -Force | ForEach-Object {{ $_.Name + $(if ($_.PSIsContainer) {{ '/' }}) }}",
+        remote_ps_cd_snippet(path),
+        drives
     )
 }
 
@@ -1791,6 +1801,29 @@ mod tests {
         assert!(clis[0].available);
         assert_eq!(clis[0].path.as_deref(), Some("C:\\tools\\muse.exe"));
         assert!(!clis[1].available);
+    }
+
+    #[test]
+    fn remote_ps_list_script_lists_drives_at_filesystem_root() {
+        // Windows hosts have no single root dir: `C:`, `D:`, … ride
+        // as `C:/` rows (the parser reads the trailing `/` as is_dir)
+        // so the browser can offer drive selection.
+        for root in ["/", "\\"] {
+            let script = remote_ps_list_script(root);
+            assert!(script.contains("Get-PSDrive"), "{script}");
+            assert!(script.contains("':/'"), "{script}");
+        }
+        // Drive rows parse through the shared parser like dirs.
+        let entries = parse_remote_list_output("C:/\nD:/\nUsers/\nnotes.txt\n");
+        assert!(entries.iter().any(|e| e.name == "C:" && e.is_dir));
+        assert!(entries.iter().any(|e| e.name == "D:" && e.is_dir));
+        // Non-root listings stay drive-free (same wire format as before).
+        for path in ["/srv/api", "C:\\srv\\api", "C:/", "~"] {
+            assert!(
+                !remote_ps_list_script(path).contains("Get-PSDrive"),
+                "{path}"
+            );
+        }
     }
 
     #[test]

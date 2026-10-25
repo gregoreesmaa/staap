@@ -491,9 +491,30 @@ inline std::vector<RemoteEntryRow> parse_remote_list(const std::string &json) {
     return out;
 }
 
-/* Join a remote base dir and an entry name with exactly one '/'. */
+/* A drive row (`C:` from a root listing on a Windows host) maps back
+ * to its own root (`C:/`); anything else is not a drive. Letters are
+ * matched ASCII-only (`Get-PSDrive` names); no locale dependence. */
+inline bool is_drive_row(const std::string &name) {
+    std::string s = name;
+    while (s.size() > 2 && s.back() == '/') {
+        s.pop_back();
+    }
+    return s.size() == 2 && s[1] == ':' &&
+           ((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= 'a' && s[0] <= 'z'));
+}
+
+/* Join a remote base dir and an entry name with exactly one '/'. A
+ * drive row joined at the root becomes its own root (`/` + `C:` ->
+ * `C:/`, never `/C:`). */
 inline std::string remote_join(const std::string &base,
                                const std::string &name) {
+    if (is_drive_row(name) && (base.empty() || base == "/")) {
+        std::string drive = name;
+        while (drive.size() > 2 && drive.back() == '/') {
+            drive.pop_back();
+        }
+        return drive + "/";
+    }
     if (base.empty()) {
         return name;
     }
@@ -504,11 +525,16 @@ inline std::string remote_join(const std::string &base,
 }
 
 /* Parent of a remote path ("/" stays "/"); empty when there is no
- * parent to go up to (relative single segment). */
+ * parent to go up to (relative single segment). Drive roots live at
+ * the filesystem root (`C:/` -> `/`) and drive parents keep their
+ * slash (`C:/Users` -> `C:/`, never bare `C:`). */
 inline std::string remote_parent(const std::string &path) {
     std::string cpy = path;
     while (cpy.size() > 1 && cpy.back() == '/') {
         cpy.pop_back();
+    }
+    if (is_drive_row(cpy)) {
+        return "/";
     }
     std::size_t slash = cpy.find_last_of('/');
     if (slash == std::string::npos) {
@@ -517,7 +543,11 @@ inline std::string remote_parent(const std::string &path) {
     if (slash == 0) {
         return "/";
     }
-    return cpy.substr(0, slash);
+    std::string parent = cpy.substr(0, slash);
+    if (is_drive_row(parent)) {
+        return parent + "/";
+    }
+    return parent;
 }
 
 } /* namespace picker */

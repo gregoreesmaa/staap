@@ -160,6 +160,12 @@ final class NewSessionPickerTests: XCTestCase {
         XCTAssertEqual(NewSessionPicker.remoteJoin(base: "~/a", name: "b"), "~/a/b")
         XCTAssertEqual(NewSessionPicker.remoteJoin(base: "~/a/", name: "b"), "~/a/b")
         XCTAssertEqual(NewSessionPicker.remoteJoin(base: "", name: "b"), "b")
+        XCTAssertEqual(NewSessionPicker.remoteJoin(base: "/", name: "Users"), "/Users")
+        XCTAssertEqual(NewSessionPicker.remoteJoin(base: "/", name: "C:"), "C:/")
+        XCTAssertEqual(NewSessionPicker.remoteJoin(base: "", name: "C:"), "C:/")
+        XCTAssertEqual(NewSessionPicker.remoteParent(of: "C:/"), "/")
+        XCTAssertEqual(NewSessionPicker.remoteParent(of: "C:"), "/")
+        XCTAssertEqual(NewSessionPicker.remoteParent(of: "C:/Users"), "C:/")
     }
 
     func testRemoteEntryRowsDistinguishDirsFromFiles() {

@@ -1294,7 +1294,33 @@ typedef struct {
     char *json; /* owned (bridge string) */
 } BrowseDone;
 
+/* A drive row (`C:` from a root listing on a Windows host) maps back
+ * to its own root (`C:/`); anything else is not a drive. Letters are
+ * matched ASCII-only (`Get-PSDrive` names); no locale dependence. */
+static int is_drive_row(const char *name) {
+    size_t n;
+    if (!name) {
+        return 0;
+    }
+    n = strlen(name);
+    while (n > 2 && name[n - 1] == '/') {
+        n--;
+    }
+    return n == 2 && name[1] == ':' &&
+           ((name[0] >= 'A' && name[0] <= 'Z') ||
+            (name[0] >= 'a' && name[0] <= 'z'));
+}
+
 static char *remote_join(const char *base, const char *name) {
+    /* A drive row joined at the root becomes its own root (`/` + `C:`
+     * -> `C:/`, never `/C:`). */
+    if (is_drive_row(name) && (!base || !*base || strcmp(base, "/") == 0)) {
+        size_t n = strlen(name);
+        while (n > 2 && name[n - 1] == '/') {
+            n--;
+        }
+        return g_strdup_printf("%.*s/", (int)n, name);
+    }
     if (!base || !*base) {
         return g_strdup(name);
     }
@@ -1314,6 +1340,12 @@ static char *remote_parent(const char *path) {
     while (n > 1 && cpy[n - 1] == '/') {
         cpy[--n] = '\0';
     }
+    /* Drive roots live at the filesystem root (`C:/` -> `/`). */
+    if (is_drive_row(cpy)) {
+        cpy[0] = '/';
+        cpy[1] = '\0';
+        return cpy;
+    }
     char *slash = strrchr(cpy, '/');
     if (!slash) {
         g_free(cpy);
@@ -1323,6 +1355,12 @@ static char *remote_parent(const char *path) {
         cpy[1] = '\0';
     } else {
         *slash = '\0';
+        /* Drive parents keep their slash (`C:/Users` -> `C:/`). */
+        if (is_drive_row(cpy)) {
+            n = strlen(cpy);
+            cpy[n] = '/';
+            cpy[n + 1] = '\0';
+        }
     }
     return cpy;
 }
