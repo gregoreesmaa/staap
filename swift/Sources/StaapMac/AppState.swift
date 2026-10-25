@@ -258,6 +258,17 @@ final class AppState: ObservableObject {
         UserDefaults.standard.string(forKey: Self.lastRemoteHostKey) ?? ""
     }
 
+    /// Forget the remembered last SSH host (unsaved-row management):
+    /// clears the shell-local memory only when it still points at
+    /// `host`, so a newer launch recorded meanwhile can never be
+    /// clobbered. Core folder memory is per-host and harmless without
+    /// the row; the next launch re-records.
+    func forgetLastRemoteHost(_ host: String) {
+        if lastRemoteHost == host {
+            UserDefaults.standard.removeObject(forKey: Self.lastRemoteHostKey)
+        }
+    }
+
     /// Confirmed remote picker launch: SSH host + remote folder × CLI +
     /// tri-state yolo (same 1/-1/0 convention as the local funnel).
     /// Blank hosts refuse fail-visible in `pendingError`, never silently.

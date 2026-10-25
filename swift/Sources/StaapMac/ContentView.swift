@@ -412,6 +412,7 @@ private struct NewSessionScreen: View {
     @State private var unsavedLastHost = ""
     @State private var showAddSheet = false
     @State private var editingHost: SavedHost? = nil
+    @State private var prefillHost: String? = nil
     @State private var machineError: String? = nil
     @State private var remoteClis: [CliRow]? = nil
     @State private var probingRemote = false
@@ -444,11 +445,13 @@ private struct NewSessionScreen: View {
                 }
                 .pickerStyle(.menu)
                 .onChange(of: machine) { _, _ in machineChanged() }
-                // Saved-host management, rendered only for a saved pick:
-                // Edit reopens the sheet prefilled (rename in place),
-                // Delete forgets the host and its folder memory. Both are
-                // buttons (keyboard-focusable) with command shortcuts, and
-                // failures report in words below — never color-only.
+                // Saved-host management: Edit reopens the sheet prefilled
+                // (rename in place), Delete forgets the host and its
+                // folder memory. A remembered-but-unsaved last host gets
+                // Save… (prefill the sheet, creates the row) and Forget
+                // (drops the shell-local memory). All are Tab-focusable
+                // buttons; Delete/Forget also answer to Command-Delete.
+                // Failures report in words below — never color-only.
                 if let selected = savedHosts.first(where: { $0.host == machine }) {
                     HStack {
                         Button("Edit…") {
@@ -460,6 +463,22 @@ private struct NewSessionScreen: View {
                         Button("Delete") { deleteSaved(selected) }
                             .keyboardShortcut(.delete, modifiers: .command)
                             .help("Delete this saved machine (Command-Delete)")
+                    }
+                    if let machineError {
+                        Text(machineError)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if !machine.isEmpty, machine == unsavedLastHost {
+                    HStack {
+                        Button("Save…") {
+                            prefillHost = machine
+                            showAddSheet = true
+                        }
+                        .help("Save this machine to the dropdown")
+                        Button("Forget") { forgetUnsaved() }
+                            .keyboardShortcut(.delete, modifiers: .command)
+                            .help("Forget this machine (Command-Delete)")
                     }
                     if let machineError {
                         Text(machineError)
@@ -583,8 +602,9 @@ private struct NewSessionScreen: View {
                 machine = previousMachine
             }
             editingHost = nil
+            prefillHost = nil
         }) {
-            SshAddSheet(state: state, isPresented: $showAddSheet, editing: editingHost) { savedHost in
+            SshAddSheet(state: state, isPresented: $showAddSheet, editing: editingHost, initialHost: prefillHost) { savedHost in
                 savedHosts = state.pickerSavedHosts()
                 unsavedLastHost = ""
                 machine = savedHost
@@ -674,6 +694,20 @@ private struct NewSessionScreen: View {
                 Button("Use this folder") { folder = remotePath }
             }
         }
+    }
+
+    /// Forget a remembered-but-unsaved last host (Forget button /
+    /// Command-Delete): drop the shell-local memory and fall back to
+    /// This machine. The pick always equals the memory here (the block
+    /// renders only for that row), but the state call re-checks so a
+    /// newer launch recorded meanwhile survives.
+    private func forgetUnsaved() {
+        state.forgetLastRemoteHost(machine)
+        machineError = nil
+        unsavedLastHost = ""
+        machine = ""
+        previousMachine = ""
+        hostChanged()
     }
 
     /// Delete one saved machine (Delete button / Command-Delete): the
@@ -912,6 +946,9 @@ private struct SshAddSheet: View {
     @ObservedObject var state: AppState
     @Binding var isPresented: Bool
     var editing: SavedHost? = nil
+    /// Prefill host for the Save… flow off an unsaved last host (add
+    /// mode: saving creates the row). Ignored when `editing` is set.
+    var initialHost: String? = nil
     var onSaved: (String) -> Void
 
     @State private var displayName = ""
@@ -967,6 +1004,8 @@ private struct SshAddSheet: View {
                 displayName = editing.name
                 host = editing.host
                 defaultFolder = editing.defaultFolder ?? ""
+            } else if let initialHost {
+                host = initialHost
             }
         }
     }
