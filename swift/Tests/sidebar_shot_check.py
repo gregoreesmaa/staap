@@ -282,6 +282,21 @@ def is_tall_single(g, inset_cut, tall_single):
             and is_row(g, inset_cut))
 
 
+def drop_chrome_button(multis, others, lines):
+    """Drop a lone first-line group from the row candidates.
+
+    The sidebar chrome opens the band, so the machine button label is
+    always the first text line. A prominent button label clears the
+    tall-single bar on its own height; without this, every shot with a
+    prominent header button counts one phantom row. Groups spanning 2+
+    lines are never chrome alone, so a real button/row overprint still
+    counts (and still fails the suite).
+    """
+    if multis and len(multis[0]) == 1 and multis[0][0] == lines[0]:
+        multis = multis[1:]
+    return multis, others
+
+
 def main():
     ap = argparse.ArgumentParser(description="sidebar overlap check")
     ap.add_argument("png")
@@ -320,6 +335,14 @@ def main():
         sys.exit(1)
     multis, others, grouped, pitch, join, tall_single = analyze_lines(
         lines, args.join_ratio, inset_cut)
+
+    # The machine button label is always the first text line (the tall
+    # reference above relies on the same "first three lines are chrome"
+    # model). A prominent button label clears the tall-single bar on its
+    # own height, so it is dropped from the row candidates (see
+    # drop_chrome_button) — real rows all live below the chrome, and a
+    # button/row overprint still spans 2+ lines and keeps failing loudly.
+    multis, _ = drop_chrome_button(multis, others, lines)
 
     print("sidebar_shot_check: window=(%d,%d) divider=%d(score %.2f) "
           "band=%dx%d lines=%d groups=%d multis=%d others=%d "
