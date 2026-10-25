@@ -8,11 +8,13 @@
 //! in [`super::layout`].
 
 use gpui::{
-    div, px, rgb, Context, ElementId, Font, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, SharedString, Size,
-    StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowControlArea, WindowOptions,
+    div, px, rgb, ClickEvent, Context, ElementId, Font, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, SharedString,
+    Size, StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowControlArea,
+    WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::sidebar::{SidebarMenu, SidebarMenuItem};
 use gpui_component::Sizable as _;
 
 use super::layout::{
@@ -57,10 +59,13 @@ impl Render for ShellView {
             .flex_col()
             .flex_1()
             .child(self.render_error_banner(cx))
-            // In-app help (`?` toggle) replaces the terminal pane while
-            // open; `?` again (or Close) returns.
+            // In-app help (`?` toggle) and the new-session screen (open
+            // picker) replace the terminal pane while open; `?` again
+            // (or Close) returns, Enter/Esc confirms/cancels the screen.
             .child(if self.show_help {
                 self.render_help(cx)
+            } else if self.picker_open() {
+                self.render_new_session_screen(cx)
             } else {
                 self.render_terminal(cx)
             });
@@ -290,9 +295,10 @@ impl ShellView {
         }
     }
 
-    /// Empty terminal pane: icon-split status line plus a clickable
-    /// `+ New` CTA (keyboard parity: `n` still works) so first run does
-    /// not depend on discovering the key hint.
+    /// Empty terminal pane: icon-split status line plus the single
+    /// clickable `+ New` button (keyboard parity: `n` repeats the last
+    /// launch, `N` opens the same in-place screen) so the first run
+    /// does not depend on discovering the key hint.
     pub(crate) fn render_empty_pane(&self, cx: &mut Context<Self>) -> gpui::Div {
         let (icon, msg, is_error) = self.empty_pane_copy();
         let color = if is_error {
@@ -308,25 +314,284 @@ impl ShellView {
                 .child(
                     div().pt_2().child(
                         Button::new(ElementId::Name("empty-new-run-btn".into()))
-                            .label("+ New (n)")
+                            .label("+ New")
                             .primary()
                             .small()
-                            .on_click(cx.listener(|this, _ev, window, _cx| {
-                                this.app.start_new_session();
-                                this.clear_selection();
-                                this.focus_term(window);
-                            })),
-                    ),
-                )
-                .child(
-                    div().pt_1().child(
-                        Button::new(ElementId::Name("empty-picker-btn".into()))
-                            .label("Choose folder × CLI (N)")
-                            .small()
                             .on_click(cx.listener(|this, _ev, _window, _cx| {
+                                // The single New session button: always
+                                // opens the in-place new-session screen on
+                                // the right side.
                                 this.open_launch_picker();
                             })),
                     ),
+                ),
+        )
+    }
+}
+
+impl ShellView {
+    /// In-place new-session screen: the right-side (terminal column)
+    /// replacement for the old choose-folder/CLI/options modal. Shown
+    /// every time New session is pressed (the single `+ New` button
+    /// always opens the picker); Enter starts the run, Esc cancels.
+    /// Every row is clickable and mirrors the keyboard capture, so
+    /// mouse and keyboard never desync: machine rows pick the host,
+    /// browser rows pick the remote dir, CLI rows move the cursor,
+    /// and Start/Cancel confirm/abort like Enter/Esc.
+    pub(crate) fn render_new_session_screen(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .text_sm()
+            .child(div().child("New session".to_string()));
+        col = col.child(self.render_screen_machine(cx));
+        col = col.child(self.render_screen_folder(cx));
+        col = col.child(self.render_screen_clis(cx));
+        if self.picker_remote.ssh_add.is_some() {
+            col = col.child(self.render_ssh_add_dialog(cx));
+        }
+        col = col.child(self.picker_preview());
+        col.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(
+                    Button::new(ElementId::Name("new-screen-start-btn".into()))
+                        .label("Start (Enter)")
+                        .primary()
+                        .small()
+                        .on_click(cx.listener(|this, _ev, window, _cx| {
+                            this.accept_launch_picker();
+                            this.focus_term(window);
+                        })),
+                )
+                .child(
+                    Button::new(ElementId::Name("new-screen-cancel-btn".into()))
+                        .label("Cancel (Esc)")
+                        .small()
+                        .on_click(cx.listener(|this, _ev, _window, _cx| {
+                            this.cancel_launch_picker();
+                        })),
+                ),
+        )
+    }
+
+    /// Machine section: the value row (click toggles the dropdown)
+    /// plus one row per option while open (This machine, saved hosts,
+    /// Add remote machine...). An empty focused axis shows the
+    /// `user@hostname` placeholder hint.
+    fn render_screen_machine(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let host = self.picker_remote.host_input.trim().to_string();
+        let value = if host.is_empty() {
+            super::picker::THIS_MACHINE_LABEL.to_string()
+        } else {
+            host.clone()
+        };
+        let hint = if host.is_empty() && self.picker_remote.host_focus {
+            format!(" ({})", super::picker::MACHINE_PLACEHOLDER)
+        } else {
+            String::new()
+        };
+        let mut section = div().flex().flex_col().gap_1().child(
+            div()
+                .id(ElementId::Name("new-screen-machine-value".into()))
+                .child(format!("Machine: {value}{hint}"))
+                .on_click(cx.listener(|this, _ev, _window, _cx| {
+                    this.toggle_machine_dropdown();
+                })),
+        );
+        if self.picker_remote.machine_open {
+            let mut items: Vec<SidebarMenuItem> = Vec::new();
+            for (index, (_opt, label)) in self.machine_dropdown_rows().into_iter().enumerate() {
+                let marker = if index == self.picker_remote.machine_cursor {
+                    "> "
+                } else {
+                    "  "
+                };
+                items.push(
+                    SidebarMenuItem::new(format!("{marker}{label}")).on_click(cx.listener(
+                        move |this, _ev: &ClickEvent, _window, _cx| {
+                            this.pick_machine_option(index);
+                        },
+                    )),
+                );
+            }
+            section = section.child(SidebarMenu::new().children(items));
+        }
+        section
+    }
+
+    /// Folder section: the typed folder plus, on remote hosts, the
+    /// folder browser (one `ls` round trip per host/folder, capped at
+    /// 500 entries by the core parser). Clicking a directory picks it
+    /// into the folder input; typing stays fully editable.
+    fn render_screen_folder(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let folder = self
+            .launch_picker
+            .as_ref()
+            .map(|p| p.folder_input.clone())
+            .unwrap_or_default();
+        let shown = if folder.trim().is_empty() {
+            "(blank = current)".to_string()
+        } else {
+            folder
+        };
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().child(format!("Folder: {shown}")));
+        if self.picker_is_remote() {
+            if self.picker_remote.remote_listing.is_empty() {
+                section = section.child(
+                    div()
+                        .text_xs()
+                        .child("(remote folder browser: listing...)".to_string()),
+                );
+            } else {
+                let mut items: Vec<SidebarMenuItem> = Vec::new();
+                for (index, entry) in self.picker_remote.remote_listing.iter().enumerate() {
+                    let marker = if index == self.picker_remote.remote_listing_cursor {
+                        "> "
+                    } else {
+                        "  "
+                    };
+                    let suffix = if entry.is_dir { "/" } else { "" };
+                    let name = entry.name.clone();
+                    items.push(
+                        SidebarMenuItem::new(format!("{marker}{name}{suffix}")).on_click(
+                            cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
+                                this.pick_remote_listing(index);
+                            }),
+                        ),
+                    );
+                }
+                section = section.child(SidebarMenu::new().children(items));
+            }
+        }
+        section
+    }
+
+    /// CLI section: one row per detected CLI (availability in words,
+    /// never color-only); clicking moves the cursor. The yolo row
+    /// cycles default/on-once/off-once on click.
+    fn render_screen_clis(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut items: Vec<SidebarMenuItem> = Vec::new();
+        if let Some(picker) = self.launch_picker.as_ref() {
+            for (index, cli) in picker.clis.iter().enumerate() {
+                let marker = if index == picker.cli_cursor {
+                    "> "
+                } else {
+                    "  "
+                };
+                let state = if cli.available {
+                    "ready"
+                } else {
+                    "not installed"
+                };
+                let id = cli.id.clone();
+                items.push(
+                    SidebarMenuItem::new(format!("{marker}{id} ({state})")).on_click(cx.listener(
+                        move |this, _ev: &ClickEvent, _window, _cx| {
+                            this.select_picker_cli(index);
+                        },
+                    )),
+                );
+            }
+        }
+        let yolo = self.picker_yolo_label().to_string();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().child("Agent CLI: (click picks, Enter starts)".to_string()))
+            .child(SidebarMenu::new().children(items))
+            .child(
+                div()
+                    .id(ElementId::Name("new-screen-yolo".into()))
+                    .child(format!("Yolo: {yolo} (click cycles)"))
+                    .on_click(cx.listener(|this, _ev, _window, _cx| {
+                        this.cycle_picker_yolo();
+                    })),
+            )
+    }
+
+    /// SSH add dialog: display name, host (`user@hostname` or alias),
+    /// and default folder (typed, Tab cycles fields), plus the Test
+    /// button wired to the core tester (reachable/unreachable in words
+    /// plus the detected CLIs) and Save/Cancel backed by the core
+    /// saved-hosts store.
+    fn render_ssh_add_dialog(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let (name, host, folder, focus, error) = match self.picker_remote.ssh_add.as_ref() {
+            Some(d) => (
+                d.name_input.clone(),
+                d.host_input.clone(),
+                d.folder_input.clone(),
+                d.focus,
+                d.error.clone(),
+            ),
+            None => (String::new(), String::new(), String::new(), 0, None),
+        };
+        let shown = |value: &str| {
+            if value.is_empty() {
+                "(blank)".to_string()
+            } else {
+                value.to_string()
+            }
+        };
+        let mark = |n: usize| if n == focus { "> " } else { "  " };
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().child("Add remote machine...".to_string()))
+            .child(div().child(format!("{}Display name: {}", mark(0), shown(&name))))
+            .child(div().child(format!(
+                "{}Host (user@hostname or alias): {}",
+                mark(1),
+                shown(&host)
+            )))
+            .child(div().child(format!("{}Default folder: {}", mark(2), shown(&folder))));
+        let status = match self.ssh_add_test_label() {
+            Some(label) => format!("Test: {label}"),
+            None => "Test: not run yet (click Test)".to_string(),
+        };
+        card = card.child(div().child(status));
+        if let Some(err) = error {
+            card = card.child(div().child(format!("Error: {err}")));
+        }
+        card.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(
+                    Button::new(ElementId::Name("ssh-add-test-btn".into()))
+                        .label("Test")
+                        .small()
+                        .on_click(cx.listener(|this, _ev, _window, _cx| {
+                            this.test_ssh_add();
+                        })),
+                )
+                .child(
+                    Button::new(ElementId::Name("ssh-add-save-btn".into()))
+                        .label("Save")
+                        .primary()
+                        .small()
+                        .on_click(cx.listener(|this, _ev, _window, _cx| {
+                            this.save_ssh_add();
+                        })),
+                )
+                .child(
+                    Button::new(ElementId::Name("ssh-add-cancel-btn".into()))
+                        .label("Cancel")
+                        .small()
+                        .on_click(cx.listener(|this, _ev, _window, _cx| {
+                            this.cancel_ssh_add();
+                        })),
                 ),
         )
     }

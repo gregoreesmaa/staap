@@ -31,8 +31,9 @@ final class AppState: ObservableObject {
     /// Row ids whose parsed links render expanded (issue #103: "1 link"
     /// opens the actual URLs instead of only counting them).
     @Published var expandedLinks: Set<String> = []
-    /// 2D-launch picker sheet visibility (set by the menu, the caret,
-    /// or Cmd-Shift-N; the sheet resets it on dismiss).
+    /// 2D-launch in-place screen visibility: the single New Session
+    /// button (or Cmd-N) shows the screen on the right side every press;
+    /// the screen resets this on Start/Cancel.
     @Published var pickerOpen = false
 
     /// Feeds waiting for the terminal view: row id -> (text, sequence).
@@ -209,11 +210,13 @@ final class AppState: ObservableObject {
 
     // MARK: - 2D launch (folder × CLI + yolo)
 
-    /// Split-button main action: repeat the last launch instantly (the
-    /// null-CLI/null-folder/zero-yolo form resolves the core's effective
-    /// default: last-used, configured, autodetected). Attaches a real
-    /// roster row in the core under the shared cap. A failed repeat
-    /// surfaces in `pendingError`, never silently.
+    /// Repeat the last launch instantly (the null-CLI/null-folder/zero-
+    /// yolo form resolves the core's effective default: last-used,
+    /// configured, autodetected). Attaches a real roster row in the core
+    /// under the shared cap. A failed repeat surfaces in `pendingError`,
+    /// never silently. No longer wired to the New Session button (which
+    /// opens the in-place screen every press); kept for the
+    /// `--shot-spawn` seed path.
     func repeatLastSession() {
         do {
             let id = try core.runSpawn(cli: nil, cwd: nil, yolo: 0,
@@ -247,7 +250,8 @@ final class AppState: ObservableObject {
 
     /// Last SSH host used for a remote launch (shell-local memory: the
     /// core owns the per-host folder recents, but exposes no last-host
-    /// getter over the C ABI, so the sheet preselects from here).
+    /// getter over the C ABI, so the screen preselects from here —
+    /// including hosts not yet saved, until one is picked).
     private static let lastRemoteHostKey = "staap.lastRemoteHost"
 
     var lastRemoteHost: String {
@@ -275,11 +279,29 @@ final class AppState: ObservableObject {
     }
 
     /// Remote CLI catalog for one SSH host (blocking: one bounded `ssh`
-    /// round trip — the sheet calls this off the main thread).
+    /// round trip — the screen calls this off the main thread).
     func pickerRemoteCatalog(host: String) -> [CliRow] { Core.remoteCliCatalog(host: host) }
 
     /// Remote folder recents for one SSH host (MRU-first, no network).
     func pickerRemoteRecents(host: String) -> [String] { core.remoteRecentFolders(host: host) }
+
+    /// Saved SSH hosts for the machine dropdown (saved order, no
+    /// network). The screen re-reads this on every open so the list is
+    /// never stale.
+    func pickerSavedHosts() -> [SavedHost] { core.savedHosts() }
+
+    /// Default remote folder for one SSH host: the saved host default,
+    /// else the host MRU head, else nil (the remote login directory).
+    /// A local core read, never the network.
+    func pickerRemoteDefault(host: String) -> String? { core.remoteDefaultFolder(host: host) }
+
+    /// Save (or update) an SSH host from the add sheet, then persist
+    /// (same funnel as every close). Blank names/hosts throw with the
+    /// core message naming the fix.
+    func addSavedHost(name: String, host: String, defaultFolder: String?) throws {
+        try core.addSavedHost(name: name, host: host, defaultFolder: defaultFolder)
+        save()
+    }
 
     /// Restart/resume the selected run on the same id.
     func restartSelected() {

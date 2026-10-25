@@ -120,6 +120,41 @@ void bridge_pty_free(StaapPty *pty) {
     staap_pty_free(pty);
 }
 
+char *bridge_saved_hosts_json(const StaapCore *core) {
+    return staap_saved_hosts_json(core);
+}
+
+int bridge_saved_host_add(StaapCore *core, const char *name,
+                          const char *host, const char *default_folder,
+                          char **msg_out) {
+    int rc = staap_saved_host_add(core, name, host, default_folder);
+    if (rc != 0 && msg_out) {
+        *msg_out = copy_last_error();
+    }
+    return rc;
+}
+
+int bridge_saved_host_remove(StaapCore *core, const char *key,
+                             char **msg_out) {
+    int rc = staap_saved_host_remove(core, key);
+    if (rc != 0 && msg_out) {
+        *msg_out = copy_last_error();
+    }
+    return rc;
+}
+
+char *bridge_remote_default_folder(const StaapCore *core, const char *host) {
+    return staap_remote_default_folder(core, host);
+}
+
+char *bridge_remote_list_json(const char *host, const char *path) {
+    return staap_remote_list_json(host, path);
+}
+
+char *bridge_remote_test_json(const char *host) {
+    return staap_remote_test_json(host);
+}
+
 int bridge_pump(StaapPty *pty) {
     return staap_pump(pty) ? 1 : 0;
 }

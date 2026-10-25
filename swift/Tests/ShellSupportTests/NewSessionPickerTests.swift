@@ -89,4 +89,84 @@ final class NewSessionPickerTests: XCTestCase {
         p.stepCli(forward: true) // no crash on empty
         XCTAssertEqual(p.preview, "muse")
     }
+
+    func testMachinePlaceholderShowsUserAtHostnameExample() {
+        XCTAssertTrue(NewSessionPicker.machinePlaceholder.contains("user@hostname"))
+    }
+
+    func testMachineTagsOrderThisMachineSavedThenAdd() {
+        let saved = [
+            NewSessionPicker.SavedHostRow(name: "GPU box", host: "you@gpu-box", defaultFolder: "~/work"),
+            NewSessionPicker.SavedHostRow(name: "", host: "alias-box"),
+        ]
+        XCTAssertEqual(
+            NewSessionPicker.machineTags(savedHosts: saved, lastHost: ""),
+            ["", "you@gpu-box", "alias-box", NewSessionPicker.addMachineTag]
+        )
+    }
+
+    func testMachineTagsKeepUnsavedLastHostSelectable() {
+        XCTAssertEqual(
+            NewSessionPicker.machineTags(savedHosts: [], lastHost: "  you@lab  "),
+            ["", "you@lab", NewSessionPicker.addMachineTag]
+        )
+        // A saved last host is never duplicated.
+        let saved = [NewSessionPicker.SavedHostRow(name: "Lab", host: "you@lab")]
+        XCTAssertEqual(
+            NewSessionPicker.machineTags(savedHosts: saved, lastHost: "you@lab"),
+            ["", "you@lab", NewSessionPicker.addMachineTag]
+        )
+    }
+
+    func testMachineLabels() {
+        let saved = [NewSessionPicker.SavedHostRow(name: "GPU box", host: "you@gpu-box")]
+        XCTAssertEqual(NewSessionPicker.machineLabel(tag: "", savedHosts: saved), "This machine")
+        XCTAssertEqual(
+            NewSessionPicker.machineLabel(tag: NewSessionPicker.addMachineTag, savedHosts: saved),
+            "Add remote machine…"
+        )
+        XCTAssertEqual(
+            NewSessionPicker.machineLabel(tag: "you@gpu-box", savedHosts: saved),
+            "GPU box (you@gpu-box)"
+        )
+        XCTAssertEqual(
+            NewSessionPicker.machineLabel(tag: "bare-alias", savedHosts: saved),
+            "bare-alias"
+        )
+    }
+
+    func testResolveRemoteDefaultPrefersSavedThenMruThenHome() {
+        XCTAssertEqual(
+            NewSessionPicker.resolveRemoteDefault(savedDefault: "~/work", recents: ["~/other"]),
+            "~/work"
+        )
+        XCTAssertEqual(
+            NewSessionPicker.resolveRemoteDefault(savedDefault: "  ", recents: ["", "~/mru"]),
+            "~/mru"
+        )
+        XCTAssertNil(NewSessionPicker.resolveRemoteDefault(savedDefault: nil, recents: ["  "]))
+        XCTAssertNil(NewSessionPicker.resolveRemoteDefault(savedDefault: nil, recents: []))
+    }
+
+    func testRemoteParentAndJoin() {
+        XCTAssertEqual(NewSessionPicker.remoteParent(of: "~/a/b"), "~/a")
+        XCTAssertEqual(NewSessionPicker.remoteParent(of: "~/a"), "~")
+        XCTAssertEqual(NewSessionPicker.remoteParent(of: "/a"), "/")
+        XCTAssertNil(NewSessionPicker.remoteParent(of: "~"))
+        XCTAssertNil(NewSessionPicker.remoteParent(of: "/"))
+        XCTAssertNil(NewSessionPicker.remoteParent(of: ""))
+        XCTAssertNil(NewSessionPicker.remoteParent(of: "bare"))
+        XCTAssertEqual(NewSessionPicker.remoteParent(of: "~/a/"), "~/a")
+        XCTAssertEqual(NewSessionPicker.remoteJoin(base: "~/a", name: "b"), "~/a/b")
+        XCTAssertEqual(NewSessionPicker.remoteJoin(base: "~/a/", name: "b"), "~/a/b")
+        XCTAssertEqual(NewSessionPicker.remoteJoin(base: "", name: "b"), "b")
+    }
+
+    func testRemoteEntryRowsDistinguishDirsFromFiles() {
+        let dir = NewSessionPicker.RemoteEntryRow(name: "src", isDir: true)
+        let file = NewSessionPicker.RemoteEntryRow(name: "notes.txt", isDir: false)
+        XCTAssertTrue(dir.isDir)
+        XCTAssertFalse(file.isDir)
+        XCTAssertNotEqual(dir, file)
+    }
 }

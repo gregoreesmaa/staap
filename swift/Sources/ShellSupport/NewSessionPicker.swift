@@ -54,6 +54,110 @@ public struct NewSessionPicker {
         }
     }
 
+    /// Placeholder hint for the machine axis (dropdown caption and the
+    /// add-sheet host field): always shows a `user@hostname` example so
+    /// the expected shape is visible before typing.
+    public static let machinePlaceholder = "e.g. you@gpu-box — a user@hostname or ssh-config alias"
+
+    /// Sentinel dropdown tag for the "Add remote machine…" row: never a
+    /// real host (hosts never contain spaces).
+    public static let addMachineTag = " Add remote machine… "
+
+    /// One saved SSH host for the machine dropdown (mirrors the core's
+    /// `{name,host,default_folder}` row; no secret fields exist).
+    public struct SavedHostRow: Equatable {
+        public var name: String
+        public var host: String
+        public var defaultFolder: String?
+
+        public init(name: String, host: String, defaultFolder: String? = nil) {
+            self.name = name
+            self.host = host
+            self.defaultFolder = defaultFolder
+        }
+
+        /// Dropdown label: display name with the SSH target, or the
+        /// bare target when unnamed.
+        public var displayLabel: String {
+            name.isEmpty ? host : "\(name) (\(host))"
+        }
+    }
+
+    /// One remote directory entry for the folder browser (mirrors the
+    /// core's `{name,is_dir}` row). Directories navigate; files are
+    /// inert (shown, never entered).
+    public struct RemoteEntryRow: Equatable {
+        public var name: String
+        public var isDir: Bool
+
+        public init(name: String, isDir: Bool) {
+            self.name = name
+            self.isDir = isDir
+        }
+    }
+
+    /// Ordered machine-dropdown tags: "" (This machine), then the saved
+    /// hosts in order, then the Add sentinel. An unsaved `lastHost`
+    /// (the shell's last-used memory) is inserted before the sentinel
+    /// so the previous host stays selectable until one is picked.
+    public static func machineTags(savedHosts: [SavedHostRow], lastHost: String) -> [String] {
+        var tags = [""]
+        for saved in savedHosts where !saved.host.isEmpty && !tags.contains(saved.host) {
+            tags.append(saved.host)
+        }
+        let trimmed = lastHost.trimmingCharacters(in: .whitespaces)
+        if !trimmed.isEmpty && !tags.contains(trimmed) && trimmed != addMachineTag {
+            tags.append(trimmed)
+        }
+        tags.append(addMachineTag)
+        return tags
+    }
+
+    /// Dropdown label for one machine tag (display names for saved
+    /// hosts, plain targets otherwise).
+    public static func machineLabel(tag: String, savedHosts: [SavedHostRow]) -> String {
+        if tag.isEmpty { return "This machine" }
+        if tag == addMachineTag { return "Add remote machine…" }
+        if let saved = savedHosts.first(where: { $0.host == tag }) {
+            return saved.displayLabel
+        }
+        return tag
+    }
+
+    /// Starting remote folder for a host: the saved per-host default,
+    /// else the host MRU head, else nil (the remote login directory).
+    /// Never synthesizes a path: nil tells the shell to list "~" and
+    /// leave the folder blank-to-home.
+    public static func resolveRemoteDefault(savedDefault: String?, recents: [String]) -> String? {
+        let def = (savedDefault ?? "").trimmingCharacters(in: .whitespaces)
+        if !def.isEmpty { return def }
+        for recent in recents {
+            let trimmed = recent.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return nil
+    }
+
+    /// Parent of a remote path ("~/a/b" -> "~/a", "~/a" -> "~",
+    /// "/a" -> "/"). Nil means already at the top ("~", "/", a bare
+    /// name, or blank): the Up button hides there.
+    public static func remoteParent(of path: String) -> String? {
+        var current = path.trimmingCharacters(in: .whitespaces)
+        while current.hasSuffix("/") && current.count > 1 { current.removeLast() }
+        guard !current.isEmpty, current != "~", current != "/" else { return nil }
+        guard let slash = current.lastIndex(of: "/") else { return nil }
+        let parent = String(current[..<slash])
+        return parent.isEmpty ? "/" : parent
+    }
+
+    /// Join a browser entry onto its directory ("~/a" + "b" -> "~/a/b").
+    public static func remoteJoin(base: String, name: String) -> String {
+        var cleaned = base.trimmingCharacters(in: .whitespaces)
+        while cleaned.hasSuffix("/") && cleaned.count > 1 { cleaned.removeLast() }
+        if cleaned.isEmpty { return name }
+        return cleaned + "/" + name
+    }
+
     public var clis: [CliRow]
     public var cliIndex: Int
     public var folder: String

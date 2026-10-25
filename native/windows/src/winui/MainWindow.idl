@@ -5,12 +5,35 @@ namespace StaapWinUI
     {
         MainWindow();
 
-        void NewButton_Click(
+        void NewSessionButton_Click(
             Object sender, Microsoft.UI.Xaml.RoutedEventArgs args);
-        void NewSplitButton_Click(
+        void MachineBox_SelectionChanged(
             Object sender,
-            Microsoft.UI.Xaml.Controls.SplitButtonClickEventArgs args);
-        void PickButton_Click(
+            Microsoft.UI.Xaml.Controls.SelectionChangedEventArgs args);
+        void PickerFolderBox_TextChanged(
+            Object sender,
+            Microsoft.UI.Xaml.Controls.TextChangedEventArgs args);
+        void PickerRecentBox_SelectionChanged(
+            Object sender,
+            Microsoft.UI.Xaml.Controls.SelectionChangedEventArgs args);
+        void PickerCliBox_SelectionChanged(
+            Object sender,
+            Microsoft.UI.Xaml.Controls.SelectionChangedEventArgs args);
+        void PickerYoloBox_SelectionChanged(
+            Object sender,
+            Microsoft.UI.Xaml.Controls.SelectionChangedEventArgs args);
+        void RemoteBrowser_SelectionChanged(
+            Object sender,
+            Microsoft.UI.Xaml.Controls.SelectionChangedEventArgs args);
+        void BrowserUp_Click(
+            Object sender, Microsoft.UI.Xaml.RoutedEventArgs args);
+        void BrowserRefresh_Click(
+            Object sender, Microsoft.UI.Xaml.RoutedEventArgs args);
+        void PickerBrowse_Click(
+            Object sender, Microsoft.UI.Xaml.RoutedEventArgs args);
+        void PickerStart_Click(
+            Object sender, Microsoft.UI.Xaml.RoutedEventArgs args);
+        void PickerCancel_Click(
             Object sender, Microsoft.UI.Xaml.RoutedEventArgs args);
         void FilterBox_TextChanged(
             Object sender,

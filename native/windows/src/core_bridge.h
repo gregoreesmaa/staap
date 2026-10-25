@@ -104,6 +104,21 @@ char *bridge_remote_recent_json(const StaapCore *core, const char *host);
 
 /* Owned JSON string array of folder recents (MRU-first), or NULL on
  * allocation failure. Free with bridge_string_free(). */
+/* Saved SSH hosts + remote listing/tester (SSH picker). Hosts JSON is
+ * `[{"name","host","default_folder"|null}]` in saved order (`[]` when
+ * none/null core); default-folder is owned or NULL (remote login dir);
+ * list JSON is `[{"name","is_dir"}]` (`[]` on blank input/failure, never
+ * an auth hang); test JSON is `{"reachable":bool,"clis":[...]}` (blank
+ * hosts degrade to unreachable). Strings free with bridge_string_free();
+ * add/remove report failures via `msg_out` (freed with free()). Callers
+ * persist via bridge_core_save after mutations. Listing/testing block
+ * for one bounded ssh round trip - call off the UI thread. */
+char *bridge_saved_hosts_json(const StaapCore *core);
+int bridge_saved_host_add(StaapCore *core, const char *name, const char *host, const char *default_folder, char **msg_out);
+int bridge_saved_host_remove(StaapCore *core, const char *key, char **msg_out);
+char *bridge_remote_default_folder(const StaapCore *core, const char *host);
+char *bridge_remote_list_json(const char *host, const char *path);
+char *bridge_remote_test_json(const char *host);
 char *bridge_recent_json(const StaapCore *core);
 
 /* Owned harness id of the effective CLI for `cli` (explicit id, or the

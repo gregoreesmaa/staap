@@ -2,13 +2,17 @@
  * parity). The preview, yolo, age, glyph, and section rules live in the
  * core (`staap_spawn_preview`, ...), pinned by `cargo test --lib`; the
  * catalog/recents JSON shapes still parse locally for native widgets
- * (picker.h), pinned here. Links the real staticlib via core_bridge.c;
+ * (picker.h), pinned here (plus the SSH-picker rows: `parse_saved_hosts`,
+ * `parse_remote_list`, `remote_join`/`remote_parent`, and the hermetic
+ * saved-host/default/listing/tester bridge surface — no network).
+ * Links the real staticlib via core_bridge.c;
  * exit 0 prints PICKER-OK, 1 on first failure. */
 
 #include "core_bridge.h"
 #include "picker.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -154,11 +158,166 @@ static void remote_bridge_surface(void) {
     bridge_core_free(core);
 }
 
+static void saved_host_axis_parses(void) {
+    /* Pure picker.h shapes for the machine dropdown + folder browser. */
+    CHECK(picker::machine_placeholder_hint().find("user@hostname") !=
+              std::string::npos,
+          "machine hint shows user@hostname");
+    std::string hosts =
+        "[{\"name\":\"Build box\",\"host\":\"alice@buildbox\","
+        "\"default_folder\":\"/srv/api\"},"
+        "{\"name\":\"nas\",\"host\":\"nas\",\"default_folder\":null}]";
+    auto rows = picker::parse_saved_hosts(hosts);
+    CHECK(rows.size() == 2, "saved hosts count");
+    CHECK(rows[0].name == "Build box", "saved host name");
+    CHECK(rows[0].host == "alice@buildbox", "saved host order");
+    CHECK(rows[0].default_folder == "/srv/api", "saved host folder");
+    CHECK(rows[1].default_folder.empty(), "null folder empty");
+    CHECK(picker::parse_saved_hosts("[]").empty(), "empty saved hosts");
+    CHECK(picker::parse_saved_hosts("nope").empty(), "malformed hosts");
+    CHECK(picker::parse_saved_hosts("[{\"name\":\"x\"}]").empty(),
+          "hostless row drops");
+    std::string list =
+        "[{\"name\":\"src\",\"is_dir\":true},"
+        "{\"name\":\"main.c\",\"is_dir\":false},"
+        "{\"name\":\".\",\"is_dir\":true},"
+        "{\"name\":\"..\",\"is_dir\":true}]";
+    auto entries = picker::parse_remote_list(list);
+    CHECK(entries.size() == 2, "remote list count");
+    CHECK(entries[0].name == "src" && entries[0].is_dir, "remote dir");
+    CHECK(entries[1].name == "main.c" && !entries[1].is_dir, "remote file");
+    CHECK(picker::parse_remote_list("[]").empty(), "empty listing");
+    CHECK(picker::parse_remote_list("nope").empty(), "malformed listing");
+    CHECK(picker::remote_join("/srv", "api") == "/srv/api", "join slash");
+    CHECK(picker::remote_join("/srv/", "api") == "/srv/api", "join trailing");
+    CHECK(picker::remote_parent("/srv/api") == "/srv", "parent dir");
+    CHECK(picker::remote_parent("/") == "/", "parent root");
+    CHECK(picker::remote_parent("api").empty(), "parent relative none");
+}
+
+static void ssh_picker_bridge_surface(void) {
+    /* Hermetic SSH-picker surface: STAAP_CONFIG points at a scratch
+     * name so the round trip never touches the live profile (nothing
+     * is saved, so the file is never created); null/blank inputs
+     * degrade without network in every path. */
+    const char *old_cfg = std::getenv("STAAP_CONFIG");
+    std::string saved_old = old_cfg ? old_cfg : "";
+    bool had_old = old_cfg != nullptr;
+    _putenv("STAAP_CONFIG=staap-win-picker-test-scratch.json");
+    StaapCore *core = bridge_core_new();
+    CHECK(core != nullptr, "ssh core new");
+    char *hosts = bridge_saved_hosts_json(core);
+    CHECK(hosts && std::strcmp(hosts, "[]") == 0,
+          "saved hosts fresh empty");
+    bridge_string_free(hosts);
+    char *nullhosts = bridge_saved_hosts_json(nullptr);
+    CHECK(nullhosts && std::strcmp(nullhosts, "[]") == 0,
+          "saved hosts null ok");
+    bridge_string_free(nullhosts);
+    {
+        char *err = nullptr;
+        CHECK(bridge_saved_host_add(core, "", "h", nullptr, &err) != 0,
+              "saved add blank name refuses");
+        CHECK(err && err[0] != '\0', "saved add blank name names fix");
+        free(err);
+    }
+    {
+        char *err = nullptr;
+        CHECK(bridge_saved_host_add(core, "n", "  ", nullptr, &err) != 0,
+              "saved add blank host refuses");
+        CHECK(err && err[0] != '\0', "saved add blank host names fix");
+        free(err);
+    }
+    CHECK(bridge_saved_host_add(core, "", "h", nullptr, nullptr) != 0,
+          "saved add null err refuses");
+    CHECK(bridge_saved_host_add(core, "Build box", "alice@buildbox",
+                                "/srv/api", nullptr) == 0,
+          "saved add stores");
+    {
+        char *h = bridge_saved_hosts_json(core);
+        CHECK(h && std::strstr(h, "alice@buildbox") &&
+                  std::strstr(h, "Build box") && std::strstr(h, "/srv/api"),
+              "saved hosts round trip");
+        bridge_string_free(h);
+    }
+    {
+        char *d = bridge_remote_default_folder(core, "alice@buildbox");
+        CHECK(d && std::strcmp(d, "/srv/api") == 0,
+              "remote default saved host");
+        bridge_string_free(d);
+    }
+    CHECK(bridge_remote_default_folder(core, "no-such-host-xyz") == nullptr,
+          "remote default unknown null");
+    CHECK(bridge_remote_default_folder(core, "") == nullptr,
+          "remote default blank null");
+    CHECK(bridge_remote_default_folder(nullptr, "h") == nullptr,
+          "remote default null core null");
+    {
+        char *err = nullptr;
+        CHECK(bridge_saved_host_remove(core, "no-such-host-xyz", &err) != 0,
+              "saved remove unknown refuses");
+        CHECK(err && err[0] != '\0', "saved remove unknown names fix");
+        free(err);
+    }
+    {
+        char *err = nullptr;
+        CHECK(bridge_saved_host_remove(nullptr, "x", &err) != 0,
+              "saved remove null core refuses");
+        free(err);
+    }
+    CHECK(bridge_saved_host_remove(core, "alice@buildbox", nullptr) == 0,
+          "saved remove by host");
+    {
+        char *h = bridge_saved_hosts_json(core);
+        CHECK(h && std::strcmp(h, "[]") == 0,
+              "saved hosts empty after remove");
+        bridge_string_free(h);
+    }
+    {
+        char *l = bridge_remote_list_json(nullptr, "/x");
+        CHECK(l && std::strcmp(l, "[]") == 0,
+              "remote list null host empty");
+        bridge_string_free(l);
+    }
+    {
+        char *l = bridge_remote_list_json("", "/x");
+        CHECK(l && std::strcmp(l, "[]") == 0,
+              "remote list blank host empty");
+        bridge_string_free(l);
+    }
+    {
+        char *l = bridge_remote_list_json("h", "");
+        CHECK(l && std::strcmp(l, "[]") == 0,
+              "remote list blank path empty");
+        bridge_string_free(l);
+    }
+    {
+        char *t = bridge_remote_test_json(nullptr);
+        CHECK(t && std::strstr(t, "\"reachable\":false") != nullptr,
+              "remote test null unreachable");
+        bridge_string_free(t);
+    }
+    {
+        char *t = bridge_remote_test_json("");
+        CHECK(t && std::strstr(t, "\"reachable\":false") != nullptr,
+              "remote test blank unreachable");
+        bridge_string_free(t);
+    }
+    bridge_core_free(core);
+    if (had_old) {
+        _putenv(("STAAP_CONFIG=" + saved_old).c_str());
+    } else {
+        _putenv("STAAP_CONFIG=");
+    }
+}
+
 int main(void) {
     catalog_parses_in_order();
     recents_parse();
     host_axis_helpers();
     remote_bridge_surface();
+    saved_host_axis_parses();
+    ssh_picker_bridge_surface();
     shared_helpers_come_from_core();
     if (failures == 0) {
         std::printf("PICKER-OK\n");

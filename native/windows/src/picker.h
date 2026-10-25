@@ -14,7 +14,9 @@
  * axis trims/prefixes locally too (`trim_host`, `is_remote`,
  * `with_ssh_prefix`); remote catalogs/recents/spawns stay on the
  * bridge (`bridge_clis_remote`, `bridge_remote_recent_json`,
- * `bridge_run_spawn_remote`).
+ * `bridge_run_spawn_remote`); saved hosts and remote listings parse
+ * locally too (`parse_saved_hosts`, `parse_remote_list`) for the
+ * machine dropdown and the folder browser).
  */
 
 #ifndef STAAP_WIN_PICKER_H
@@ -231,6 +233,245 @@ inline std::string with_ssh_prefix(const std::string &host,
         return preview;
     }
     return "ssh " + h + ": " + preview;
+}
+
+/* Machine-axis hint for the host dropdown/add dialog: always shows a
+ * user@hostname example so the expected shape is visible at a glance. */
+inline std::string machine_placeholder_hint() {
+    return "user@hostname, e.g. alice@buildbox (or ssh-config alias)";
+}
+
+/* One saved SSH host row (parsed from `bridge_saved_hosts_json`:
+ * [{"name","host","default_folder"|null}] in saved order). Malformed
+ * input yields zero rows, never a throw. */
+struct SavedHostRow {
+    std::string name;
+    std::string host;
+    std::string default_folder; /* empty when none */
+};
+
+inline std::vector<SavedHostRow> parse_saved_hosts(const std::string &json) {
+    std::vector<SavedHostRow> out;
+    std::size_t p = json.find('[');
+    if (p == std::string::npos) {
+        return out;
+    }
+    ++p;
+    while (p < json.size() && json[p] != ']') {
+        while (p < json.size() &&
+               (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' ||
+                json[p] == '\r' || json[p] == ',')) {
+            ++p;
+        }
+        if (p >= json.size() || json[p] != '{') {
+            break;
+        }
+        std::size_t start = p;
+        int depth = 0;
+        bool in_str = false, esc = false;
+        for (; p < json.size(); ++p) {
+            char c = json[p];
+            if (in_str) {
+                if (esc) {
+                    esc = false;
+                } else if (c == '\\') {
+                    esc = true;
+                } else if (c == '"') {
+                    in_str = false;
+                }
+            } else if (c == '"') {
+                in_str = true;
+            } else if (c == '{') {
+                ++depth;
+            } else if (c == '}') {
+                if (--depth == 0) {
+                    ++p;
+                    break;
+                }
+            }
+        }
+        if (depth != 0) {
+            break;
+        }
+        std::string obj = json.substr(start, p - start);
+        auto raw = [&](const char *key) -> std::string {
+            std::string pat = std::string("\"") + key + "\"";
+            std::size_t q = obj.find(pat);
+            if (q == std::string::npos) {
+                return {};
+            }
+            q = obj.find(':', q + pat.size());
+            if (q == std::string::npos) {
+                return {};
+            }
+            ++q;
+            while (q < obj.size() &&
+                   (obj[q] == ' ' || obj[q] == '\t')) {
+                ++q;
+            }
+            if (q >= obj.size() || obj[q] != '"') {
+                return {}; /* null or non-string: no value */
+            }
+            std::string val;
+            ++q;
+            while (q < obj.size() && obj[q] != '"') {
+                if (obj[q] != '\\') {
+                    val += obj[q++];
+                    continue;
+                }
+                ++q;
+                if (q >= obj.size()) {
+                    return {};
+                }
+                char e = obj[q++];
+                switch (e) {
+                case '"': val += '"'; break;
+                case '\\': val += '\\'; break;
+                case '/': val += '/'; break;
+                case 'n': val += '\n'; break;
+                case 't': val += '\t'; break;
+                case 'r': val += '\r'; break;
+                default: val += e; break;
+                }
+            }
+            return val;
+        };
+        SavedHostRow row;
+        row.name = raw("name");
+        row.host = raw("host");
+        row.default_folder = raw("default_folder");
+        if (!row.name.empty() && !row.host.empty()) {
+            out.push_back(std::move(row));
+        }
+    }
+    return out;
+}
+
+/* One remote directory listing entry (parsed from
+ * `bridge_remote_list_json`: [{"name","is_dir"}]). Malformed input
+ * yields zero rows, never a throw. */
+struct RemoteEntryRow {
+    std::string name;
+    bool is_dir = false;
+};
+
+inline std::vector<RemoteEntryRow> parse_remote_list(const std::string &json) {
+    std::vector<RemoteEntryRow> out;
+    std::size_t p = json.find('[');
+    if (p == std::string::npos) {
+        return out;
+    }
+    ++p;
+    while (p < json.size() && json[p] != ']') {
+        while (p < json.size() &&
+               (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' ||
+                json[p] == '\r' || json[p] == ',')) {
+            ++p;
+        }
+        if (p >= json.size() || json[p] != '{') {
+            break;
+        }
+        std::size_t start = p;
+        int depth = 0;
+        bool in_str = false, esc = false;
+        for (; p < json.size(); ++p) {
+            char c = json[p];
+            if (in_str) {
+                if (esc) {
+                    esc = false;
+                } else if (c == '\\') {
+                    esc = true;
+                } else if (c == '"') {
+                    in_str = false;
+                }
+            } else if (c == '"') {
+                in_str = true;
+            } else if (c == '{') {
+                ++depth;
+            } else if (c == '}') {
+                if (--depth == 0) {
+                    ++p;
+                    break;
+                }
+            }
+        }
+        if (depth != 0) {
+            break;
+        }
+        std::string obj = json.substr(start, p - start);
+        auto raw = [&](const char *key) -> std::string {
+            std::string pat = std::string("\"") + key + "\"";
+            std::size_t q = obj.find(pat);
+            if (q == std::string::npos) {
+                return {};
+            }
+            q = obj.find(':', q + pat.size());
+            if (q == std::string::npos) {
+                return {};
+            }
+            ++q;
+            while (q < obj.size() &&
+                   (obj[q] == ' ' || obj[q] == '\t')) {
+                ++q;
+            }
+            if (q >= obj.size() || obj[q] != '"') {
+                return {};
+            }
+            std::string val;
+            ++q;
+            while (q < obj.size() && obj[q] != '"') {
+                if (obj[q] != '\\') {
+                    val += obj[q++];
+                    continue;
+                }
+                ++q;
+                if (q >= obj.size()) {
+                    return {};
+                }
+                val += obj[q++];
+            }
+            return val;
+        };
+        std::string name = raw("name");
+        if (name.empty() || name == "." || name == "..") {
+            continue;
+        }
+        RemoteEntryRow row;
+        row.name = std::move(name);
+        row.is_dir = obj.find("\"is_dir\":true") != std::string::npos ||
+                     obj.find("\"is_dir\": true") != std::string::npos;
+        out.push_back(std::move(row));
+    }
+    return out;
+}
+
+/* Join a remote base dir and an entry name with exactly one '/'. */
+inline std::string remote_join(const std::string &base,
+                               const std::string &name) {
+    if (base.empty()) {
+        return name;
+    }
+    if (base.back() == '/') {
+        return base + name;
+    }
+    return base + "/" + name;
+}
+
+/* Parent of a remote path ("/" stays "/"); empty when there is no
+ * parent to go up to (relative single segment). */
+inline std::string remote_parent(const std::string &path) {
+    std::string cpy = path;
+    while (cpy.size() > 1 && cpy.back() == '/') {
+        cpy.pop_back();
+    }
+    std::size_t slash = cpy.find_last_of('/');
+    if (slash == std::string::npos) {
+        return {};
+    }
+    if (slash == 0) {
+        return "/";
+    }
+    return cpy.substr(0, slash);
 }
 
 } /* namespace picker */

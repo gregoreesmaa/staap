@@ -114,8 +114,13 @@ impl ShellView {
             } else {
                 picker.folder_input.clone()
             };
+            // Machine-field placeholder hint (SSH picker): an empty host
+            // axis names the `user@hostname` shape plus a concrete
+            // example, so the field never looks like free prose.
             let host_part = if remote {
                 format!(" · ssh {host}")
+            } else if self.picker_remote.host_focus {
+                format!(" · machine: {}", super::picker::MACHINE_PLACEHOLDER)
             } else {
                 String::new()
             };

@@ -42,12 +42,13 @@ struct StaapMacApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("New Session", action: appState.repeatLastSession)
-                    .keyboardShortcut("n", modifiers: .command)
-                Button("Choose Folder, CLI, Options…") {
+                // Single New Session entry: every press shows the
+                // in-place screen on the right side (no sheet/modal,
+                // no split-button repeat).
+                Button("New Session") {
                     appState.pickerOpen = true
                 }
-                .keyboardShortcut("n", modifiers: [.command, .shift])
+                .keyboardShortcut("n", modifiers: .command)
                 // Restart/close parity with the other shells (Ctrl+R /
                 // Ctrl+W there; Cmd-R / Cmd-W here). Persistence is
                 // automatic — no Save command.

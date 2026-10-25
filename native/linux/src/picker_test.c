@@ -6,8 +6,11 @@
  * pins the bridge's own thin wrappers (malloc/free discipline, NULL
  * conventions) against the real staticlib — no GTK needed. Remote
  * coverage (`bridge_clis_remote`, `bridge_remote_recent_json`,
- * `bridge_run_spawn_remote`) is hermetic: null/blank/unknown hosts never
- * touch the network.
+ * `bridge_run_spawn_remote`, plus the SSH-picker surface
+ * `bridge_saved_hosts_json` / `bridge_saved_host_add` /
+ * `bridge_saved_host_remove` / `bridge_remote_default_folder` /
+ * `bridge_remote_list_json` / `bridge_remote_test_json`) is hermetic:
+ * null/blank/unknown hosts never touch the network.
  *
  * Exit 0 on success (`PICKER-OK`), 1 on first failure. */
 
@@ -129,6 +132,90 @@ int main(void) {
         CHECK(rc != 0, "remote spawn null host refuses");
         CHECK(err && err[0], "remote spawn null host names fix");
         free(err);
+    }
+
+    /* Saved hosts + remote default/listing/tester (SSH picker):
+     * hermetic — null/blank inputs degrade without network. */
+    char *hosts = bridge_saved_hosts_json(core);
+    CHECK(hosts && strcmp(hosts, "[]") == 0, "saved hosts fresh empty");
+    bridge_string_free(hosts);
+    CHECK(bridge_saved_hosts_json(NULL) != NULL, "saved hosts null ok");
+    bridge_string_free(bridge_saved_hosts_json(NULL));
+    {
+        char *err = NULL;
+        CHECK(bridge_saved_host_add(core, "", "h", NULL, &err) != 0,
+              "saved add blank name refuses");
+        CHECK(err && err[0], "saved add blank name names fix");
+        free(err);
+    }
+    {
+        char *err = NULL;
+        CHECK(bridge_saved_host_add(core, "n", "  ", NULL, &err) != 0,
+              "saved add blank host refuses");
+        CHECK(err && err[0], "saved add blank host names fix");
+        free(err);
+    }
+    CHECK(bridge_saved_host_add(core, "Build box", "alice@buildbox",
+                                "/srv/api", NULL) == 0,
+          "saved add stores");
+    {
+        char *h = bridge_saved_hosts_json(core);
+        CHECK(h && strstr(h, "alice@buildbox") && strstr(h, "Build box") &&
+                  strstr(h, "/srv/api"),
+              "saved hosts round trip");
+        bridge_string_free(h);
+    }
+    {
+        char *d = bridge_remote_default_folder(core, "alice@buildbox");
+        CHECK(d && strcmp(d, "/srv/api") == 0, "remote default saved host");
+        bridge_string_free(d);
+    }
+    CHECK(bridge_remote_default_folder(core, "no-such-host-xyz") == NULL,
+          "remote default unknown null");
+    CHECK(bridge_remote_default_folder(core, "") == NULL,
+          "remote default blank null");
+    CHECK(bridge_remote_default_folder(NULL, "h") == NULL,
+          "remote default null core null");
+    {
+        char *err = NULL;
+        CHECK(bridge_saved_host_remove(core, "no-such-host-xyz", &err) != 0,
+              "saved remove unknown refuses");
+        CHECK(err && err[0], "saved remove unknown names fix");
+        free(err);
+    }
+    CHECK(bridge_saved_host_remove(core, "alice@buildbox", NULL) == 0,
+          "saved remove by host");
+    {
+        char *h = bridge_saved_hosts_json(core);
+        CHECK(h && strcmp(h, "[]") == 0, "saved hosts empty after remove");
+        bridge_string_free(h);
+    }
+    {
+        char *l = bridge_remote_list_json(NULL, "/x");
+        CHECK(l && strcmp(l, "[]") == 0, "remote list null host empty");
+        bridge_string_free(l);
+    }
+    {
+        char *l = bridge_remote_list_json("", "/x");
+        CHECK(l && strcmp(l, "[]") == 0, "remote list blank host empty");
+        bridge_string_free(l);
+    }
+    {
+        char *l = bridge_remote_list_json("h", "");
+        CHECK(l && strcmp(l, "[]") == 0, "remote list blank path empty");
+        bridge_string_free(l);
+    }
+    {
+        char *t = bridge_remote_test_json(NULL);
+        CHECK(t && strstr(t, "\"reachable\":false"),
+              "remote test null unreachable");
+        bridge_string_free(t);
+    }
+    {
+        char *t = bridge_remote_test_json("");
+        CHECK(t && strstr(t, "\"reachable\":false"),
+              "remote test blank unreachable");
+        bridge_string_free(t);
     }
 
     bridge_core_free(core);

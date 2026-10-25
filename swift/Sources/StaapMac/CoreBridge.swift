@@ -30,6 +30,39 @@ import Foundation
     _ core: OpaquePointer?,
     _ host: UnsafePointer<CChar>?
 ) -> UnsafeMutablePointer<CChar>?
+// Saved SSH hosts for the picker dropdown ([{name,host,default_folder}];
+// null core yields []). Adds/removes persist via `staap_core_save`.
+@_silgen_name("staap_saved_hosts_json") private func staap_saved_hosts_json(
+    _ core: OpaquePointer?
+) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("staap_saved_host_add") private func staap_saved_host_add(
+    _ core: OpaquePointer?,
+    _ name: UnsafePointer<CChar>?,
+    _ host: UnsafePointer<CChar>?,
+    _ defaultFolder: UnsafePointer<CChar>?
+) -> Int32
+@_silgen_name("staap_saved_host_remove") private func staap_saved_host_remove(
+    _ core: OpaquePointer?,
+    _ key: UnsafePointer<CChar>?
+) -> Int32
+// Owned default remote folder for one SSH host (saved default, else host
+// MRU head, else null = remote home). Null/blank hosts yield null.
+@_silgen_name("staap_remote_default_folder") private func staap_remote_default_folder(
+    _ core: OpaquePointer?,
+    _ host: UnsafePointer<CChar>?
+) -> UnsafeMutablePointer<CChar>?
+// Owned JSON of one remote directory listing ([{name,is_dir}]); every
+// failure degrades to []. Blocking: call off the main thread.
+@_silgen_name("staap_remote_list_json") private func staap_remote_list_json(
+    _ host: UnsafePointer<CChar>?,
+    _ path: UnsafePointer<CChar>?
+) -> UnsafeMutablePointer<CChar>?
+// Owned JSON of the add-dialog tester result
+// ({reachable,clis}); every failure degrades to unreachable.
+// Blocking: call off the main thread, on tester-button press only.
+@_silgen_name("staap_remote_test_json") private func staap_remote_test_json(
+    _ host: UnsafePointer<CChar>?
+) -> UnsafeMutablePointer<CChar>?
 // Owned harness id of the effective CLI for `cli` (explicit id, or the
 // core's last-used / configured / autodetected resolution for NULL).
 @_silgen_name("staap_effective_cli") private func staap_effective_cli(
@@ -214,6 +247,49 @@ struct CliRow: Decodable {
     var program: String
     var path: String?
     var available: Bool
+}
+
+/// One saved SSH host decoded from `staap_saved_hosts_json`
+/// (`[{name,host,default_folder|null}]` in saved order). No secret fields
+/// exist: the core stores a display label, an SSH target
+/// (`user@hostname` or an ssh-config alias), and an optional per-host
+/// default folder.
+struct SavedHost: Decodable {
+    var name: String
+    var host: String
+    var defaultFolder: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case host
+        case defaultFolder = "default_folder"
+    }
+
+    /// Dropdown label: display name with the SSH target, or the bare
+    /// target when unnamed.
+    var displayLabel: String {
+        name.isEmpty ? host : "\(name) (\(host))"
+    }
+}
+
+/// One remote directory entry decoded from `staap_remote_list_json`
+/// (`[{name,is_dir}]`, capped at 500 rows in the core).
+struct RemoteEntry: Decodable {
+    var name: String
+    var isDir: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case isDir = "is_dir"
+    }
+}
+
+/// Add-dialog tester result decoded from `staap_remote_test_json`
+/// (`{reachable,clis}` from one bounded non-interactive `ssh` round
+/// trip). Unreachable hosts degrade to `reachable == false`.
+struct RemoteTestResult: Decodable {
+    var reachable: Bool
+    var clis: [CliRow]
 }
 
 /// One roster row decoded from the core's `ChatSession` JSON
@@ -573,6 +649,91 @@ final class Core {
                let recents = try? JSONDecoder().decode([String].self, from: data)
             {
                 result = recents
+            }
+        }
+        return result
+    }
+
+    /// Saved SSH hosts for the machine dropdown (saved order). Decodes
+    /// to [] when absent; never throws.
+    func savedHosts() -> [SavedHost] {
+        guard let text = copyOwnedString(staap_saved_hosts_json(handle)),
+              let data = text.data(using: .utf8),
+              let hosts = try? JSONDecoder().decode([SavedHost].self, from: data)
+        else { return [] }
+        return hosts
+    }
+
+    /// Save (or update, by trimmed host) an SSH host for the dropdown.
+    /// Blank names/hosts throw with the core message naming the fix;
+    /// persisting is the caller's funnel (`save()`), like every close.
+    func addSavedHost(name: String, host: String, defaultFolder: String?) throws {
+        let rc = name.withCString { namePtr in
+            host.withCString { hostPtr in
+                withOptionalCString(defaultFolder) { folderPtr in
+                    staap_saved_host_add(handle, namePtr, hostPtr, folderPtr)
+                }
+            }
+        }
+        if rc != 0 {
+            throw CoreError.spawn(message: Self.lastError())
+        }
+    }
+
+    /// Remove a saved SSH host by host or display name. Unknown keys
+    /// throw with the core "no such host" message (fail visible).
+    func removeSavedHost(key: String) throws {
+        let rc = key.withCString { staap_saved_host_remove(handle, $0) }
+        if rc != 0 {
+            throw CoreError.spawn(message: Self.lastError())
+        }
+    }
+
+    /// Default remote folder for one SSH host: the saved host default,
+    /// else the host MRU head, else nil (the remote login directory).
+    /// A local read, never the network; nil also covers blank hosts.
+    func remoteDefaultFolder(host: String) -> String? {
+        let trimmed = host.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        var result: String?
+        trimmed.withCString { hostPtr in
+            result = copyOwnedString(staap_remote_default_folder(handle, hostPtr))
+        }
+        let cleaned = result?.trimmingCharacters(in: .whitespaces)
+        return (cleaned?.isEmpty ?? true) ? nil : cleaned
+    }
+
+    /// One remote directory listing for the folder browser. Blocking:
+    /// one bounded `ssh` round trip — callers fetch this off the main
+    /// thread. Decodes to [] on every failure (unreachable hosts render
+    /// as an empty browser section, never a hang).
+    static func remoteList(host: String, path: String) -> [RemoteEntry] {
+        var result: [RemoteEntry] = []
+        host.withCString { hostPtr in
+            path.withCString { pathPtr in
+                if let text = copyOwnedString(staap_remote_list_json(hostPtr, pathPtr)),
+                   let data = text.data(using: .utf8),
+                   let entries = try? JSONDecoder().decode([RemoteEntry].self, from: data)
+                {
+                    result = entries
+                }
+            }
+        }
+        return result
+    }
+
+    /// Add-dialog tester result for one SSH host. Blocking: one bounded
+    /// non-interactive `ssh` round trip — callers fetch this off the
+    /// main thread, on tester-button press only. Degrades to unreachable
+    /// (never throws, never hangs on auth prompts).
+    static func remoteTest(host: String) -> RemoteTestResult {
+        var result = RemoteTestResult(reachable: false, clis: [])
+        host.withCString { hostPtr in
+            if let text = copyOwnedString(staap_remote_test_json(hostPtr)),
+               let data = text.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode(RemoteTestResult.self, from: data)
+            {
+                result = decoded
             }
         }
         return result

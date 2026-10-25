@@ -6,6 +6,7 @@
 #include "MainWindow.xaml.g.h"
 
 #include "core_bridge.h"
+#include "picker.h"
 
 namespace winrt::StaapWinUI::implementation
 {
@@ -23,35 +24,56 @@ namespace winrt::StaapWinUI::implementation
         MainWindow();
         ~MainWindow();
 
-        void NewButton_Click(
+        /* Single New Session entry: opens the in-place new-session
+         * screen on the right side on every press. */
+        void NewSessionButton_Click(
             Windows::Foundation::IInspectable const &sender,
             Microsoft::UI::Xaml::RoutedEventArgs const &args);
-        /* SplitButton primary-face entry: same instant repeat-last as
-         * NewButton_Click (which stays for the menu item + Ctrl+N). */
-        void NewSplitButton_Click(
-            Windows::Foundation::IInspectable const &sender,
-            Microsoft::UI::Xaml::Controls::SplitButtonClickEventArgs const
-                &args);
-        void RestartButton_Click(
-            Windows::Foundation::IInspectable const &sender,
-            Microsoft::UI::Xaml::RoutedEventArgs const &args);
-        void CloseButton_Click(
-            Windows::Foundation::IInspectable const &sender,
-            Microsoft::UI::Xaml::RoutedEventArgs const &args);
-        /* Instant repeat-last shared by the face, the menu item, and
-         * Ctrl+N: one path, no divergence. */
-        void RepeatLastSession();
         /* Restart/resume + close for the selected run (Ctrl+R / Ctrl+W,
          * parity with the `r`/`x` keys and the other shells). */
         void RestartSelected();
         void CloseSelected();
-        /* 2D new-session picker (SSH host + folder x CLI + tri-state
-         * yolo): the caret/menu counterpart to NewButton_Click's instant
-         * repeat. */
-        void PickButton_Click(
+        /* In-place new-session screen controls (machine dropdown + SSH
+         * add dialog + remote folder browser + folder x CLI + tri-state
+         * yolo). */
+        void MachineBox_SelectionChanged(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const
+                &args);
+        void PickerFolderBox_TextChanged(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::Controls::TextChangedEventArgs const &args);
+        void PickerRecentBox_SelectionChanged(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const
+                &args);
+        void PickerCliBox_SelectionChanged(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const
+                &args);
+        void PickerYoloBox_SelectionChanged(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const
+                &args);
+        void RemoteBrowser_SelectionChanged(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const
+                &args);
+        void BrowserUp_Click(
             Windows::Foundation::IInspectable const &sender,
             Microsoft::UI::Xaml::RoutedEventArgs const &args);
-        fire_and_forget PickNewSessionAsync();
+        void BrowserRefresh_Click(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::RoutedEventArgs const &args);
+        void PickerBrowse_Click(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::RoutedEventArgs const &args);
+        void PickerStart_Click(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::RoutedEventArgs const &args);
+        void PickerCancel_Click(
+            Windows::Foundation::IInspectable const &sender,
+            Microsoft::UI::Xaml::RoutedEventArgs const &args);
         void FilterBox_TextChanged(
             Windows::Foundation::IInspectable const &sender,
             Microsoft::UI::Xaml::Controls::TextChangedEventArgs const &args);
@@ -140,6 +162,33 @@ namespace winrt::StaapWinUI::implementation
         int m_emptyMode{2};
         std::string m_filter;                   /* sidebar filter (UTF-8) */
         std::string m_fingerprint; /* roster rebuild gate */
+        /* In-place new-session screen state (dumb renderer: the
+         * core owns saved hosts, recents, catalogs, and spawns;
+         * this only caches widget rows + generations for
+         * stale-drop). */
+        bool m_pickerOpen{false};
+        bool m_pickerSync{false}; /* true while rebuilding picker lists */
+        std::vector<picker::CliRow> m_pickerClis;
+        std::vector<std::string> m_pickerRecents;
+        std::vector<std::string> m_machineHosts; /* parallel to MachineBox */
+        std::string m_machineHost; /* trimmed host, empty = this machine */
+        size_t m_machineSel{0}; /* last non-Add machine selection */
+        std::string m_browsePath; /* last listed remote dir */
+        unsigned m_browseGen{0}; /* bumped per listing; stale arrivals drop */
+        unsigned m_probeGen{0}; /* bumped per host edit; stale arrivals drop */
+        void OpenNewSession();
+        void CloseNewSession();
+        fire_and_forget ShowAddMachineDialog();
+        std::string PickerCli();
+        void RefreshPickerPreview();
+        void RefreshPickerYolo(std::string const &cli);
+        void RebuildCliRows(std::vector<picker::CliRow> fresh);
+        void RebuildMachineBox(std::string const &select_host);
+        void AfterMachine();
+        void ReloadPickerRecents();
+        void KickProbe();
+        void BrowseRefresh();
+        void RenderBrowser(std::string const &json);
         Microsoft::UI::Dispatching::DispatcherQueueTimer m_timer{nullptr};
         winrt::event_token m_closedToken{};
     };

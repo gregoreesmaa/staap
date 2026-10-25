@@ -7,11 +7,14 @@ import SwiftUI
 ///
 /// - Roster: core registry rows grouped Needs input → Working → Idle →
 ///   History, with an inline sidebar filter field (core-owned text).
-/// - Spawn: the sidebar New Session button (or the detail Spawn
-///   button) attaches a real roster row in the core via `staap_run_spawn`;
+/// - Spawn: the single sidebar New Session button shows the in-place
+///   new-session screen on the right side every press (folder × CLI +
+///   yolo, with the machine dropdown and remote folder browser); Start
+///   attaches a real roster row in the core via `staap_run_spawn`.
 ///   Restart/Close act on the selected row via `staap_run_restart` /
-///   `staap_run_close`. Typing in the terminal converses through
-///   `staap_run_write`.
+///   `staap_run_close` (row context menus, keyboard shortcuts, and the
+///   detail pane — never the New Session button). Typing in the
+///   terminal converses through `staap_run_write`.
 /// - History: every row shows its project, harness, and last-active age;
 ///   the rows themselves come from discovery + the persisted store, so
 ///   they survive relaunches. Ended rows offer restart inline.
@@ -25,24 +28,18 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
-                // Split-button 2D launch: the main action repeats the
-                // last launch instantly; the menu opens the full picker
-                // (folder × CLI + yolo) or repeats explicitly.
-                Menu {
-                    Button("Repeat last session", action: state.repeatLastSession)
-                    Button("Choose folder, CLI, options…") { state.pickerOpen = true }
-                        .keyboardShortcut("n", modifiers: [.command, .shift])
-                    Button("Restart selected run", action: state.restartSelected)
-                        .keyboardShortcut("r", modifiers: .command)
-                    Button("Close selected run", action: state.closeSelected)
-                        .keyboardShortcut("w", modifiers: .command)
-                } label: {
+                // Single New Session button: every press shows the
+                // in-place new-session screen on the right side (folder
+                // × CLI + yolo, machine dropdown, remote folder
+                // browser). Restart/Close deliberately ride only the row
+                // context menus, keyboard shortcuts, and the detail
+                // pane — never this button.
+                Button { state.pickerOpen = true } label: {
                     Label("New Session", systemImage: "plus")
                 }
-                .menuStyle(.button)
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut("n", modifiers: .command)
-                .help("Repeat the last session, or pick folder × CLI + yolo")
+                .help("Pick folder × CLI + yolo on the right side")
                 .padding(8)
                 Divider()
                 // Filter sits above the list, not inside it: as a List
@@ -132,16 +129,23 @@ struct ContentView: View {
                 // never stick; in-place updates keep the instance and the
                 // scroll position.
                 .id(rosterSequenceID)
-                // No sidebar footer: Restart/Close ride the New Session
-                // menu, row context menus, keyboard shortcuts, and the
-                // detail pane (Windows parity — no headings, no footer).
+                // No sidebar footer: Restart/Close ride the row context
+                // menus, keyboard shortcuts, and the detail pane
+                // (Windows parity — no headings, no footer).
             }
         } detail: {
-            // SwiftUI counts the toolbar height as detail safe area,
-            // leaving a toolbar-tall dead gap above the terminal: ignore
-            // only the top container inset so the terminal starts at the
+            // The in-place new-session screen takes the whole right
+            // side every time New Session is pressed (no sheet/modal).
+            // Otherwise the terminal owns the detail: SwiftUI counts
+            // the toolbar height as detail safe area, leaving a
+            // toolbar-tall dead gap above the terminal, so ignore only
+            // the top container inset and the terminal starts at the
             // window edge. Keyboard safe area is untouched.
-            detailView.ignoresSafeArea(.container, edges: .top)
+            if state.pickerOpen {
+                NewSessionScreen(state: state, isPresented: $state.pickerOpen)
+            } else {
+                detailView.ignoresSafeArea(.container, edges: .top)
+            }
         }
         // Repaint the window background when the system appearance
         // changes mid-run.
@@ -153,18 +157,14 @@ struct ContentView: View {
         } message: {
             Text(state.pendingError ?? "")
         }
-        .sheet(isPresented: $state.pickerOpen) {
-            NewSessionSheet(state: state, isPresented: $state.pickerOpen)
-        }
     }
 
     // MARK: - Sidebar
 
-    // No sidebar heading and no footer: Restart/Close ride the New
-    // Session menu, row context menus, keyboard shortcuts, and the
-    // detail pane (Windows parity). Persistence is automatic (no Save
-    // button); the shell follows the system appearance (no manual
-    // theme override).
+    // No sidebar heading and no footer: Restart/Close ride the row
+    // context menus, keyboard shortcuts, and the detail pane (Windows
+    // parity). Persistence is automatic (no Save button); the shell
+    // follows the system appearance (no manual theme override).
 
     private struct StatusSection {
         var status: Int
@@ -367,16 +367,26 @@ private struct WindowDragStrip: NSViewRepresentable {
     }
 }
 
-/// 2D new-session sheet: working folder × agent CLI + one-shot yolo.
+/// 2D new-session screen: working folder × agent CLI + one-shot yolo,
+/// shown in place on the right side (no sheet/modal).
 ///
+/// - Machine: a dropdown (This machine, saved hosts, Add remote
+///   machine…) over the core saved-hosts. The Add row opens the SSH add
+///   sheet (display name, `user@hostname`-or-alias host, default
+///   folder, Test + Save/Cancel). A picked remote host runs the CLI on
+///   that host over `ssh -t` and probes the remote catalog off the main
+///   thread, so picking never blocks on the network.
 /// - Folder: Choose… (directory panel) or a text field (blank =
-///   inherit) plus the persisted recents for one-click refill. A
-///   missing folder refuses inline — the sheet never spawns into nothing.
+///   inherit) plus the persisted recents for one-click refill locally;
+///   remotely a text field plus the core-driven folder browser (remote
+///   listing from the host default folder, stale arrivals dropped). A
+///   missing local folder refuses inline — the screen never spawns into
+///   nothing.
 /// - CLI: a picker over the autodetected catalog; missing CLIs render
 ///   disabled with an install hint, never hidden.
 /// - Yolo: a tri-state toggle (labeled default on/off + on/off once),
 ///   safe by default; the footer previews the exact combination.
-private struct NewSessionSheet: View {
+private struct NewSessionScreen: View {
     @ObservedObject var state: AppState
     @Binding var isPresented: Bool
 
@@ -385,46 +395,74 @@ private struct NewSessionSheet: View {
     @State private var folder = ""
     @State private var yolo = NewSessionPicker.YoloChoice.useDefault
     @State private var folderError: String?
-    @State private var host = ""
+    @State private var machine = ""
+    @State private var previousMachine = ""
+    @State private var savedHosts: [SavedHost] = []
+    @State private var unsavedLastHost = ""
+    @State private var showAddSheet = false
     @State private var remoteClis: [CliRow]? = nil
     @State private var probingRemote = false
     @State private var probeToken = 0
+    @State private var remotePath = "~"
+    @State private var remoteEntries: [RemoteEntry] = []
+    @State private var listingRemote = false
+    @State private var listToken = 0
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Start a new run").font(.title2)
-            // Folder axis.
-            Text("Where should it work?").font(.headline)
-            HStack {
-                TextField("Blank = current folder", text: $folder)
-                    .textFieldStyle(.roundedBorder)
-                Button("Choose…") { chooseFolder() }
-            }
-            if !recents.isEmpty {
-                Picker("Recent", selection: $folder) {
-                    Text("Type a folder…").tag("")
-                    ForEach(recents, id: \.self) { recent in
-                        Text(recent).tag(recent)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Start a new run").font(.title2)
+                // Machine axis: dropdown over the core saved-hosts (This
+                // machine, saved hosts with display names, Add remote
+                // machine…). The hint under it always shows the
+                // `user@hostname` shape new hosts must take.
+                Text("Which machine?").font(.headline)
+                Picker("Machine", selection: $machine) {
+                    Text("This machine").tag("")
+                    ForEach(savedHosts, id: \.host) { saved in
+                        Text(saved.displayLabel).tag(saved.host)
                     }
+                    if !unsavedLastHost.isEmpty,
+                       !savedHosts.contains(where: { $0.host == unsavedLastHost })
+                    {
+                        Text(unsavedLastHost).tag(unsavedLastHost)
+                    }
+                    Text("Add remote machine…").tag(NewSessionPicker.addMachineTag)
                 }
                 .pickerStyle(.menu)
-            }
-            // SSH host axis: blank means this Mac (the historic local
-            // path); anything else runs the CLI on that host over
-            // `ssh -t` and probes the remote catalog off the main
-            // thread, so typing never blocks on the network.
-            Text("Which machine?").font(.headline)
-            TextField("Blank = this Mac", text: $host)
-                .textFieldStyle(.roundedBorder)
-                .onChange(of: host) { _, _ in hostChanged() }
-            if isRemote {
-                Text(remoteStatusLine)
+                .onChange(of: machine) { _, _ in machineChanged() }
+                Text(NewSessionPicker.machinePlaceholder)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-            if let folderError {
-                Text(folderError).foregroundStyle(.red).font(.caption)
-            }
+                if isRemote {
+                    Text(remoteStatusLine)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                // Folder axis: local directory panel + recents, or the
+                // remote browser when a host is picked.
+                if isRemote {
+                    remoteFolderSection
+                } else {
+                    Text("Where should it work?").font(.headline)
+                    HStack {
+                        TextField("Blank = current folder", text: $folder)
+                            .textFieldStyle(.roundedBorder)
+                        Button("Choose…") { chooseFolder() }
+                    }
+                    if !recents.isEmpty {
+                        Picker("Recent", selection: $folder) {
+                            Text("Type a folder…").tag("")
+                            ForEach(recents, id: \.self) { recent in
+                                Text(recent).tag(recent)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
+                }
+                if let folderError {
+                    Text(folderError).foregroundStyle(.red).font(.caption)
+                }
             // CLI axis.
             Text("Who should do it?").font(.headline)
             Picker("Agent CLI", selection: $cliId) {
@@ -462,20 +500,32 @@ private struct NewSessionSheet: View {
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) { isPresented = false }
-                Button("Spawn") { spawn() }
+                Button("Start") { spawn() }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
                     .disabled(shownClis.isEmpty)
             }
+            } // VStack (the ScrollView closes below; the screen scrolls)
+            .padding(20)
+            .frame(maxWidth: 560)
         }
-        .padding(20)
-        .frame(minWidth: 360)
         .onAppear {
             clis = state.pickerCatalog()
-            host = state.lastRemoteHost
+            savedHosts = state.pickerSavedHosts()
+            // Preselect the last-used host (saved or not — an unsaved
+            // last host renders as its own row until one is picked), or
+            // This machine when nothing was ever used remotely.
+            let last = state.lastRemoteHost.trimmingCharacters(in: .whitespaces)
+            if !last.isEmpty {
+                machine = last
+                if !savedHosts.contains(where: { $0.host == last }) {
+                    unsavedLastHost = last
+                }
+            }
+            previousMachine = machine
             // Preselect the first available CLI (catalog order); a
             // configured-but-missing default stays listed but never
-            // preselected — Spawn would fail for certain.
+            // preselected — Start would fail for certain.
             if let firstUp = clis.first(where: { $0.available }) {
                 if !clis.contains(where: { $0.id == cliId && $0.available }) {
                     cliId = firstUp.id
@@ -485,23 +535,159 @@ private struct NewSessionSheet: View {
             }
             folder = state.pickerRecents().first ?? ""
             if effectiveHost != nil {
+                applyRemoteDefaults()
                 startRemoteProbe()
+                startRemoteList()
+            }
+        }
+        .sheet(isPresented: $showAddSheet, onDismiss: {
+            // Dismissing the add sheet without saving returns the
+            // dropdown to the previously picked machine.
+            if machine == NewSessionPicker.addMachineTag {
+                machine = previousMachine
+            }
+        }) {
+            SshAddSheet(state: state, isPresented: $showAddSheet) { savedHost in
+                savedHosts = state.pickerSavedHosts()
+                unsavedLastHost = ""
+                machine = savedHost
+                previousMachine = savedHost
+                hostChanged()
             }
         }
     }
 
-    /// Host changed: drop the stale remote catalog and probe the new
-    /// host off the main thread (`staap_remote_clis_json` blocks on one
-    /// bounded `ssh` round trip). Arrivals carry a token, so a stale
-    /// host's late arrival never overwrites the current one.
+    /// Remote folder browser: the working folder text plus the
+    /// core-driven listing of the browsed remote path (directories
+    /// navigate, files are inert). The listing starts at the host
+    /// default folder (saved default, then host MRU, then home) and
+    /// refreshes off the main thread with stale-arrival drops.
+    private var remoteFolderSection: some View {
+        Group {
+            Text("Where should it work?").font(.headline)
+            HStack {
+                TextField("Remote folder (blank = home)", text: $folder)
+                    .textFieldStyle(.roundedBorder)
+                Button("Go") {
+                    let trimmed = folder.trimmingCharacters(in: .whitespaces)
+                    remotePath = trimmed.isEmpty ? "~" : trimmed
+                    startRemoteList()
+                }
+                .help("List this remote folder below")
+            }
+            if !recents.isEmpty {
+                Picker("Recent", selection: $folder) {
+                    Text("Type a folder…").tag("")
+                    ForEach(recents, id: \.self) { recent in
+                        Text(recent).tag(recent)
+                    }
+                }
+                .pickerStyle(.menu)
+                .onChange(of: folder) { _, newValue in
+                    let trimmed = newValue.trimmingCharacters(in: .whitespaces)
+                    if !trimmed.isEmpty {
+                        remotePath = trimmed
+                        startRemoteList()
+                    }
+                }
+            }
+            HStack {
+                Text(remotePath)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                if NewSessionPicker.remoteParent(of: remotePath) != nil {
+                    Button("Up") {
+                        if let parent = NewSessionPicker.remoteParent(of: remotePath) {
+                            remotePath = parent
+                            startRemoteList()
+                        }
+                    }
+                }
+                Button("Refresh") { startRemoteList() }
+            }
+            if listingRemote {
+                Text("Listing remote folder over ssh…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if remoteEntries.isEmpty {
+                Text("Empty or unreachable folder.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(remoteEntries, id: \.name) { entry in
+                    if entry.isDir {
+                        Button {
+                            remotePath = NewSessionPicker.remoteJoin(
+                                base: remotePath, name: entry.name)
+                            startRemoteList()
+                        } label: {
+                            Label(entry.name, systemImage: "folder")
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        // Files are inert: shown, never entered.
+                        Text(entry.name)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Button("Use this folder") { folder = remotePath }
+            }
+        }
+    }
+
+    /// Machine picked: the Add row opens the SSH add sheet, anything
+    /// else drops the stale remote state and probes the new host off
+    /// the main thread. Arrivals carry a token, so a stale machine's
+    /// late arrival never overwrites the current one.
+    private func machineChanged() {
+        if machine == NewSessionPicker.addMachineTag {
+            showAddSheet = true
+            return
+        }
+        previousMachine = machine
+        hostChanged()
+    }
+
+    /// Host changed: drop the stale remote catalog and listing, apply
+    /// the host default folder, and probe the new host off the main
+    /// thread (`staap_remote_clis_json` blocks on one bounded `ssh`
+    /// round trip).
     private func hostChanged() {
         probeToken += 1
+        listToken += 1
         if effectiveHost == nil {
             remoteClis = nil
             probingRemote = false
+            remoteEntries = []
+            listingRemote = false
             return
         }
+        applyRemoteDefaults()
         startRemoteProbe()
+        startRemoteList()
+    }
+
+    /// Blank folder inherits the host default (saved default, then host
+    /// MRU, then home): the browser lists "~" while the folder stays
+    /// blank-to-home. A typed folder is never clobbered.
+    private func applyRemoteDefaults() {
+        guard let remote = effectiveHost else { return }
+        if folder.trimmingCharacters(in: .whitespaces).isEmpty {
+            let recents = state.pickerRemoteRecents(host: remote)
+            let savedDefault = savedHosts.first(where: { $0.host == remote })?.defaultFolder
+                ?? state.pickerRemoteDefault(host: remote)
+            if let resolved = NewSessionPicker.resolveRemoteDefault(
+                savedDefault: savedDefault, recents: recents)
+            {
+                folder = resolved
+            }
+        }
+        let trimmed = folder.trimmingCharacters(in: .whitespaces)
+        remotePath = trimmed.isEmpty ? "~" : trimmed
     }
 
     private func startRemoteProbe() {
@@ -523,9 +709,34 @@ private struct NewSessionSheet: View {
                 } else if let first = catalog.first {
                     cliId = first.id
                 }
-                if folder.trimmingCharacters(in: .whitespaces).isEmpty {
-                    folder = state.pickerRemoteRecents(host: remote).first ?? ""
-                }
+            }
+        }
+    }
+
+    /// List the browsed remote path off the main thread
+    /// (`staap_remote_list_json` blocks on one bounded `ssh` round
+    /// trip). Arrivals carry a token plus their host/path, so a stale
+    /// listing never overwrites the current one.
+    private func startRemoteList() {
+        guard let remote = effectiveHost else { return }
+        let path = remotePath.trimmingCharacters(in: .whitespaces)
+        guard !path.isEmpty else {
+            remoteEntries = []
+            listingRemote = false
+            return
+        }
+        listToken += 1
+        let token = listToken
+        listingRemote = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let entries = Core.remoteList(host: remote, path: path)
+            DispatchQueue.main.async {
+                guard token == listToken,
+                      effectiveHost == remote,
+                      remotePath.trimmingCharacters(in: .whitespaces) == path
+                else { return }
+                listingRemote = false
+                remoteEntries = entries
             }
         }
     }
@@ -550,9 +761,16 @@ private struct NewSessionSheet: View {
         return state.pickerRecents()
     }
 
+    /// Dropdown machine backing the Add row: while the add sheet is
+    /// open the tag sits on the sentinel, so fall back to the previous
+    /// pick until the sheet saves or dismisses.
+    private var effectiveMachine: String {
+        machine == NewSessionPicker.addMachineTag ? previousMachine : machine
+    }
+
     /// Trimmed SSH host, or nil for a local launch on this Mac.
     private var effectiveHost: String? {
-        let trimmed = host.trimmingCharacters(in: .whitespaces)
+        let trimmed = effectiveMachine.trimmingCharacters(in: .whitespaces)
         return trimmed.isEmpty ? nil : trimmed
     }
 
@@ -564,7 +782,7 @@ private struct NewSessionSheet: View {
         effectiveHost != nil ? (remoteClis ?? []) : clis
     }
 
-    /// Status line under the host field: probing state or availability.
+    /// Status line under the machine dropdown: probing state or availability.
     private var remoteStatusLine: String {
         if probingRemote { return "Probing remote CLIs over ssh…" }
         let n = (remoteClis ?? []).filter { $0.available }.count
@@ -621,5 +839,126 @@ private struct NewSessionSheet: View {
             state.confirmPicker(cli: cliId, folder: folderOrNil, yolo: yoloArg)
         }
         isPresented = false
+    }
+}
+
+/// SSH add sheet for the machine dropdown's Add row: display name,
+/// `user@hostname`-or-alias host, and default folder, backed by the
+/// core saved-hosts. Test dials the core tester off the main thread
+/// (reachable/unreachable plus the detected remote CLIs, stale arrivals
+/// dropped); Save persists through the core and hands the host back so
+/// the dropdown picks it.
+private struct SshAddSheet: View {
+    @ObservedObject var state: AppState
+    @Binding var isPresented: Bool
+    var onSaved: (String) -> Void
+
+    @State private var displayName = ""
+    @State private var host = ""
+    @State private var defaultFolder = ""
+    @State private var testStatus: String?
+    @State private var testing = false
+    @State private var testToken = 0
+    @State private var saveError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Add remote machine").font(.title2)
+            Text("Display name").font(.headline)
+            TextField("e.g. GPU box", text: $displayName)
+                .textFieldStyle(.roundedBorder)
+            Text("Host").font(.headline)
+            TextField("user@hostname or alias", text: $host, prompt: Text(NewSessionPicker.machinePlaceholder))
+                .textFieldStyle(.roundedBorder)
+            Text("Default folder").font(.headline)
+            TextField("Remote folder (blank = home)", text: $defaultFolder)
+                .textFieldStyle(.roundedBorder)
+            if testing {
+                Text("Testing over ssh…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let testStatus {
+                Text(testStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if let saveError {
+                Text(saveError).foregroundStyle(.red).font(.caption)
+            }
+            HStack {
+                Spacer()
+                Button("Test") { runTest() }
+                    .disabled(testHost == nil || testing)
+                    .help("Probe this host once (reachable + remote CLIs)")
+                Button("Cancel", role: .cancel) { isPresented = false }
+                Button("Save") { save() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canSave)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 360)
+    }
+
+    private var testHost: String? {
+        let trimmed = host.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private var canSave: Bool {
+        !displayName.trimmingCharacters(in: .whitespaces).isEmpty && testHost != nil
+    }
+
+    /// Probe the host once off the main thread (`staap_remote_test_json`
+    /// blocks on one bounded non-interactive `ssh` round trip — never on
+    /// every keystroke). Arrivals carry a token, so a stale host's late
+    /// arrival never overwrites the current one.
+    private func runTest() {
+        guard let remote = testHost else {
+            testStatus = "Enter a host first (\(NewSessionPicker.machinePlaceholder))."
+            return
+        }
+        testToken += 1
+        let token = testToken
+        testing = true
+        testStatus = nil
+        saveError = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Core.remoteTest(host: remote)
+            DispatchQueue.main.async {
+                guard token == testToken else { return }
+                testing = false
+                if result.reachable {
+                    let available = result.clis.filter { $0.available }
+                    if available.isEmpty {
+                        testStatus = "Reachable — no agent CLIs detected on this host."
+                    } else {
+                        let names = available.map { $0.id }.joined(separator: ", ")
+                        testStatus = "Reachable — \(names) available."
+                    }
+                } else {
+                    testStatus = "Unreachable — check the host and SSH access."
+                }
+            }
+        }
+    }
+
+    private func save() {
+        let name = displayName.trimmingCharacters(in: .whitespaces)
+        guard let remote = testHost, !name.isEmpty else {
+            saveError = "Display name and host are both required."
+            return
+        }
+        let trimmedFolder = defaultFolder.trimmingCharacters(in: .whitespaces)
+        do {
+            try state.addSavedHost(
+                name: name, host: remote,
+                defaultFolder: trimmedFolder.isEmpty ? nil : trimmedFolder)
+            onSaved(remote)
+            isPresented = false
+        } catch {
+            saveError = error.localizedDescription
+        }
     }
 }

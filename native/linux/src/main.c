@@ -10,10 +10,14 @@
  *   roster      core registry rows (staap_session_count/json live),
  *               grouped working → idle (needs-input shares idle,
  *               issue #105), history collapsed in its own toggle
- *   spawn       header New run (repeat-last) + ▾ picker → staap_run_spawn
- *               (blank host) or staap_run_spawn_remote (SSH host axis)
+ *   spawn       exactly one header New session button opens the
+ *               in-place screen on the right side (folder x CLI + yolo,
+ *               local or over SSH) → staap_run_spawn
+ *               (this machine) or staap_run_spawn_remote (saved host)
  *   restart     header Restart / Ctrl+R → staap_run_restart (same id)
  *   close       header Close run / Ctrl+W → staap_run_close + autosave
+ *               (no restart/close dropdown buttons exist in this shell:
+ *               restart/close are header buttons + keyboard only)
  *   converse    key event → staap_key_encode → staap_run_write; pump →
  *               staap_feed_delta → VTE
  *   copy/paste  native VTE selection + Ctrl+Shift+C/V + right-click menu
@@ -214,6 +218,10 @@ static long long json_int(const char *json, const char *key, long long dflt) {
 /* Shell state (dumb renderer: the core registry owns everything else). */
 /* ------------------------------------------------------------------ */
 
+/* In-place new-session form state (defined below; the Shell only holds
+ * a pointer while the screen is open). */
+typedef struct PickerUi PickerUi;
+
 typedef struct {
     AdwApplication *app;
     StaapCore *core;
@@ -231,6 +239,13 @@ typedef struct {
     VteTerminal *term;
     AdwWindowTitle *header_title;
     GtkButton *spawn_btn;
+    /* In-place new-session screen (right side): replaces the old modal
+     * picker dialog — shown every time New session is pressed. While
+     * open the terminal scroll hides and the form fills the same
+     * column; `ns` owns the live form, NULL when closed. */
+    GtkScrolledWindow *ns_scroll;
+    gboolean ns_open;
+    PickerUi *ns;
     GtkRevealer *find_revealer;
     GtkSearchEntry *find_entry;
     GtkScrolledWindow *term_scroll;
@@ -350,7 +365,7 @@ static void reload_statuses(Shell *sh) {
         if (attention > 0) {
             sub = g_strdup_printf("%zu runs · %d need input", n, attention);
         } else if (n == 0) {
-            sub = g_strdup("No runs yet — New run spawns one");
+            sub = g_strdup("No runs yet — New session spawns one");
         } else {
             sub = g_strdup_printf("%zu runs", n);
         }
@@ -464,46 +479,15 @@ static void toast(Shell *sh, const char *msg) {
 }
 
 static void update_spawn_state(Shell *sh) {
-    /* Split-button repeat-last mints a local id, so both header buttons
-     * stay sensitive with or without a selection (the empty roster is a
-     * starting point, not a dead end). */
+    /* The single New session button opens the in-place screen on every
+     * press, so it stays sensitive with or without a selection (the
+     * empty roster is a starting point, not a dead end). */
     (void)sh;
 }
 
-static void on_spawn(GtkButton *btn, gpointer data) {
-    (void)btn;
-    Shell *sh = data;
-    /* Split-button main: repeat the last launch instantly (the
-     * null-CLI/null-folder/zero-yolo form resolves the core's effective
-     * default, so a picker-confirmed claude/yolo combo repeats here).
-     * The core run registry attaches the PTY to a new roster row under
-     * the shared cap — no shell-local ids, no shell-local live map. */
-    char id[128] = { 0 };
-    char *err = NULL;
-    int rc = bridge_run_spawn(sh->core, NULL, NULL, 0,
-                              (unsigned)sh->cols,
-                              (unsigned)sh->rows_grid, id, sizeof id, &err);
-    if (rc != 0) {
-        char *msg = g_strdup_printf("Could not start session: %s",
-                                    err ? err : "unknown error");
-        toast(sh, msg);
-        g_free(msg);
-        free(err);
-        return;
-    }
-    /* Name the effective CLI so the repeat is verifiable (the null
-     * form resolves last-used / configured / autodetected). */
-    char *eff = bridge_effective_cli(sh->core, NULL);
-    char *preview =
-        bridge_spawn_preview(eff ? eff : "muse", NULL, 0);
-    bridge_string_free(eff);
-    toast(sh, preview ? preview : "Session started.");
-    free(preview);
-    refresh_roster(sh);
-    show_selected_in_terminal(sh);
-    update_spawn_state(sh);
-    reload_statuses(sh);
-}
+/* Forward: the single header button + Ctrl+N/Ctrl+Shift+N all open the
+ * in-place new-session screen (defined with the picker below). */
+static void show_new_session(Shell *sh);
 
 /* ------------------------------------------------------------------ */
 /* 2D new-session picker (folder x CLI + yolo, local or over SSH).     */
@@ -516,24 +500,38 @@ typedef struct {
     int available;
 } PickerCli;
 
-typedef struct {
+struct PickerUi {
     Shell *sh;
+    /* In-place form root (parents modal children like Choose/Add). */
+    GtkWidget *page;
     PickerCli *clis;
     size_t n_clis;
     GtkCheckButton **cli_btns;
     GtkWidget *cli_box; /* radio rows live here so a probe can rebuild them */
     GtkEntry *folder;
-    GtkEntry *host; /* SSH host; blank means this machine (local launch) */
+    /* SSH machine axis: dropdown over This machine + saved hosts + the
+     * Add remote machine... row. NULL host means this machine. */
+    GtkDropDown *machine;
+    char **machine_hosts; /* parallel to dropdown rows; NULL = local/Add */
+    size_t n_machine_rows;
+    guint machine_sel; /* last non-Add selection (Add reverts to this) */
+    char *machine_host; /* trimmed selected host, NULL = this machine */
     GtkDropDown *recent;
     char **recents;
     size_t n_recents;
+    /* Remote folder browser (remote hosts only; local keeps Choose...). */
+    GtkWidget *browser_wrap; /* hidden for This machine */
+    GtkListBox *browser;
+    GtkLabel *browse_path_label;
+    GtkLabel *browse_status;
+    char *browse_path; /* last listed remote dir (g_free family) */
+    unsigned browse_gen; /* bumped per listing; stale arrivals drop */
     GtkDropDown *yolo;
     GtkLabel *preview;
     GtkLabel *status; /* probing line under the host axis, else empty */
     GtkLabel *error;
-    AdwDialog *dialog;
     unsigned probe_gen; /* bumped per host edit; stale arrivals are dropped */
-} PickerUi;
+};
 
 /* Minimal catalog/recents JSON parse (flat shapes from the core; the
  * full picker-logic copies now live in the core — this only extracts
@@ -672,10 +670,8 @@ static void picker_refresh_preview(PickerUi *pu) {
     int yolo =
         bridge_yolo_value((int)gtk_drop_down_get_selected(pu->yolo));
     char *text = bridge_spawn_preview(cli, folder, yolo);
-    /* pu->host is NULL until the dialog build reaches the host axis. */
-    const char *host_raw =
-        pu->host ? gtk_editable_get_text(GTK_EDITABLE(pu->host)) : NULL;
-    char *host = trimmed_or_null(host_raw);
+    /* machine_host is already trimmed (NULL = this machine). */
+    const char *host = pu->machine_host;
     if (host && text) {
         char *remote = g_strdup_printf("ssh %s: %s", host, text);
         gtk_label_set_text(pu->preview, remote ? remote : text);
@@ -683,7 +679,6 @@ static void picker_refresh_preview(PickerUi *pu) {
     } else {
         gtk_label_set_text(pu->preview, text ? text : "runs: muse");
     }
-    free(host);
     free(text);
 }
 
@@ -982,18 +977,742 @@ static void picker_reload_recents(PickerUi *pu, const char *host) {
     gtk_drop_down_set_selected(pu->recent, 0);
 }
 
-static void picker_host_changed(GtkEditable *entry, gpointer data) {
-    (void)entry;
-    PickerUi *pu = data;
-    char *host =
-        trimmed_or_null(gtk_editable_get_text(GTK_EDITABLE(pu->host)));
+/* Forward declarations for the machine-axis helpers (defined below;
+ * picker_probe_remote / picker_reload_recents live above). */
+static void picker_machine_changed(GObject *obj, GParamSpec *pspec,
+                                   gpointer data);
+static void picker_after_machine(PickerUi *pu);
+static void picker_open_add_dialog(PickerUi *pu);
+static void picker_browse_refresh(PickerUi *pu);
+
+/* Saved-host row (parsed from the core saved-hosts JSON). */
+typedef struct {
+    char *name;
+    char *host;
+    char *folder; /* NULL when none */
+} SavedHost;
+
+/* Extract the string value of `key` inside the object span [start, end).
+ * Returns a malloc'd unescaped value, or NULL when absent/non-string. */
+static char *span_string(const char *start, const char *end, const char *key) {
+    char pat[64];
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    const char *p = start;
+    while ((p = strstr(p, pat)) != NULL && p < end) {
+        const char *c = strchr(p + strlen(pat), ':');
+        if (!c || c >= end) {
+            return NULL;
+        }
+        c++;
+        while (c < end &&
+               (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r')) {
+            c++;
+        }
+        if (c >= end || *c != '"') {
+            return NULL; /* null or non-string */
+        }
+        c++;
+        size_t cap = 32, len = 0;
+        char *out = malloc(cap);
+        if (!out) {
+            return NULL;
+        }
+        int ok = 1;
+        for (; c < end && *c != '"'; c++) {
+            char ch = *c;
+            if (ch == '\\' && c + 1 < end) {
+                c++;
+                ch = *c;
+            }
+            if (len + 1 >= cap) {
+                cap *= 2;
+                char *nb = realloc(out, cap);
+                if (!nb) {
+                    ok = 0;
+                    break;
+                }
+                out = nb;
+            }
+            out[len++] = ch;
+        }
+        if (!ok || c >= end) {
+            free(out);
+            return NULL;
+        }
+        out[len] = '\0';
+        return out;
+    }
+    return NULL;
+}
+
+static SavedHost *parse_hosts(const char *json, size_t *n_out) {
+    *n_out = 0;
+    if (!json) {
+        return NULL;
+    }
+    size_t cap = 4, n = 0;
+    SavedHost *out = calloc(cap, sizeof *out);
+    if (!out) {
+        return NULL;
+    }
+    const char *p = json;
+    while ((p = strchr(p, '{')) != NULL) {
+        const char *e = strchr(p, '}');
+        if (!e) {
+            break;
+        }
+        char *name = span_string(p, e, "name");
+        char *host = span_string(p, e, "host");
+        char *folder = span_string(p, e, "default_folder");
+        if (name && host) {
+            if (n == cap) {
+                cap *= 2;
+                SavedHost *nb = realloc(out, cap * sizeof *out);
+                if (!nb) {
+                    free(name);
+                    free(host);
+                    free(folder);
+                    break;
+                }
+                out = nb;
+            }
+            out[n].name = name;
+            out[n].host = host;
+            out[n].folder = folder;
+            n++;
+        } else {
+            free(name);
+            free(host);
+            free(folder);
+        }
+        p = e + 1;
+    }
+    *n_out = n;
+    return out;
+}
+
+static void hosts_free(SavedHost *hosts, size_t n) {
+    if (!hosts) {
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        free(hosts[i].name);
+        free(hosts[i].host);
+        free(hosts[i].folder);
+    }
+    free(hosts);
+}
+
+/* Rebuild the machine dropdown (This machine + saved hosts + the Add
+ * row). `select_host` names the host to preselect, if still saved. */
+static void picker_rebuild_machine(PickerUi *pu, const char *select_host) {
+    char *hosts_json = bridge_saved_hosts_json(pu->sh->core);
+    size_t n = 0;
+    SavedHost *hosts = parse_hosts(hosts_json ? hosts_json : "[]", &n);
+    bridge_string_free(hosts_json);
+    if (pu->machine_hosts) {
+        for (size_t i = 0; i < pu->n_machine_rows; i++) {
+            g_free(pu->machine_hosts[i]);
+        }
+        g_free(pu->machine_hosts);
+        pu->machine_hosts = NULL;
+        pu->n_machine_rows = 0;
+    }
+    pu->machine_hosts = g_calloc(n + 2, sizeof *pu->machine_hosts);
+    if (!pu->machine_hosts) {
+        hosts_free(hosts, n);
+        return;
+    }
+    pu->n_machine_rows = n + 2;
+    GtkStringList *list = GTK_STRING_LIST(gtk_string_list_new(NULL));
+    gtk_string_list_append(list, "This machine");
+    pu->machine_hosts[0] = NULL;
+    guint sel = 0;
+    for (size_t i = 0; i < n; i++) {
+        char *label = g_strdup_printf("%s - %s", hosts[i].name, hosts[i].host);
+        gtk_string_list_append(list, label);
+        g_free(label);
+        pu->machine_hosts[i + 1] = g_strdup(hosts[i].host);
+        if (select_host && strcmp(select_host, hosts[i].host) == 0) {
+            sel = (guint)(i + 1);
+        }
+    }
+    hosts_free(hosts, n);
+    gtk_string_list_append(list, "Add remote machine...");
+    pu->machine_hosts[n + 1] = NULL;
+    g_signal_handlers_block_by_func(pu->machine, picker_machine_changed, pu);
+    gtk_drop_down_set_model(pu->machine, G_LIST_MODEL(list));
+    gtk_drop_down_set_selected(pu->machine, sel);
+    g_signal_handlers_unblock_by_func(pu->machine, picker_machine_changed, pu);
+    pu->machine_sel = sel;
+    g_free(pu->machine_host);
+    pu->machine_host = (sel > 0 && pu->machine_hosts[sel])
+        ? g_strdup(pu->machine_hosts[sel])
+        : NULL;
+}
+
+/* Refresh everything the machine axis owns: folder default inherit,
+ * recents, remote catalog probe, browser listing. */
+static void picker_after_machine(PickerUi *pu) {
+    char *host = pu->machine_host ? g_strdup(pu->machine_host) : NULL;
+    if (host) {
+        /* A saved host default fills a blank folder entry (never
+         * clobbers what the user typed). */
+        char *cur = trimmed_or_null(
+            gtk_editable_get_text(GTK_EDITABLE(pu->folder)));
+        if (!cur) {
+            char *dflt = bridge_remote_default_folder(pu->sh->core, host);
+            if (dflt && *dflt) {
+                gtk_editable_set_text(GTK_EDITABLE(pu->folder), dflt);
+            }
+            bridge_string_free(dflt);
+        }
+        g_free(cur);
+    }
+    gtk_entry_set_placeholder_text(
+        pu->folder, host ? "Blank = remote login directory"
+                         : "Blank = current folder");
     picker_reload_recents(pu, host);
     picker_probe_remote(pu, host);
-    free(host);
-    /* The probe paths refresh on arrival; blank↔host toggles refresh
-     * inside picker_probe_remote — this covers the ssh preview prefix
-     * on every keystroke. */
+    picker_browse_refresh(pu);
+    g_free(host);
     picker_on_changed(pu);
+}
+
+static void picker_machine_changed(GObject *obj, GParamSpec *pspec,
+                                   gpointer data) {
+    (void)pspec;
+    PickerUi *pu = data;
+    guint idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(obj));
+    if (pu->n_machine_rows > 0 && idx == pu->n_machine_rows - 1) {
+        /* Add row: revert to the previous pick, open the SSH dialog. */
+        g_signal_handlers_block_by_func(pu->machine, picker_machine_changed,
+                                        pu);
+        gtk_drop_down_set_selected(pu->machine, pu->machine_sel);
+        g_signal_handlers_unblock_by_func(pu->machine, picker_machine_changed,
+                                          pu);
+        picker_open_add_dialog(pu);
+        return;
+    }
+    pu->machine_sel = idx;
+    g_free(pu->machine_host);
+    pu->machine_host =
+        (idx > 0 && idx < pu->n_machine_rows && pu->machine_hosts[idx])
+        ? g_strdup(pu->machine_hosts[idx])
+        : NULL;
+    picker_after_machine(pu);
+}
+
+/* Remote folder browser (remote hosts only): one bounded ssh listing
+ * per Refresh/Up/navigate/machine-change — never per keystroke or per
+ * picker open. Listing/probing share the stale-drop discipline: worker
+ * threads never touch widgets; results hop back via idle and apply
+ * only when the screen is still open and the generation matches. */
+typedef struct {
+    PickerUi *pu;
+    unsigned gen;
+    char *host; /* owned */
+    char *path; /* owned */
+} BrowseReq;
+
+typedef struct {
+    PickerUi *pu;
+    unsigned gen;
+    char *path; /* owned: the listed path */
+    char *json; /* owned (bridge string) */
+} BrowseDone;
+
+static char *remote_join(const char *base, const char *name) {
+    if (!base || !*base) {
+        return g_strdup(name);
+    }
+    size_t n = strlen(base);
+    if (base[n - 1] == '/') {
+        return g_strdup_printf("%s%s", base, name);
+    }
+    return g_strdup_printf("%s/%s", base, name);
+}
+
+static char *remote_parent(const char *path) {
+    if (!path || !*path) {
+        return NULL;
+    }
+    char *cpy = g_strdup(path);
+    size_t n = strlen(cpy);
+    while (n > 1 && cpy[n - 1] == '/') {
+        cpy[--n] = '\0';
+    }
+    char *slash = strrchr(cpy, '/');
+    if (!slash) {
+        g_free(cpy);
+        return NULL;
+    }
+    if (slash == cpy) {
+        cpy[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    return cpy;
+}
+
+/* Fill the browser rows from a listing payload. Directories navigate
+ * on activate (filling the folder entry); files are inert. */
+static void picker_render_browser(PickerUi *pu, const char *json) {
+    GtkWidget *child;
+    while ((child = gtk_widget_get_first_child(GTK_WIDGET(pu->browser)))) {
+        gtk_list_box_remove(pu->browser, child);
+    }
+    size_t shown = 0;
+    if (json) {
+        const char *p = json;
+        while ((p = strchr(p, '{')) != NULL) {
+            const char *e = strchr(p, '}');
+            if (!e) {
+                break;
+            }
+            char *name = span_string(p, e, "name");
+            int is_dir = 0;
+            {
+                const char *k = strstr(p, "\"is_dir\"");
+                if (k && k < e) {
+                    const char *t = strstr(k, "true");
+                    is_dir = (t && t < e) ? 1 : 0;
+                }
+            }
+            if (name && *name && strcmp(name, ".") != 0 &&
+                strcmp(name, "..") != 0) {
+                char *full = remote_join(pu->browse_path, name);
+                char *label = is_dir ? g_strdup_printf("%s/", name)
+                                     : g_strdup(name);
+                GtkWidget *row = gtk_list_box_row_new();
+                GtkWidget *lab = gtk_label_new(label);
+                g_free(label);
+                gtk_label_set_xalign(GTK_LABEL(lab), 0);
+                gtk_label_set_ellipsize(GTK_LABEL(lab), PANGO_ELLIPSIZE_MIDDLE);
+                gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), lab);
+                g_object_set_data_full(G_OBJECT(row), "staap-path", full,
+                                       g_free);
+                g_object_set_data(G_OBJECT(row), "staap-dir",
+                                  GINT_TO_POINTER(is_dir));
+                if (!is_dir) {
+                    gtk_widget_set_sensitive(row, FALSE);
+                }
+                gtk_list_box_append(pu->browser, row);
+                shown++;
+            }
+            free(name);
+            p = e + 1;
+        }
+    }
+    if (shown == 0) {
+        gtk_label_set_text(pu->browse_status,
+            "Empty or unreachable - check the path, or Test the host.");
+    } else {
+        char *msg = g_strdup_printf(
+            "%zu entries - open a folder to fill the entry.", shown);
+        gtk_label_set_text(pu->browse_status, msg);
+        g_free(msg);
+    }
+}
+
+static gboolean picker_browse_deliver(gpointer data) {
+    BrowseDone *done = data;
+    int current = g_slist_find(live_pickers, done->pu) != NULL &&
+                  done->pu->browse_gen == done->gen;
+    if (current) {
+        g_free(done->pu->browse_path);
+        done->pu->browse_path = g_strdup(done->path);
+        gtk_label_set_text(done->pu->browse_path_label, done->path);
+        picker_render_browser(done->pu, done->json);
+    }
+    g_free(done->path);
+    bridge_string_free(done->json);
+    free(done);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer picker_browse_thread(gpointer data) {
+    BrowseReq *req = data;
+    char *json = bridge_remote_list_json(req->host, req->path);
+    BrowseDone *done = malloc(sizeof *done);
+    if (done) {
+        done->pu = req->pu;
+        done->gen = req->gen;
+        done->path = req->path; /* ownership moves */
+        req->path = NULL;
+        done->json = json;
+        g_idle_add(picker_browse_deliver, done);
+    } else {
+        bridge_string_free(json);
+    }
+    g_free(req->host);
+    g_free(req->path);
+    free(req);
+    return NULL;
+}
+
+static void picker_browse_refresh(PickerUi *pu) {
+    pu->browse_gen++;
+    if (!pu->machine_host) {
+        gtk_widget_set_visible(pu->browser_wrap, FALSE);
+        gtk_label_set_text(pu->browse_status, "");
+        return;
+    }
+    gtk_widget_set_visible(pu->browser_wrap, TRUE);
+    /* The folder entry wins when non-blank, else the last listed dir,
+     * else the host default (saved default, then host MRU, then home).
+     * The entry is the single source the Start action reads. */
+    char *entry = trimmed_or_null(
+        gtk_editable_get_text(GTK_EDITABLE(pu->folder)));
+    char *path = entry;
+    if (!path) {
+        if (pu->browse_path && *pu->browse_path) {
+            path = g_strdup(pu->browse_path);
+        } else {
+            char *dflt =
+                bridge_remote_default_folder(pu->sh->core, pu->machine_host);
+            path = (dflt && *dflt) ? g_strdup(dflt) : NULL;
+            bridge_string_free(dflt);
+        }
+    }
+    if (!path) {
+        gtk_label_set_text(pu->browse_status,
+            "No default folder - type a path above, then press Refresh.");
+        picker_render_browser(pu, "[]");
+        return;
+    }
+    unsigned gen = pu->browse_gen;
+    char *msg = g_strdup_printf("Listing %s ...", path);
+    gtk_label_set_text(pu->browse_status, msg);
+    g_free(msg);
+    BrowseReq *req = malloc(sizeof *req);
+    if (!req) {
+        g_free(path);
+        return;
+    }
+    req->pu = pu;
+    req->gen = gen;
+    req->host = g_strdup(pu->machine_host);
+    req->path = path; /* ownership moves */
+    if (!req->host) {
+        g_free(req->path);
+        free(req);
+        return;
+    }
+    GError *err = NULL;
+    GThread *th = g_thread_try_new("staap-remote-list", picker_browse_thread,
+                                   req, &err);
+    g_clear_error(&err);
+    if (!th) {
+        gtk_label_set_text(pu->browse_status,
+            "Listing unavailable; check the folder and press Start.");
+        g_free(req->host);
+        g_free(req->path);
+        free(req);
+        return;
+    }
+    g_thread_unref(th); /* detached; the result hops back via idle */
+}
+
+static void picker_browser_row(GtkListBox *box, GtkListBoxRow *row,
+                               gpointer data) {
+    (void)box;
+    PickerUi *pu = data;
+    if (!GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "staap-dir"))) {
+        return; /* files are inert */
+    }
+    const char *path = g_object_get_data(G_OBJECT(row), "staap-path");
+    if (!path) {
+        return;
+    }
+    gtk_editable_set_text(GTK_EDITABLE(pu->folder), path);
+    picker_browse_refresh(pu);
+    picker_on_changed(pu);
+}
+
+static void picker_browse_up(GtkButton *btn, gpointer data) {
+    (void)btn;
+    PickerUi *pu = data;
+    char *cur = trimmed_or_null(
+        gtk_editable_get_text(GTK_EDITABLE(pu->folder)));
+    if (!cur && pu->browse_path) {
+        cur = g_strdup(pu->browse_path);
+    }
+    if (!cur) {
+        return;
+    }
+    char *parent = remote_parent(cur);
+    g_free(cur);
+    if (!parent) {
+        return;
+    }
+    gtk_editable_set_text(GTK_EDITABLE(pu->folder), parent);
+    g_free(parent);
+    picker_browse_refresh(pu);
+    picker_on_changed(pu);
+}
+
+static void picker_browse_go(GtkButton *btn, gpointer data) {
+    (void)btn;
+    /* Manual refresh only (no per-keystroke ssh): lists the entry path. */
+    picker_browse_refresh(data);
+    picker_on_changed(data);
+}
+
+/* SSH add dialog (opened from the machine dropdown's Add row): display
+ * name, user@hostname-or-alias host, default folder, Test/Save/Cancel.
+ * Save stores a saved host via the core; Test runs the core tester
+ * off-thread and reports reachable/unreachable plus detected CLIs. */
+typedef struct {
+    PickerUi *pu;
+    GtkEntry *name;
+    GtkEntry *host;
+    GtkEntry *folder;
+    GtkLabel *result;
+    GtkLabel *error;
+    AdwDialog *dialog;
+    unsigned test_gen;
+    int alive; /* cleared by the closed handler; stale tests drop */
+} AddUi;
+
+typedef struct {
+    AddUi *au;
+    unsigned gen;
+    char *host; /* owned */
+} AddTestReq;
+
+typedef struct {
+    AddUi *au;
+    unsigned gen;
+    char *host; /* owned */
+    char *json; /* owned (bridge string) */
+} AddTestDone;
+
+static gboolean add_test_deliver(gpointer data) {
+    AddTestDone *done = data;
+    if (done->au->alive && done->au->test_gen == done->gen) {
+        int reachable =
+            done->json && strstr(done->json, "\"reachable\":true");
+        if (reachable) {
+            /* Name the detected CLIs (the test payload reuses the
+             * catalog shape, so parse_clis reads it directly). */
+            size_t n = 0;
+            PickerCli *clis = parse_clis(done->json, &n);
+            GString *have = g_string_new(NULL);
+            size_t nhave = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (clis[i].available) {
+                    g_string_append_printf(have, "%s%s", nhave ? ", " : "",
+                                           clis[i].id);
+                    nhave++;
+                }
+            }
+            char *msg = nhave ? g_strdup_printf("Reachable - CLIs: %s.",
+                                                              have->str)
+                              : g_strdup("Reachable - no known CLIs found.");
+            gtk_label_set_text(done->au->result, msg);
+            g_free(msg);
+            g_string_free(have, TRUE);
+            clis_free(clis, n);
+        } else {
+            char *msg = g_strdup_printf(
+                "Unreachable - check the host name and SSH access (%s).",
+                done->host);
+            gtk_label_set_text(done->au->result, msg);
+            g_free(msg);
+        }
+    }
+    g_free(done->host);
+    bridge_string_free(done->json);
+    free(done);
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer add_test_thread(gpointer data) {
+    AddTestReq *req = data;
+    char *json = bridge_remote_test_json(req->host);
+    AddTestDone *done = malloc(sizeof *done);
+    if (done) {
+        done->au = req->au;
+        done->gen = req->gen;
+        done->host = req->host; /* ownership moves */
+        req->host = NULL;
+        done->json = json;
+        g_idle_add(add_test_deliver, done);
+    } else {
+        bridge_string_free(json);
+    }
+    g_free(req->host);
+    free(req);
+    return NULL;
+}
+
+static void add_test_clicked(GtkButton *btn, gpointer data) {
+    (void)btn;
+    AddUi *au = data;
+    au->test_gen++;
+    char *host = trimmed_or_null(
+        gtk_editable_get_text(GTK_EDITABLE(au->host)));
+    if (!host) {
+        gtk_label_set_text(au->result, "Enter a host to test.");
+        return;
+    }
+    unsigned gen = au->test_gen;
+    char *msg = g_strdup_printf("Testing %s ...", host);
+    gtk_label_set_text(au->result, msg);
+    g_free(msg);
+    AddTestReq *req = malloc(sizeof *req);
+    if (!req) {
+        free(host);
+        return;
+    }
+    req->au = au;
+    req->gen = gen;
+    req->host = g_strdup(host);
+    free(host);
+    if (!req->host) {
+        free(req);
+        return;
+    }
+    GError *err = NULL;
+    GThread *th = g_thread_try_new("staap-remote-test", add_test_thread,
+                                   req, &err);
+    g_clear_error(&err);
+    if (!th) {
+        gtk_label_set_text(au->result, "Test unavailable right now.");
+        g_free(req->host);
+        free(req);
+        return;
+    }
+    g_thread_unref(th); /* detached; the result hops back via idle */
+}
+
+static void add_save_clicked(GtkButton *btn, gpointer data) {
+    (void)btn;
+    AddUi *au = data;
+    char *name = trimmed_or_null(
+        gtk_editable_get_text(GTK_EDITABLE(au->name)));
+    char *host = trimmed_or_null(
+        gtk_editable_get_text(GTK_EDITABLE(au->host)));
+    char *folder = trimmed_or_null(
+        gtk_editable_get_text(GTK_EDITABLE(au->folder)));
+    if (!name) {
+        gtk_label_set_text(au->error, "Give the machine a display name.");
+        goto out;
+    }
+    if (!host) {
+        gtk_label_set_text(au->error,
+            "Enter a host: user@hostname or an ssh-config alias.");
+        goto out;
+    }
+    {
+        char *err = NULL;
+        if (bridge_saved_host_add(au->pu->sh->core, name, host, folder,
+                                  &err) != 0) {
+            gtk_label_set_text(au->error, err ? err : "Could not save.");
+            free(err);
+            goto out;
+        }
+        char *serr = NULL;
+        if (bridge_core_save(au->pu->sh->core, &serr) != 0) {
+            free(serr);
+        }
+    }
+    {
+        /* The closed handler frees au synchronously inside
+         * adw_dialog_close, so keep only owned copies past it. */
+        PickerUi *owner = au->pu;
+        char *saved = g_strdup(host);
+        adw_dialog_close(au->dialog);
+        picker_rebuild_machine(owner, saved);
+        g_free(saved);
+        picker_after_machine(owner);
+    }
+out:
+    free(name);
+    free(host);
+    free(folder);
+}
+
+static void add_dialog_closed(AdwDialog *dialog, gpointer data) {
+    (void)dialog;
+    AddUi *au = data;
+    au->alive = 0;
+    au->test_gen++;
+    free(au);
+}
+
+static void picker_open_add_dialog(PickerUi *pu) {
+    GtkWindow *win = GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(pu->page)));
+    AddUi *au = calloc(1, sizeof *au);
+    if (!au) {
+        return;
+    }
+    au->pu = pu;
+    au->alive = 1;
+
+    AdwDialog *dialog = ADW_DIALOG(adw_dialog_new());
+    au->dialog = dialog;
+    adw_dialog_set_title(dialog, "Add remote machine");
+    adw_dialog_set_content_width(dialog, 380);
+    g_signal_connect(dialog, "closed", G_CALLBACK(add_dialog_closed), au);
+
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_start(box, 20);
+    gtk_widget_set_margin_end(box, 20);
+    gtk_widget_set_margin_top(box, 20);
+    gtk_widget_set_margin_bottom(box, 20);
+
+    GtkWidget *name_label = gtk_label_new("Display name");
+    gtk_label_set_xalign(GTK_LABEL(name_label), 0);
+    gtk_box_append(GTK_BOX(box), name_label);
+    au->name = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(au->name, "e.g. Build box");
+    gtk_box_append(GTK_BOX(box), GTK_WIDGET(au->name));
+
+    GtkWidget *host_label = gtk_label_new("Host");
+    gtk_label_set_xalign(GTK_LABEL(host_label), 0);
+    gtk_box_append(GTK_BOX(box), host_label);
+    au->host = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(
+        au->host, "user@hostname, e.g. alice@buildbox (or ssh-config alias)");
+    gtk_box_append(GTK_BOX(box), GTK_WIDGET(au->host));
+
+    GtkWidget *folder_label = gtk_label_new("Default folder (optional)");
+    gtk_label_set_xalign(GTK_LABEL(folder_label), 0);
+    gtk_box_append(GTK_BOX(box), folder_label);
+    au->folder = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(au->folder,
+                                   "Blank = remote home directory");
+    gtk_box_append(GTK_BOX(box), GTK_WIDGET(au->folder));
+
+    au->result = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(au->result, 0);
+    gtk_label_set_wrap(au->result, TRUE);
+    gtk_box_append(GTK_BOX(box), GTK_WIDGET(au->result));
+    au->error = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(au->error, 0);
+    gtk_widget_add_css_class(GTK_WIDGET(au->error), "error");
+    gtk_box_append(GTK_BOX(box), GTK_WIDGET(au->error));
+
+    GtkWidget *actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(actions, GTK_ALIGN_END);
+    GtkWidget *test = gtk_button_new_with_label("Test");
+    gtk_widget_set_tooltip_text(test, "Check SSH reachability now");
+    g_signal_connect(test, "clicked", G_CALLBACK(add_test_clicked), au);
+    gtk_box_append(GTK_BOX(actions), test);
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel");
+    g_signal_connect_swapped(cancel, "clicked",
+                             G_CALLBACK(adw_dialog_close), dialog);
+    gtk_box_append(GTK_BOX(actions), cancel);
+    GtkWidget *save = gtk_button_new_with_label("Save");
+    gtk_widget_add_css_class(save, "suggested-action");
+    g_signal_connect(save, "clicked", G_CALLBACK(add_save_clicked), au);
+    gtk_box_append(GTK_BOX(actions), save);
+    gtk_box_append(GTK_BOX(box), actions);
+
+    adw_dialog_set_child(dialog, box);
+    adw_dialog_present(dialog, GTK_WIDGET(win));
 }
 
 static void picker_free(PickerUi *pu) {
@@ -1004,20 +1723,30 @@ static void picker_free(PickerUi *pu) {
     clis_free(pu->clis, pu->n_clis);
     recents_free(pu->recents, pu->n_recents);
     free(pu->cli_btns);
+    if (pu->machine_hosts) {
+        for (size_t i = 0; i < pu->n_machine_rows; i++) {
+            g_free(pu->machine_hosts[i]);
+        }
+        g_free(pu->machine_hosts);
+    }
+    g_free(pu->machine_host);
+    g_free(pu->browse_path);
     free(pu);
 }
 
 /* Spawn the confirmed combination: folder x CLI + one-shot yolo, local
- * or over SSH. A missing local folder refuses inline (the dialog stays
+ * or over SSH. A missing local folder refuses inline (the screen stays
  * open for a fix); remote paths skip that gate (they cannot be stated
  * locally) and let the core report failures. A spawn failure toasts and
  * closes (the core error names the fix). */
+static void hide_new_session(Shell *sh);
+
 static void picker_confirm(PickerUi *pu) {
     Shell *sh = pu->sh;
     char *folder = trimmed_or_null(
         gtk_editable_get_text(GTK_EDITABLE(pu->folder)));
-    char *host = trimmed_or_null(
-        gtk_editable_get_text(GTK_EDITABLE(pu->host)));
+    char *host =
+        pu->machine_host ? g_strdup(pu->machine_host) : NULL;
     if (!host && folder && !g_file_test(folder, G_FILE_TEST_IS_DIR)) {
         char *msg = g_strdup_printf("No such folder: %s", folder);
         gtk_label_set_text(pu->error, msg);
@@ -1068,8 +1797,8 @@ static void picker_confirm(PickerUi *pu) {
         g_free(msg);
         free(err);
         free(folder);
-        free(host);
-        adw_dialog_close(pu->dialog);
+        g_free(host);
+        hide_new_session(sh);
         return;
     }
     char *preview = bridge_spawn_preview(cli, folder, yolo);
@@ -1082,8 +1811,8 @@ static void picker_confirm(PickerUi *pu) {
     }
     free(preview);
     free(folder);
-    free(host);
-    adw_dialog_close(pu->dialog);
+    g_free(host);
+    hide_new_session(sh);
     refresh_roster(sh);
     show_selected_in_terminal(sh);
     update_spawn_state(sh);
@@ -1093,11 +1822,6 @@ static void picker_confirm(PickerUi *pu) {
 static void picker_spawn_clicked(GtkButton *btn, gpointer data) {
     (void)btn;
     picker_confirm(data);
-}
-
-static void picker_closed(AdwDialog *dialog, gpointer data) {
-    (void)dialog;
-    picker_free(data);
 }
 
 /* Directory picker for the folder axis (issue #102): choosing in the
@@ -1135,23 +1859,44 @@ static void picker_choose_folder(GtkButton *btn, gpointer data) {
                                   g_object_ref(pu->folder));
     g_object_unref(dlg);
 }
-/* Open the 2D picker dialog: folder entry + recents, SSH host axis,
- * CLI radio rows (missing CLIs disabled with an install hint), yolo
- * tri-state, and the live `runs: ...` preview. Catalog + recents
- * re-read on every open so the list is never stale; typing a host swaps
- * in the per-host recents and probes the remote catalog off-thread. */
-static void on_pick_session(GtkButton *btn, gpointer data) {
-    (void)btn;
-    Shell *sh = data;
-    GtkWindow *win =
-        gtk_application_get_active_window(GTK_APPLICATION(sh->app));
+/* Hide the in-place screen and return to the terminal. */
+static void hide_new_session(Shell *sh) {
+    if (!sh->ns_open) {
+        return;
+    }
+    sh->ns_open = FALSE;
+    PickerUi *pu = sh->ns;
+    sh->ns = NULL;
+    /* Dropping the child destroys the form; stale thread arrivals find
+     * no live picker and drop (same discipline as the old dialog). */
+    gtk_scrolled_window_set_child(sh->ns_scroll, NULL);
+    picker_free(pu);
+    gtk_widget_set_visible(GTK_WIDGET(sh->ns_scroll), FALSE);
+    gtk_widget_set_visible(GTK_WIDGET(sh->term_scroll), TRUE);
+}
 
+static void picker_cancel_clicked(GtkButton *btn, gpointer data) {
+    (void)btn;
+    hide_new_session(((PickerUi *)data)->sh);
+}
+
+/* Open the in-place new-session screen on the right side: folder entry
+ * (+ Choose dialog for this machine, remote browser for saved hosts) +
+ * recents, machine dropdown (This machine / saved hosts / Add row), CLI
+ * radio rows, yolo tri-state, and the live `runs: ...` preview. Catalog,
+ * recents, and saved hosts re-read on every open so the list is never
+ * stale. Shown every time New session is pressed. */
+static void show_new_session(Shell *sh) {
+    if (sh->ns_open) {
+        hide_new_session(sh);
+    }
     PickerUi *pu = calloc(1, sizeof *pu);
     if (!pu) {
         return;
     }
     pu->sh = sh;
     live_pickers = g_slist_prepend(live_pickers, pu);
+
     /* Radio rows live in their own box so a remote probe can rebuild
      * them; the initial build is the synchronous local catalog. */
     pu->cli_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -1169,18 +1914,12 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
         return;
     }
 
-    AdwDialog *dialog = ADW_DIALOG(adw_dialog_new());
-    pu->dialog = dialog;
-    adw_dialog_set_title(dialog, "Start a new run");
-    adw_dialog_set_content_width(dialog, 420);
-    g_signal_connect(dialog, "closed", G_CALLBACK(picker_closed), pu);
-
-    GtkWidget *box =
-        gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_widget_set_margin_start(box, 20);
     gtk_widget_set_margin_end(box, 20);
     gtk_widget_set_margin_top(box, 20);
     gtk_widget_set_margin_bottom(box, 20);
+    pu->page = box;
 
     GtkWidget *folder_label = gtk_label_new("Where should it work?");
     gtk_label_set_xalign(GTK_LABEL(folder_label), 0);
@@ -1196,7 +1935,7 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
     g_signal_connect(pu->folder, "changed",
                      G_CALLBACK(picker_folder_changed), pu);
     gtk_box_append(GTK_BOX(folder_row), GTK_WIDGET(pu->folder));
-    GtkWidget *choose = gtk_button_new_with_label("Choose…");
+    GtkWidget *choose = gtk_button_new_with_label("Choose...");
     g_signal_connect(choose, "clicked", G_CALLBACK(picker_choose_folder),
                      pu);
     gtk_box_append(GTK_BOX(folder_row), choose);
@@ -1204,7 +1943,7 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
     {
         GtkStringList *recent_list =
             GTK_STRING_LIST(gtk_string_list_new(NULL));
-        gtk_string_list_append(recent_list, "Type a folder…");
+        gtk_string_list_append(recent_list, "Type a folder...");
         for (size_t i = 0; i < pu->n_recents; i++) {
             gtk_string_list_append(recent_list, pu->recents[i]);
         }
@@ -1216,22 +1955,68 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
         gtk_box_append(GTK_BOX(box), GTK_WIDGET(pu->recent));
     }
 
-    /* SSH host axis (blank = this machine). Typing a host swaps in the
-     * per-host recents and probes the remote CLI catalog off-thread. */
-    GtkWidget *host_label = gtk_label_new("Which machine? (SSH host)");
+    /* SSH machine axis: This machine, saved hosts, Add remote
+     * machine... (blank = this machine, local launch). */
+    GtkWidget *host_label = gtk_label_new("Which machine?");
     gtk_label_set_xalign(GTK_LABEL(host_label), 0);
     gtk_widget_add_css_class(host_label, "heading");
     gtk_box_append(GTK_BOX(box), host_label);
-    pu->host = GTK_ENTRY(gtk_entry_new());
-    gtk_widget_set_hexpand(GTK_WIDGET(pu->host), TRUE);
-    gtk_entry_set_placeholder_text(pu->host, "Blank = this machine");
-    g_signal_connect(pu->host, "changed",
-                     G_CALLBACK(picker_host_changed), pu);
-    gtk_box_append(GTK_BOX(box), GTK_WIDGET(pu->host));
+    pu->machine = GTK_DROP_DOWN(gtk_drop_down_new(NULL, NULL));
+    g_signal_connect(pu->machine, "notify::selected",
+                     G_CALLBACK(picker_machine_changed), pu);
+    gtk_box_append(GTK_BOX(box), GTK_WIDGET(pu->machine));
+    GtkWidget *host_hint =
+        gtk_label_new("This machine, a saved host, or add one - "
+                      "e.g. alice@buildbox");
+    gtk_label_set_xalign(GTK_LABEL(host_hint), 0);
+    gtk_widget_add_css_class(GTK_WIDGET(host_hint), "dim-label");
+    gtk_box_append(GTK_BOX(box), host_hint);
     pu->status = GTK_LABEL(gtk_label_new(""));
     gtk_label_set_xalign(pu->status, 0);
     gtk_widget_add_css_class(GTK_WIDGET(pu->status), "dim-label");
     gtk_box_append(GTK_BOX(box), GTK_WIDGET(pu->status));
+
+    /* Remote folder browser (saved hosts only; hidden otherwise). */
+    pu->browser_wrap = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    {
+        GtkWidget *browse_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        pu->browse_path_label = GTK_LABEL(gtk_label_new(""));
+        gtk_label_set_xalign(pu->browse_path_label, 0);
+        gtk_label_set_ellipsize(pu->browse_path_label,
+                                PANGO_ELLIPSIZE_MIDDLE);
+        gtk_widget_set_hexpand(GTK_WIDGET(pu->browse_path_label), TRUE);
+        gtk_box_append(GTK_BOX(browse_row),
+                       GTK_WIDGET(pu->browse_path_label));
+        GtkWidget *up = gtk_button_new_with_label("Up");
+        g_signal_connect(up, "clicked", G_CALLBACK(picker_browse_up), pu);
+        gtk_box_append(GTK_BOX(browse_row), up);
+        GtkWidget *refresh = gtk_button_new_with_label("Refresh");
+        gtk_widget_set_tooltip_text(refresh, "List the folder above");
+        g_signal_connect(refresh, "clicked", G_CALLBACK(picker_browse_go),
+                         pu);
+        gtk_box_append(GTK_BOX(browse_row), refresh);
+        gtk_box_append(GTK_BOX(pu->browser_wrap), browse_row);
+        pu->browser = GTK_LIST_BOX(gtk_list_box_new());
+        g_signal_connect(pu->browser, "row-activated",
+                         G_CALLBACK(picker_browser_row), pu);
+        GtkWidget *browse_scroll = gtk_scrolled_window_new();
+        gtk_widget_set_size_request(browse_scroll, -1, 140);
+        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(browse_scroll),
+                                      GTK_WIDGET(pu->browser));
+        gtk_box_append(GTK_BOX(pu->browser_wrap), browse_scroll);
+        GtkWidget *browse_hint =
+            gtk_label_new("Open a folder to fill the entry above.");
+        gtk_label_set_xalign(GTK_LABEL(browse_hint), 0);
+        gtk_widget_add_css_class(GTK_WIDGET(browse_hint), "dim-label");
+        gtk_box_append(GTK_BOX(pu->browser_wrap), browse_hint);
+    }
+    pu->browse_status = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(pu->browse_status, 0);
+    gtk_widget_add_css_class(GTK_WIDGET(pu->browse_status), "dim-label");
+    gtk_box_append(GTK_BOX(pu->browser_wrap),
+                   GTK_WIDGET(pu->browse_status));
+    gtk_widget_set_visible(pu->browser_wrap, FALSE);
+    gtk_box_append(GTK_BOX(box), pu->browser_wrap);
 
     pu->error = GTK_LABEL(gtk_label_new(""));
     gtk_label_set_xalign(pu->error, 0);
@@ -1271,21 +2056,34 @@ static void on_pick_session(GtkButton *btn, gpointer data) {
     GtkWidget *actions = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_halign(actions, GTK_ALIGN_END);
     GtkWidget *cancel = gtk_button_new_with_label("Cancel");
-    g_signal_connect_swapped(cancel, "clicked",
-                             G_CALLBACK(adw_dialog_close), dialog);
+    g_signal_connect(cancel, "clicked", G_CALLBACK(picker_cancel_clicked),
+                     pu);
     gtk_box_append(GTK_BOX(actions), cancel);
-    GtkWidget *spawn = gtk_button_new_with_label("Spawn");
+    GtkWidget *spawn = gtk_button_new_with_label("Start");
     gtk_widget_add_css_class(spawn, "suggested-action");
     g_signal_connect(spawn, "clicked", G_CALLBACK(picker_spawn_clicked),
                      pu);
     gtk_box_append(GTK_BOX(actions), spawn);
     gtk_box_append(GTK_BOX(box), actions);
 
-    /* Label "Default" with its resolved state for the preselected CLI. */
+    gtk_scrolled_window_set_child(sh->ns_scroll, box);
+    gtk_widget_set_visible(GTK_WIDGET(sh->term_scroll), FALSE);
+    gtk_widget_set_visible(GTK_WIDGET(sh->ns_scroll), TRUE);
+    sh->ns = pu;
+    sh->ns_open = TRUE;
+
+    /* Label "Default" with its resolved state for the preselected CLI,
+     * rebuild the machine list, then refresh everything the (local)
+     * machine owns. */
     picker_refresh_yolo(pu);
-    picker_refresh_preview(pu);
-    adw_dialog_set_child(dialog, box);
-    adw_dialog_present(dialog, GTK_WIDGET(win));
+    picker_rebuild_machine(pu, NULL);
+    picker_after_machine(pu);
+    gtk_widget_grab_focus(GTK_WIDGET(pu->folder));
+}
+
+static void on_pick_session(GtkButton *btn, gpointer data) {
+    (void)btn;
+    show_new_session((Shell *)data);
 }
 
 /* Map one GDK keyval to the core's logical key name (the shared key
@@ -1450,7 +2248,7 @@ static void show_selected_in_terminal(Shell *sh) {
                               "(run ended — press R to restart)\r\n", -1);
         } else {
             vte_terminal_feed(sh->term,
-                              "(no live session — press New run)\r\n", -1);
+                              "(no live session — press New session)\r\n", -1);
         }
         free(id);
         free(sh->fed_id);
@@ -1747,8 +2545,8 @@ static void on_term_menu(GtkGestureClick *gest, int n_press, double x,
     g_object_unref(ag);
 }
 
-/* App-level shortcuts: Ctrl+F find, Ctrl+N repeat-last spawn,
- * Ctrl+Shift+N picker, Ctrl+R restart/resume, Ctrl+W close run,
+/* App-level shortcuts: Ctrl+F find, Ctrl+N / Ctrl+Shift+N open the
+ * in-place new-session screen, Ctrl+R restart/resume, Ctrl+W close run,
  * Up/Down step selection. Persistence is automatic (no Ctrl+S). */
 static gboolean on_window_key(GtkEventControllerKey *ctl, guint keyval,
                               guint keycode, GdkModifierType state,
@@ -1763,7 +2561,7 @@ static gboolean on_window_key(GtkEventControllerKey *ctl, guint keyval,
         }
         if ((keyval == GDK_KEY_n || keyval == GDK_KEY_N) &&
             !(state & GDK_SHIFT_MASK)) {
-            on_spawn(NULL, sh);
+            on_pick_session(NULL, sh);
             return TRUE;
         }
         if ((keyval == GDK_KEY_n || keyval == GDK_KEY_N) &&
@@ -1826,23 +2624,17 @@ static void build_ui(Shell *sh) {
     sh->header_title = ADW_WINDOW_TITLE(title);
     adw_header_bar_set_title_widget(bar, title);
 
-    /* Header: split-button 2D launch — "New run" repeats the last
-     * launch instantly, the caret opens the folder x CLI picker. */
-    GtkWidget *new_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_add_css_class(new_box, "linked");
-    sh->spawn_btn = GTK_BUTTON(gtk_button_new_with_label("New run"));
+    /* Header: exactly one New session button - it opens the in-place
+     * screen on the right side on every press (no repeat-last
+     * split-button, no caret). */
+    sh->spawn_btn = GTK_BUTTON(gtk_button_new_with_label("New session"));
     gtk_widget_add_css_class(GTK_WIDGET(sh->spawn_btn), "suggested-action");
     gtk_widget_set_tooltip_text(GTK_WIDGET(sh->spawn_btn),
-                                "Repeat the last session (Ctrl+N)");
-    g_signal_connect(sh->spawn_btn, "clicked", G_CALLBACK(on_spawn), sh);
-    gtk_box_append(GTK_BOX(new_box), GTK_WIDGET(sh->spawn_btn));
-    GtkWidget *pick_btn = gtk_button_new_with_label("▾");
-    gtk_widget_set_tooltip_text(pick_btn,
-                                "Choose folder, CLI, options… (Ctrl+Shift+N)");
-    g_signal_connect(pick_btn, "clicked", G_CALLBACK(on_pick_session), sh);
-    gtk_box_append(GTK_BOX(new_box), pick_btn);
-    gtk_widget_set_sensitive(pick_btn, TRUE);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(bar), new_box);
+                                "Start a new session (Ctrl+N)");
+    g_signal_connect(sh->spawn_btn, "clicked",
+                     G_CALLBACK(on_pick_session), sh);
+    adw_header_bar_pack_start(ADW_HEADER_BAR(bar),
+                              GTK_WIDGET(sh->spawn_btn));
 
     /* Restart + close run buttons (parity with Ctrl+R / Ctrl+W and the
      * `r`/`x` keys everywhere). Persistence is automatic — no Save
@@ -1896,7 +2688,8 @@ static void build_ui(Shell *sh) {
     gtk_box_append(GTK_BOX(side_box), GTK_WIDGET(sh->history_expander));
     adw_overlay_split_view_set_sidebar(split, side_box);
 
-    /* Terminal side: find revealer on top, VTE in a scrolled window. */
+        /* Terminal side: find revealer on top, VTE in a scrolled window,
+     * plus the hidden in-place new-session screen (same column). */
     GtkWidget *term_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     sh->find_revealer = GTK_REVEALER(gtk_revealer_new());
     sh->find_entry = GTK_SEARCH_ENTRY(gtk_search_entry_new());
@@ -1936,6 +2729,11 @@ static void build_ui(Shell *sh) {
                               GTK_EVENT_CONTROLLER(right));
     gtk_scrolled_window_set_child(sh->term_scroll, GTK_WIDGET(sh->term));
     gtk_box_append(GTK_BOX(term_box), GTK_WIDGET(sh->term_scroll));
+    sh->ns_scroll = GTK_SCROLLED_WINDOW(gtk_scrolled_window_new());
+    gtk_widget_set_vexpand(GTK_WIDGET(sh->ns_scroll), TRUE);
+    gtk_widget_set_hexpand(GTK_WIDGET(sh->ns_scroll), TRUE);
+    gtk_widget_set_visible(GTK_WIDGET(sh->ns_scroll), FALSE);
+    gtk_box_append(GTK_BOX(term_box), GTK_WIDGET(sh->ns_scroll));
     adw_overlay_split_view_set_content(split, term_box);
 
     GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -1961,8 +2759,8 @@ static void build_ui(Shell *sh) {
         }
     } else {
         adw_window_title_set_subtitle(sh->header_title,
-                                      "No runs yet — New run spawns one");
-        vte_terminal_feed(sh->term, "No runs yet — press New run.\r\n", -1);
+                                      "No runs yet — New session spawns one");
+        vte_terminal_feed(sh->term, "No runs yet — press New session.\r\n", -1);
     }
     update_spawn_state(sh);
     reload_statuses(sh);
