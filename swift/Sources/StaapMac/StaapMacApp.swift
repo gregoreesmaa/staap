@@ -106,20 +106,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// overridden from this module — and the fix is the shell's byte
     /// transport to own, not the core's. An app-global local monitor
     /// therefore intercepts the key *before* it reaches any responder:
-    /// when the focused view is a terminal and the press is an
-    /// unmodified backtick, send byte 0x60 straight to that view and
-    /// swallow the event. Everything else — modified presses (Shift gives
-    /// tilde; Option/Control/Command are deliberate combos), key repeats
-    /// aside from the same byte, and any non-terminal first responder such
-    /// as a sheet text field — passes through untouched. Sending to the
-    /// focused view (rather than a specific row) keeps this a single
-    /// monitor for every terminal, with no per-row state to leak.
+    /// when the focused view is a terminal and the key produces a backtick
+    /// character (checked via `event.characters`, modifiers applied), send
+    /// byte 0x60 straight to that view and swallow the event. This is
+    /// layout-agnostic: any keyboard that maps a key+modifiers to a
+    /// backtick (e.g., Option+' on Estonian) is handled, without hard-coding
+    /// layouts. Command is excluded, and non-terminal first responders such
+    /// as sheet text fields pass through untouched. Sending to the focused
+    /// view keeps this a single monitor for every terminal, with no per-row
+    /// state to leak.
     private func installBacktickMonitor() {
         guard backtickMonitor == nil else { return }
         backtickMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard event.modifierFlags.intersection([.command, .option, .control, .shift]) == [],
-                  let scalar = event.charactersIgnoringModifiers?.unicodeScalars.first,
-                  scalar.value == 0x60,
+            // Intercept any key that produces a backtick character, regardless of
+            // which modifiers the layout requires (e.g., Option+' on Estonian).
+            // Use event.characters (modifiers applied) instead of
+            // charactersIgnoringModifiers so layout-specific modifier combos are
+            // recognized. Command is excluded because it never produces a character
+            // and is used for menu shortcuts.
+            guard !event.modifierFlags.contains(.command),
+                  let chars = event.characters,
+                  chars.unicodeScalars.contains(where: { $0.value == 0x60 }),
                   let terminal = event.window?.firstResponder as? TerminalView
             else {
                 return event
