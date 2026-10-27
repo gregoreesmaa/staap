@@ -1,4 +1,6 @@
+import AppKit
 import ShellSupport
+import SwiftTerm
 import SwiftUI
 
 /// macOS shell over the core staticlib (issue #62).
@@ -70,6 +72,8 @@ struct StaapMacApp: App {
 /// activating on launch is what makes the window show.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var state: AppState?
+    /// Token for the app-global backtick monitor (see installBacktickMonitor).
+    private var backtickMonitor: Any?
 
     func applicationDidFinishLaunching(_: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -77,6 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The manual theme override is gone; drop the stale default.
         UserDefaults.standard.removeObject(forKey: "appearance")
         WindowPaint.sync()
+        installBacktickMonitor()
         // The WindowGroup window may not exist yet at launch, so paint
         // on every main-window change too.
         _ = NotificationCenter.default.addObserver(
@@ -89,6 +94,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Best effort on the way out; errors have nowhere to show.
         MainActor.assumeIsolated {
             self.state?.save()
+        }
+        uninstallBacktickMonitor()
+    }
+
+    /// Backticks reach the PTY even though AppKit's `interpretKeyEvents`
+    /// path swallows a plain one (routing it to `cancelOperation` → ESC)
+    /// before SwiftTerm can insert it.
+    ///
+    /// SwiftTerm's `keyDown` is `public`, not `open`, so it can't be
+    /// overridden from this module — and the fix is the shell's byte
+    /// transport to own, not the core's. An app-global local monitor
+    /// therefore intercepts the key *before* it reaches any responder:
+    /// when the focused view is a terminal and the press is an
+    /// unmodified backtick, send byte 0x60 straight to that view and
+    /// swallow the event. Everything else — modified presses (Shift gives
+    /// tilde; Option/Control/Command are deliberate combos), key repeats
+    /// aside from the same byte, and any non-terminal first responder such
+    /// as a sheet text field — passes through untouched. Sending to the
+    /// focused view (rather than a specific row) keeps this a single
+    /// monitor for every terminal, with no per-row state to leak.
+    private func installBacktickMonitor() {
+        guard backtickMonitor == nil else { return }
+        backtickMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.modifierFlags.intersection([.command, .option, .control, .shift]) == [],
+                  let scalar = event.charactersIgnoringModifiers?.unicodeScalars.first,
+                  scalar.value == 0x60,
+                  let terminal = event.window?.firstResponder as? TerminalView
+            else {
+                return event
+            }
+            terminal.send(data: [0x60][...])
+            return nil
+        }
+    }
+
+    private func uninstallBacktickMonitor() {
+        if let monitor = backtickMonitor {
+            NSEvent.removeMonitor(monitor)
+            backtickMonitor = nil
         }
     }
 }
