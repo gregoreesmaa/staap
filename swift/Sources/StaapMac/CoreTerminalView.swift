@@ -25,6 +25,9 @@ struct CoreTerminalView: NSViewRepresentable {
     func makeNSView(context: Context) -> TerminalView {
         let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         let view = TerminalView(frame: .zero, font: font)
+        // Make Option produce macOS characters rather than Meta/ESC sequences,
+        // so the terminal feels like a normal macOS app (e.g., Estonian Option+' → `).
+        view.optionAsMetaKey = false
         applyThemeColors(to: view, darkMode: darkMode)
         view.terminalDelegate = context.coordinator
         // Fresh view per row: replay the full current text first, then
