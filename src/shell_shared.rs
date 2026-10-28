@@ -255,11 +255,15 @@ pub fn row_matches_filter(session: &ChatSession, query: &str) -> bool {
     roster_matches(&session.title, &session.project, &session.id, query)
 }
 
-/// Group row indices into urgency sections: working, then idle —
+/// Group row indices into urgency sections: idle, then working —
 /// (idle holds needs-input rows first — issue #105), then history (rows
 /// with no live PTY) last. Returns `(header, indices)` pairs, skipping
 /// nothing: empty groups still render headers. This is the single rule
-/// replacing the Linux sort-fn, the macOS section builder, and Windows order.
+/// Scope (issue #114 fix-loop): core-side ordering only, currently
+/// exercised by its unit test below — no `staap_*` FFI exposes it and no
+/// native shell calls it (Swift cites it in a comment only). The gpui
+/// shell orders via `status_sections` (`src/app.rs`); the native shells
+/// keep their own section order (native-parity gap, see task-4 report).
 pub fn group_sections(
     sessions: &[ChatSession],
     live: &dyn Fn(&str) -> bool,
@@ -294,12 +298,12 @@ pub fn group_sections(
     idle_all.extend(idle);
     vec![
         (
-            format!("{} ({})", section_title(RowStatus::Working), working.len()),
-            working,
-        ),
-        (
             format!("{} ({})", section_title(RowStatus::Idle), idle_all.len()),
             idle_all,
+        ),
+        (
+            format!("{} ({})", section_title(RowStatus::Working), working.len()),
+            working,
         ),
         (format!("History ({})", history.len()), history),
     ]
@@ -865,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_order_working_idle_then_history() {
+    fn groups_order_idle_working_then_history() {
         let sessions = vec![
             sess("h", Status::Working, 9),
             sess("a", Status::Attention, 1),
@@ -883,11 +887,11 @@ mod tests {
                 .map(|&i| sessions[i].id.clone())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(ids(0), vec!["w"]);
-        assert_eq!(ids(1), vec!["a", "i"]);
+        assert_eq!(ids(0), vec!["a", "i"]);
+        assert_eq!(ids(1), vec!["w"]);
         assert_eq!(ids(2), vec!["h"]);
-        assert!(groups[0].0.starts_with("Working (1)"));
-        assert!(groups[1].0.starts_with("Idle (2)"));
+        assert!(groups[0].0.starts_with("Idle (2)"));
+        assert!(groups[1].0.starts_with("Working (1)"));
         assert!(groups[2].0.starts_with("History (1)"));
     }
 
