@@ -441,6 +441,66 @@ pub fn render_ansi_json(json: &str) -> Option<String> {
     Some(render_ansi(&out))
 }
 
+// --- Terminal row geometry (issue #112) --------------------------------------
+//
+// Single source for the three cursor-row numbers that must agree, or the
+// caret reads a row low: glyph-row tops (what the text element lays out),
+// cursor-block tops (what overlays place), and mouse mapping (what a press
+// resolves to). Every shell renders with ONE origin (the captured text top)
+// and ONE pitch (`line_h` = measured ascent + descent): the old phi
+// default pitch drifted lower rows exactly this way (issue #59), and any
+// cursor-row math that is not literally `line_h` reintroduces #112.
+//
+// `origin` is window-space for glyph tops (the captured text-bounds top)
+// and `0.0` for origin-relative overlay placement (the inner wrapper
+// carries no padding, so overlay origin == text origin by construction).
+// `f32` throughout so shells convert nothing: these values feed the text
+// element (`px`), device pixels (VTE/WinUI), and points (Swift) unchanged.
+
+/// Top edge of glyph row `row` at `pitch`, measured from `origin`.
+pub fn row_top(origin: f32, row: u16, pitch: f32) -> f32 {
+    origin + row as f32 * pitch
+}
+
+/// Left edge of grid column `col` at `pitch`, measured from `origin`.
+pub fn col_left(origin: f32, col: u16, pitch: f32) -> f32 {
+    origin + col as f32 * pitch
+}
+
+/// Grid row containing point `y`: the unclamped floor of the pitch
+/// division. Callers clamp into their grid (see [`cell_at`]).
+pub fn row_at(y: f32, origin: f32, pitch: f32) -> i32 {
+    ((y - origin) / pitch).floor() as i32
+}
+
+/// Grid column containing point `x`: the unclamped floor of the pitch
+/// division. Callers clamp into their grid (see [`cell_at`]).
+pub fn col_at(x: f32, origin: f32, pitch: f32) -> i32 {
+    ((x - origin) / pitch).floor() as i32
+}
+
+/// Map a window-space point to a terminal cell. `origin` is the
+/// window-space top-left of the terminal text, `(char_w, line_h)` the
+/// monospace cell size, `(cols, rows)` the live grid size. The result is
+/// clamped into the grid; `col` may be `cols` (exclusive line end) so a
+/// drag past the right edge still selects to end-of-line. Degenerate
+/// inputs (non-positive cell, empty grid) map to `(0, 0)`.
+pub fn cell_at(
+    mouse: (f32, f32),
+    origin: (f32, f32),
+    cell: (f32, f32),
+    grid: (u16, u16),
+) -> (u16, u16) {
+    let (char_w, line_h) = cell;
+    let (cols, rows) = grid;
+    if char_w <= 0.0 || line_h <= 0.0 || cols == 0 || rows == 0 {
+        return (0, 0);
+    }
+    let row = row_at(mouse.1, origin.1, line_h).clamp(0, rows as i32 - 1) as u16;
+    let col = col_at(mouse.0, origin.0, char_w).clamp(0, cols as i32) as u16;
+    (row, col)
+}
+
 // --- Picker helpers ----------------------------------------------------------
 
 /// The 2D new-session preview line (`runs: muse in ~/api + yolo`).
@@ -615,6 +675,56 @@ pub fn relative_age(now_secs: i64, then_secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_row_maps_to_rendered_row() {
+        // Issue #112: render pitch == mapping pitch == line_h, from ONE
+        // shared source. For a pane with known line_h, origin, and cursor
+        // (r,c): the cursor glyph's rendered top-center pixel maps back to
+        // (r,c) through the same pitch, and row r+1's pixels never map to r.
+        // Production-structured origin: past the 264px sidebar, the 1px
+        // focus border, and the 8px pane padding, like the captured
+        // `term_text_bounds` the mouse path maps from.
+        let origin = (264.0 + 1.0 + 8.0, 40.0);
+        let (char_w, line_h) = (8.0f32, 18.0f32);
+        let (cols, rows) = (80u16, 24u16);
+        for r in 0..rows {
+            for c in [0u16, 1, cols / 2, cols - 1] {
+                // Rendered top-center pixel of glyph (r,c).
+                let x = col_left(origin.0, c, char_w) + char_w * 0.5;
+                let y = row_top(origin.1, r, line_h) + line_h * 0.5;
+                assert_eq!(
+                    cell_at((x, y), origin, (char_w, line_h), (cols, rows)),
+                    (r, c),
+                    "glyph ({r},{c}) center must map back to ({r},{c})"
+                );
+            }
+            // The first pixel of the NEXT row must map to the next row,
+            // never back to r (the 1-low aliasing of the phi-pitch era).
+            if r + 1 < rows {
+                let y = row_top(origin.1, r + 1, line_h) + 1.0;
+                let (mapped, _) =
+                    cell_at((origin.0 + 1.0, y), origin, (char_w, line_h), (cols, rows));
+                assert_eq!(mapped, r + 1, "row {} top must not alias row {r}", r + 1);
+            }
+            // Cursor-block top (origin-relative, what overlays place with)
+            // is the glyph-row top from the same source: no second pitch.
+            assert_eq!(
+                row_top(0.0, r, line_h),
+                row_top(origin.1, r, line_h) - origin.1,
+                "block top and glyph top share one origin/pitch"
+            );
+        }
+        // Sensitivity: a substituted pitch (the old phi default) drifts
+        // lower rows, which is exactly the failure this pin guards against.
+        let phi = 13.0 * 1.618034;
+        let y = row_top(origin.1, 4, line_h) + line_h * 0.5;
+        assert_ne!(
+            row_at(y, origin.1, phi),
+            4,
+            "a non-line_h pitch must mis-map row 4"
+        );
+    }
 
     #[test]
     fn identical_snapshots_feed_nothing() {

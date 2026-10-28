@@ -167,14 +167,9 @@ pub fn point_to_cell(
     cols: u16,
     rows: u16,
 ) -> CellPos {
-    if char_w <= 0.0 || line_h <= 0.0 || cols == 0 || rows == 0 {
-        return (0, 0);
-    }
-    let row = ((mouse.1 - origin.1) / line_h).floor() as i32;
-    let col = ((mouse.0 - origin.0) / char_w).floor() as i32;
-    let row = row.clamp(0, rows as i32 - 1) as u16;
-    let col = col.clamp(0, cols as i32) as u16;
-    (row, col)
+    // Single pitch source (issue #112): the floor/clamp math lives in the
+    // core helper, so mapping can never drift from the render pitch again.
+    crate::shell_shared::cell_at(mouse, origin, (char_w, line_h), (cols, rows))
 }
 
 /// Split a normalized multi-row selection into per-row `(row, start_col,
