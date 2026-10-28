@@ -2009,6 +2009,91 @@ pub unsafe extern "C" fn staap_link_count(core: *const StaapCore, row: usize) ->
     }
 }
 
+/// Display label for one PR link URL on roster row `row` (issue #115):
+/// the pinned state glyph with approval count (`✓3`) from stored core
+/// state, or the Unknown fallback (`–`). Lets shells render per-link
+/// state icons without parsing or spawning `gh` themselves. Owned
+/// string; free with [`staap_screen_text_free`]. Null on null handle,
+/// out-of-bounds row, null URL, non-UTF-8 URL, or when `url` is not a
+/// PR link (shells leave non-PR rows bare).
+///
+/// # Safety
+/// `core` must be null or a live pointer from [`staap_core_new`]; `url`
+/// must be null or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn staap_pr_glyph(
+    core: *const StaapCore,
+    row: usize,
+    url: *const c_char,
+) -> *mut c_char {
+    if core.is_null() {
+        set_error("staap_pr_glyph: null core".to_string());
+        return std::ptr::null_mut();
+    }
+    if url.is_null() {
+        set_error("staap_pr_glyph: null url".to_string());
+        return std::ptr::null_mut();
+    }
+    let url = match CStr::from_ptr(url).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_error("staap_pr_glyph: url is not valid UTF-8".to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    let sessions: &[ChatSession] = &(*core).reg.app.sessions;
+    match sessions.get(row) {
+        Some(session) => match crate::shell_shared::pr_link_label(session, url) {
+            Some(label) => match CString::new(label) {
+                Ok(s) => s.into_raw(),
+                Err(_) => {
+                    set_error("staap_pr_glyph: label contains NUL".to_string());
+                    std::ptr::null_mut()
+                }
+            },
+            // Non-PR URLs carry no icon; shells leave those rows bare.
+            None => std::ptr::null_mut(),
+        },
+        None => {
+            set_error(format!("staap_pr_glyph: row {row} out of bounds"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Refresh stored PR states for roster row `row` (issue #115): re-query
+/// `gh` for stale URLs (5-minute TTL cache) and persist the results.
+/// Returns 1 when any state changed, 0 when unchanged, -1 on null
+/// handle / out-of-bounds row. Absent binary, failures, and rate
+/// limits resolve Unknown and prune — never an error row.
+///
+/// Blocking: spawns `gh` subprocesses for stale URLs. Call from a
+/// background task only — never on the pump hot path.
+///
+/// # Safety
+/// `core` must be null or a live pointer from [`staap_core_new`].
+#[no_mangle]
+pub unsafe extern "C" fn staap_pr_refresh(core: *mut StaapCore, row: usize) -> c_int {
+    if core.is_null() {
+        set_error("staap_pr_refresh: null core".to_string());
+        return -1;
+    }
+    let sessions = &mut (*core).reg.app.sessions;
+    match sessions.get_mut(row) {
+        Some(session) => {
+            if session.refresh_pr_states() {
+                1
+            } else {
+                0
+            }
+        }
+        None => {
+            set_error(format!("staap_pr_refresh: row {row} out of bounds"));
+            -1
+        }
+    }
+}
+
 /// Unix seconds of `last_active` for roster row `row`, or -1 on null
 /// handle / out-of-bounds row. Shells feed it to [`staap_relative_age`]
 /// with their own clock, so all shells render the same relative label.
@@ -2506,6 +2591,7 @@ mod tests {
                 harness: HARNESS_MUSE.into(),
                 last_active: 0,
                 pr_links: vec![],
+                pr_states: Default::default(),
                 related_links: vec![],
                 links_truncated: false,
                 transcript: vec![],
@@ -2718,6 +2804,7 @@ mod tests {
                 harness: HARNESS_MUSE.into(),
                 last_active: 0,
                 pr_links: vec![],
+                pr_states: Default::default(),
                 related_links: vec![],
                 links_truncated: false,
                 transcript: vec![],
@@ -2755,6 +2842,75 @@ mod tests {
                 .into_owned();
             assert!(msg.contains("staap_session_json"), "last_error: {msg:?}");
             assert!(staap_session_json(std::ptr::null(), 0).is_null());
+        }
+    }
+
+    // Issue #115: per-link state glyphs over the C ABI serve stored core
+    // state (never spawn); refresh on an empty row is a no-op without
+    // touching the network.
+    #[test]
+    fn pr_glyph_serves_stored_state_and_refresh_degrades() {
+        use crate::app::{ChatSession, HARNESS_MUSE};
+        use crate::parsers::github::PrState;
+        use std::ffi::CString;
+
+        fn row(id: &str, status: Status) -> ChatSession {
+            ChatSession {
+                id: id.into(),
+                title: id.into(),
+                project: "proj".into(),
+                status,
+                harness: HARNESS_MUSE.into(),
+                last_active: 0,
+                pr_links: vec!["https://github.com/acme/app/pull/42".to_string()],
+                pr_states: [(
+                    "https://github.com/acme/app/pull/42".to_string(),
+                    PrState::Merged,
+                )]
+                .into_iter()
+                .collect(),
+                related_links: vec![],
+                links_truncated: false,
+                transcript: vec![],
+                transcript_truncated: false,
+                title_locked: true,
+                pending_input: String::new(),
+                provider_session_id: None,
+                cwd: None,
+                remote: None,
+            }
+        }
+        let core = StaapCore {
+            reg: crate::runs::RunRegistry::new(vec![row("a", Status::Idle)]),
+        };
+        unsafe {
+            // Stored state renders its pinned label; unknown URLs fall
+            // back to the Unknown glyph — no spawn on either path.
+            let url = CString::new("https://github.com/acme/app/pull/42").unwrap();
+            let raw = staap_pr_glyph(&core as *const StaapCore, 0, url.as_ptr());
+            assert!(!raw.is_null());
+            assert_eq!(CStr::from_ptr(raw).to_str().unwrap(), "✔");
+            staap_screen_text_free(raw);
+            let fresh = CString::new("https://github.com/acme/app/pull/43").unwrap();
+            let raw = staap_pr_glyph(&core as *const StaapCore, 0, fresh.as_ptr());
+            assert_eq!(CStr::from_ptr(raw).to_str().unwrap(), "–");
+            staap_screen_text_free(raw);
+            // Non-PR URLs carry no icon: null, not the Unknown glyph.
+            let issue = CString::new("https://github.com/acme/app/issues/5").unwrap();
+            assert!(staap_pr_glyph(&core as *const StaapCore, 0, issue.as_ptr()).is_null());
+            // Guards: null core, out-of-bounds row, null URL.
+            assert!(staap_pr_glyph(std::ptr::null(), 0, url.as_ptr()).is_null());
+            assert!(staap_pr_glyph(&core as *const StaapCore, 7, url.as_ptr()).is_null());
+            assert!(staap_pr_glyph(&core as *const StaapCore, 0, std::ptr::null()).is_null());
+            // A row with no links refreshes to unchanged without spawning.
+            let mut bare = StaapCore {
+                reg: crate::runs::RunRegistry::new(vec![row("b", Status::Idle)]),
+            };
+            bare.reg.app.sessions[0].pr_links.clear();
+            bare.reg.app.sessions[0].pr_states.clear();
+            assert_eq!(staap_pr_refresh(&mut bare as *mut StaapCore, 0), 0);
+            assert_eq!(staap_pr_refresh(&mut bare as *mut StaapCore, 7), -1);
+            assert_eq!(staap_pr_refresh(std::ptr::null_mut(), 0), -1);
         }
     }
 
@@ -3246,6 +3402,7 @@ mod tests {
                 harness: crate::app::HARNESS_MUSE.into(),
                 last_active: 0,
                 pr_links: vec![],
+                pr_states: Default::default(),
                 related_links: vec![],
                 links_truncated: false,
                 transcript: vec![],

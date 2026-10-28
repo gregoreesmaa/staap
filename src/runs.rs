@@ -263,6 +263,7 @@ mod tests {
             harness: HARNESS_MUSE.into(),
             last_active: 1,
             pr_links: vec![],
+            pr_states: Default::default(),
             related_links: vec![],
             links_truncated: false,
             transcript: vec![],

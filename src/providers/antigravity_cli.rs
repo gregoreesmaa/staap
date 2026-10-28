@@ -273,6 +273,7 @@ impl Provider for AntigravityCliProvider {
                 harness: crate::app::HARNESS_ANTIGRAVITY.to_string(),
                 last_active: mtime,
                 pr_links,
+                pr_states: Default::default(),
                 related_links,
                 links_truncated: false,
                 transcript: transcript.messages,

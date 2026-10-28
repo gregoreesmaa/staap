@@ -759,6 +759,36 @@ char *staap_relative_age(int64_t now_secs, int64_t then_secs);
 int staap_link_count(const struct StaapCore *core, uintptr_t row);
 
 /**
+ * Display label for one PR link URL on roster row `row` (issue #115):
+ * the pinned state glyph with approval count (`✓3`) from stored core
+ * state, or the Unknown fallback (`–`). Lets shells render per-link
+ * state icons without parsing or spawning `gh` themselves. Owned
+ * string; free with [`staap_screen_text_free`]. Null on null handle,
+ * out-of-bounds row, null URL, non-UTF-8 URL, or when `url` is not a
+ * PR link (shells leave non-PR rows bare).
+ *
+ * # Safety
+ * `core` must be null or a live pointer from [`staap_core_new`]; `url`
+ * must be null or a valid NUL-terminated C string.
+ */
+char *staap_pr_glyph(const struct StaapCore *core, uintptr_t row, const char *url);
+
+/**
+ * Refresh stored PR states for roster row `row` (issue #115): re-query
+ * `gh` for stale URLs (5-minute TTL cache) and persist the results.
+ * Returns 1 when any state changed, 0 when unchanged, -1 on null
+ * handle / out-of-bounds row. Absent binary, failures, and rate
+ * limits resolve Unknown and prune — never an error row.
+ *
+ * Blocking: spawns `gh` subprocesses for stale URLs. Call from a
+ * background task only — never on the pump hot path.
+ *
+ * # Safety
+ * `core` must be null or a live pointer from [`staap_core_new`].
+ */
+int staap_pr_refresh(struct StaapCore *core, uintptr_t row);
+
+/**
  * Unix seconds of `last_active` for roster row `row`, or -1 on null
  * handle / out-of-bounds row. Shells feed it to [`staap_relative_age`]
  * with their own clock, so all shells render the same relative label.

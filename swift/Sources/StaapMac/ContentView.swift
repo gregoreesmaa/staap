@@ -268,7 +268,7 @@ struct ContentView: View {
     private func linkList(_ row: SessionRow) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(allLinks(row), id: \.self) { link in
-                linkRow(link)
+                linkRow(row.id, link)
             }
         }
     }
@@ -276,13 +276,16 @@ struct ContentView: View {
     /// One parsed-link row: a direct-tap `Link` for URLs (native
     /// single-click open, matching the click-to-open rows in the
     /// other shells), plain text for non-URL refs. Both carry the
-    /// copy action.
-    private func linkRow(_ link: String) -> some View {
-        Group {
+    /// copy action. PR rows lead with the stored core state icon
+    /// (issue #115); other rows render bare.
+    private func linkRow(_ rowId: String, _ link: String) -> some View {
+        let icon = state.prGlyph(for: rowId, link: link)
+        let title = icon.isEmpty ? link : icon + " " + link
+        return Group {
             if let url = URL(string: link), url.scheme != nil {
-                Link(link, destination: url)
+                Link(title, destination: url)
             } else {
-                Text(link)
+                Text(title)
             }
         }
         .font(.caption)

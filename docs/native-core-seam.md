@@ -53,7 +53,8 @@ can link them.
 
 - Types: `ChatSession` (serde JSON; stable row key `id`, display-only
   `title`, `project`, `status: Status`, `harness`, `last_active`,
-  `pr_links` / `related_links` / `links_truncated`, `transcript` /
+  `pr_links` / `related_links` / `links_truncated`, `pr_states`
+  (per-link PR state, issue #115), `transcript` /
   `transcript_truncated`, `title_locked`, `pending_input`,
   `provider_session_id`, `cwd: Option<String>`), `Status::{Attention, Idle,
   Working}`, `Focus`, `App` (`sessions`, `selected`, `filter`,
@@ -343,7 +344,8 @@ WinUI 3 UI over the same C ABI. What future maintainers should know:
   renderer, and preview/selection helpers) lives in the core itself
   (`src/shell_shared.rs` + `src/runs.rs`, bound as `staap_feed_delta` /
   `staap_roster_matches` / `staap_relative_age` / `staap_link_count` /
-  `staap_last_active` and the `staap_run_*` / `staap_key_*` / `staap_ansi_*` /
+  `staap_pr_glyph` / `staap_pr_refresh` / `staap_last_active` and the
+  `staap_run_*` / `staap_key_*` / `staap_ansi_*` /
   `staap_select_*` family); `staap-win-feed-test` and `staap-feed-test` pin that
   C ABI edge instead of a vendored copy.
 - Key encoding goes through the shared core table

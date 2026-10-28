@@ -1,9 +1,12 @@
 //! Agent models, conversation status, and sort order.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::embedded::SpawnKind;
+use crate::parsers::github::PrState;
 use crate::transcript::TranscriptMessage;
 
 /// Conversation attention state, ordered by urgency.
@@ -144,6 +147,12 @@ pub struct ChatSession {
     pub last_active: i64,
     /// GitHub PR URLs extracted from the conversation transcript.
     pub pr_links: Vec<String>,
+    /// Per-link PR state keyed by full PR URL (issue #115), refreshed
+    /// off the pump tick via [`ChatSession::refresh_pr_states`] and read
+    /// by every shell's link rows. Serde-defaulted so state files saved
+    /// before #115 load with an empty map (all Unknown glyphs).
+    #[serde(default)]
+    pub pr_states: HashMap<String, PrState>,
     /// Non-PR references (issues, commits, file refs), same treatment.
     #[serde(default)]
     pub related_links: Vec<String>,
@@ -220,6 +229,61 @@ impl ChatSession {
         let key = crate::parsers::github::link_sort_key;
         self.pr_links.sort_by_key(|a| key(a));
         self.related_links.sort_by_key(|a| key(a));
+    }
+
+    /// Stored PR state for a link URL (issue #115): Unknown when never
+    /// refreshed, when `gh` is absent, or when the refresh failed. Pure
+    /// render input — never spawns, never parses.
+    pub fn pr_state_for(&self, url: &str) -> PrState {
+        self.pr_states.get(url).copied().unwrap_or(PrState::Unknown)
+    }
+
+    /// Display label (`◴`, `✓3`, `⚠`, `✕`, `✔`, `⋯`, `–`) for a PR link
+    /// URL from stored state, or `None` when the URL is not a PR link at
+    /// all. Shells prefix PR rows with this and leave other rows bare;
+    /// the glyph mapping and the PR/non-PR call live in the core alone
+    /// (dumb-shell contract — shells never branch on URL shape).
+    pub fn pr_label_for(&self, url: &str) -> Option<String> {
+        // PR/non-PR call first: only PR links carry icons.
+        crate::parsers::github::parse_pr_url(url)?;
+        Some(crate::parsers::github::pr_status_label(
+            self.pr_state_for(url),
+        ))
+    }
+
+    /// Record a refreshed state for a retained PR link. Unknown states
+    /// prune the entry (nothing to persist); anything else upserts.
+    /// Returns true when the stored map changed.
+    pub fn set_pr_state(&mut self, url: &str, state: PrState) -> bool {
+        if state == PrState::Unknown {
+            return self.pr_states.remove(url).is_some();
+        }
+        match self.pr_states.get(url) {
+            Some(&old) if old == state => false,
+            _ => {
+                self.pr_states.insert(url.to_string(), state);
+                true
+            }
+        }
+    }
+
+    /// Refresh stored PR states for every retained PR link (issue #115).
+    /// Each URL costs at most one `gh` spawn per 5 minutes (shared TTL
+    /// cache); absent binary, failures, and rate limits resolve Unknown
+    /// and prune. Returns true when any stored state changed.
+    ///
+    /// Blocking: spawns `gh` subprocesses for stale URLs. Call from a
+    /// background task only — never on the pump hot path.
+    pub fn refresh_pr_states(&mut self) -> bool {
+        let mut changed = false;
+        // Snapshot the URLs: resolving borrows nothing here, but the
+        // clone keeps the loop honest if retention rules ever mutate.
+        let urls = self.pr_links.clone();
+        for url in &urls {
+            let state = crate::parsers::github::resolve_pr_state(url);
+            changed |= self.set_pr_state(url, state);
+        }
+        changed
     }
 }
 
@@ -1117,6 +1181,7 @@ impl App {
             harness: cli.clone(),
             last_active: now_secs(),
             pr_links: vec![],
+            pr_states: Default::default(),
             related_links: vec![],
             links_truncated: false,
             transcript: vec![],
@@ -1207,6 +1272,7 @@ mod tests {
             harness: HARNESS_MUSE.into(),
             last_active,
             pr_links: vec![],
+            pr_states: Default::default(),
             related_links: vec![],
             links_truncated: false,
             transcript: vec![],
@@ -1276,6 +1342,70 @@ mod tests {
         let (shown, hidden) = visible_links(&short);
         assert_eq!(shown.len(), 3);
         assert_eq!(hidden, 0);
+    }
+
+    // Issue #115: per-link PR state storage on the session.
+    #[test]
+    fn pr_states_default_unknown_and_round_trip() {
+        let mut s = sess("a", Status::Working, 1);
+        let url = "https://github.com/acme/app/pull/42";
+        // Unseen PR URLs read Unknown; labels render the fallback glyph.
+        assert_eq!(s.pr_state_for(url), PrState::Unknown);
+        assert_eq!(s.pr_label_for(url), Some("–".to_string()));
+        // Non-PR URLs carry no label at all.
+        assert_eq!(s.pr_label_for("https://github.com/acme/app/issues/5"), None);
+        // Upsert reports change only on change; Unknown prunes.
+        assert!(s.set_pr_state(url, PrState::OpenApproved(2)));
+        assert!(!s.set_pr_state(url, PrState::OpenApproved(2)));
+        assert_eq!(s.pr_label_for(url), Some("✓2".to_string()));
+        assert!(s.set_pr_state(url, PrState::Merged));
+        assert_eq!(s.pr_label_for(url), Some("✔".to_string()));
+        assert!(s.set_pr_state(url, PrState::Unknown));
+        assert!(!s.set_pr_state(url, PrState::Unknown));
+        assert_eq!(s.pr_state_for(url), PrState::Unknown);
+        // States survive the persisted JSON form.
+        s.set_pr_state(url, PrState::OpenChangesRequested);
+        let text = serde_json::to_string(&s).expect("session serializes");
+        let back: ChatSession = serde_json::from_str(&text).expect("session loads");
+        assert_eq!(back.pr_state_for(url), PrState::OpenChangesRequested);
+        assert_eq!(back.pr_label_for(url), Some("⚠".to_string()));
+    }
+
+    // Issue #115: runs.json entries saved before pr_states load with an
+    // empty map (same serde-default pattern as the #46 harness field).
+    #[test]
+    fn pr_states_load_from_pre_115_files() {
+        let old: ChatSession = serde_json::from_str(
+            r#"{"id":"a","title":"a","project":"p","status":"Idle","last_active":1,"pr_links":[],"related_links":[]}"#,
+        )
+        .unwrap();
+        assert!(old.pr_states.is_empty());
+        assert_eq!(
+            old.pr_label_for("https://github.com/acme/app/pull/1"),
+            Some("–".to_string())
+        );
+    }
+
+    // Issue #115: refresh observes the shared TTL cache, so a fresh
+    // entry costs no spawn (no subprocess on this path at all).
+    #[test]
+    fn refresh_pr_states_uses_cache_without_spawning() {
+        use std::time::Instant;
+
+        let url = "https://github.com/acme/refresh-warm/pull/11";
+        let body = br#"{"number":11,"state":"MERGED","isDraft":false,"reviewDecision":"","mergeStateStatus":"UNKNOWN"}"#.to_vec();
+        let mut fetch = |_repo: &str, _n: u64| Some(body.clone());
+        assert_eq!(
+            crate::parsers::github::resolve_pr_state_with(url, Instant::now(), true, &mut fetch),
+            PrState::Merged
+        );
+        let mut s = sess("a", Status::Working, 1);
+        s.push_links(vec![url.to_string()], vec![]);
+        assert!(s.refresh_pr_states());
+        assert_eq!(s.pr_state_for(url), PrState::Merged);
+        // Second refresh: nothing changed (and still no spawn — the
+        // cache is fresh, so refresh never reaches a subprocess).
+        assert!(!s.refresh_pr_states());
     }
 
     #[test]

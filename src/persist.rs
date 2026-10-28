@@ -81,6 +81,14 @@ fn union_into(keep: &mut ChatSession, mut donor: ChatSession) {
         std::mem::take(&mut donor.pr_links),
         std::mem::take(&mut donor.related_links),
     );
+    // Refreshed PR states (issue #115) ride with the links they describe:
+    // discovery never reports states, so the persisted copy's states fill
+    // keep's map for retained URLs without overwriting fresher entries.
+    for (url, state) in std::mem::take(&mut donor.pr_states) {
+        if keep.pr_links.contains(&url) && !keep.pr_states.contains_key(&url) {
+            keep.pr_states.insert(url, state);
+        }
+    }
     if keep.transcript.is_empty() && !donor.transcript.is_empty() {
         keep.transcript = donor.transcript;
         keep.transcript_truncated = donor.transcript_truncated;
@@ -137,6 +145,10 @@ pub fn merge_sessions(
                 // Pre-sort persisted rows converge loaded state with live
                 // rows without waiting for the next link arrival.
                 saved.sort_links();
+                // States only describe retained links (issue #115).
+                saved
+                    .pr_states
+                    .retain(|url, _| saved.pr_links.contains(url));
                 out.push(saved);
             }
         }
@@ -245,6 +257,7 @@ mod tests {
             last_active: 7,
             provider_session_id: None,
             pr_links: vec!["https://github.com/acme/app/pull/1".into()],
+            pr_states: Default::default(),
             related_links: vec!["src/app.rs:9".into()],
             links_truncated: false,
             transcript: vec![TranscriptMessage {
@@ -456,6 +469,29 @@ mod tests {
         // Discovered title wins over the stale persisted one.
         let ghost = merged.iter().find(|s| s.id == "ghost").unwrap();
         assert_eq!(ghost.status, Status::Idle);
+    }
+
+    #[test]
+    fn merge_carries_pr_states_for_retained_links() {
+        use crate::parsers::github::PrState;
+
+        let url = "https://github.com/acme/app/pull/1";
+        // Fresh discovery reports links but never states.
+        let mut discovered = vec![sess("a")];
+        discovered[0].pr_states.clear();
+        // The persisted copy carries a refreshed state for the same link.
+        let mut saved = sess("a");
+        saved.set_pr_state(url, PrState::Merged);
+        let merged = merge_sessions(discovered, vec![saved]);
+        let a = merged.iter().find(|s| s.id == "a").unwrap();
+        assert_eq!(a.pr_state_for(url), PrState::Merged);
+        // ...but never for links the union dropped.
+        let mut saved2 = sess("a");
+        saved2.pr_links.clear();
+        saved2.set_pr_state(url, PrState::Merged);
+        let merged2 = merge_sessions(vec![sess("b")], vec![saved2]);
+        let a2 = merged2.iter().find(|s| s.id == "a").unwrap();
+        assert_eq!(a2.pr_state_for(url), PrState::Unknown);
     }
 
     #[test]
