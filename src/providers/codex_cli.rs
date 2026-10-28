@@ -173,6 +173,7 @@ impl Provider for CodexCliProvider {
                 harness: crate::app::HARNESS_CODEX.to_string(),
                 last_active: mtime,
                 pr_links: parsed.pr_links,
+                pr_states: Default::default(),
                 related_links: parsed.related_links,
                 links_truncated: false,
                 transcript: transcript.messages,

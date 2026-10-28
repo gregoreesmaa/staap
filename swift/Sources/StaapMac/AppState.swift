@@ -142,6 +142,15 @@ final class AppState: ObservableObject {
         Core.statusGlyph(Int32(statuses[row.id] ?? RunStatus.idle.rawValue))
     }
 
+    /// Stored PR state label for one link (issue #115): the pinned
+    /// glyph with approval count, the Unknown fallback, or "" for
+    /// non-PR links. Render only — refresh runs outside the pump tick
+    /// via the core `staap_pr_refresh` API (background callers only).
+    func prGlyph(for rowId: String, link: String) -> String {
+        guard let i = rows.firstIndex(where: { $0.id == rowId }) else { return "" }
+        return core.prGlyph(row: i, url: link)
+    }
+
     /// Human age for a row (shared core buckets).
     func age(of row: SessionRow) -> String {
         let now = Int64(Date.now.timeIntervalSince1970)

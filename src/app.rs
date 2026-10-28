@@ -1,9 +1,12 @@
 //! Agent models, conversation status, and sort order.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::embedded::SpawnKind;
+use crate::parsers::github::PrState;
 use crate::transcript::TranscriptMessage;
 
 /// Conversation attention state, ordered by urgency.
@@ -144,6 +147,12 @@ pub struct ChatSession {
     pub last_active: i64,
     /// GitHub PR URLs extracted from the conversation transcript.
     pub pr_links: Vec<String>,
+    /// Per-link PR state keyed by full PR URL (issue #115), refreshed
+    /// off the pump tick via [`ChatSession::refresh_pr_states`] and read
+    /// by every shell's link rows. Serde-defaulted so state files saved
+    /// before #115 load with an empty map (all Unknown glyphs).
+    #[serde(default)]
+    pub pr_states: HashMap<String, PrState>,
     /// Non-PR references (issues, commits, file refs), same treatment.
     #[serde(default)]
     pub related_links: Vec<String>,
@@ -220,6 +229,82 @@ impl ChatSession {
         let key = crate::parsers::github::link_sort_key;
         self.pr_links.sort_by_key(|a| key(a));
         self.related_links.sort_by_key(|a| key(a));
+    }
+
+    /// Stored PR state for a link URL (issue #115): Unknown when never
+    /// refreshed, when `gh` is absent, or when the refresh failed. Pure
+    /// render input — never spawns, never parses.
+    pub fn pr_state_for(&self, url: &str) -> PrState {
+        self.pr_states.get(url).copied().unwrap_or(PrState::Unknown)
+    }
+
+    /// Display label (`◴`, `✓3`, `⚠`, `✕`, `✔`, `⋯`, `–`) for a PR link
+    /// URL from stored state, or `None` when the URL is not a PR link at
+    /// all. Shells prefix PR rows with this and leave other rows bare;
+    /// the glyph mapping and the PR/non-PR call live in the core alone
+    /// (dumb-shell contract — shells never branch on URL shape).
+    pub fn pr_label_for(&self, url: &str) -> Option<String> {
+        // PR/non-PR call first: only PR links carry icons.
+        crate::parsers::github::parse_pr_url(url)?;
+        Some(crate::parsers::github::pr_status_label(
+            self.pr_state_for(url),
+        ))
+    }
+
+    /// Record a refreshed state for a retained PR link. Unknown states
+    /// prune the entry (nothing to persist); anything else upserts.
+    /// Returns true when the stored map changed.
+    pub fn set_pr_state(&mut self, url: &str, state: PrState) -> bool {
+        if state == PrState::Unknown {
+            return self.pr_states.remove(url).is_some();
+        }
+        match self.pr_states.get(url) {
+            Some(&old) if old == state => false,
+            _ => {
+                self.pr_states.insert(url.to_string(), state);
+                true
+            }
+        }
+    }
+
+    /// Refresh stored PR states for every retained PR link (issue #115).
+    /// Each URL costs at most one `gh` spawn per 5 minutes (shared TTL
+    /// cache, each spawn bounded by the `fetch_pr_json` spawn timeout);
+    /// absent binary, failures, and rate limits resolve Unknown and
+    /// prune. Returns true when any stored state changed.
+    ///
+    /// Blocking and unbudgeted: one bounded spawn per stale URL. Call
+    /// from a background task only — never per-tick or per-row. The
+    /// pump's periodic path uses the throttled budgeted driver
+    /// ([`App::refresh_stale_pr_states`]) instead; nothing calls this
+    /// on the pump.
+    pub fn refresh_pr_states(&mut self) -> bool {
+        self.refresh_pr_states_with(
+            std::time::Instant::now(),
+            crate::parsers::github::gh_cli_available(),
+            &mut crate::parsers::github::fetch_pr_json,
+        )
+    }
+
+    /// Injectable seam behind [`Self::refresh_pr_states`]: `now` stands
+    /// in for the clock, `gh_available` for `gh` presence, `fetch` for
+    /// the `gh` spawn, so tests cover refresh without subprocesses.
+    pub fn refresh_pr_states_with(
+        &mut self,
+        now: std::time::Instant,
+        gh_available: bool,
+        fetch: &mut dyn FnMut(&str, u64) -> Option<Vec<u8>>,
+    ) -> bool {
+        let mut changed = false;
+        // Snapshot the URLs: resolving borrows nothing here, but the
+        // clone keeps the loop honest if retention rules ever mutate.
+        let urls = self.pr_links.clone();
+        for url in &urls {
+            let state =
+                crate::parsers::github::resolve_pr_state_with(url, now, gh_available, fetch);
+            changed |= self.set_pr_state(url, state);
+        }
+        changed
     }
 }
 
@@ -1121,6 +1206,7 @@ impl App {
             harness: cli.clone(),
             last_active: now_secs(),
             pr_links: vec![],
+            pr_states: Default::default(),
             related_links: vec![],
             links_truncated: false,
             transcript: vec![],
@@ -1196,6 +1282,68 @@ impl App {
     pub fn selected_session(&self) -> Option<&ChatSession> {
         self.sessions.get(self.selected)
     }
+
+    /// Budgeted PR-state refresh driver (issue #115): resolve at most
+    /// `budget` stale PR-link URLs across all sessions; fresh cache
+    /// entries keep resolving free past the cap (only stale resolutions
+    /// spend budget). Returns how many stored states changed. Stale URLs
+    /// past the cap wait for the next driver run.
+    ///
+    /// Blocking: up to `budget` `gh` spawns, each bounded by the
+    /// `fetch_pr_json` spawn timeout. The pump runs this inline on its
+    /// task under a 60 s throttle (budget 1): the per-tick hot path
+    /// stays spawn-free — a throttle check, a link-list scan, and
+    /// TTL-cache lookups — and the worst case is `budget` bounded
+    /// spawns per throttle window. Never call per-tick unthrottled or
+    /// per-row.
+    pub fn refresh_stale_pr_states(&mut self, budget: usize) -> usize {
+        self.refresh_stale_pr_states_with(
+            budget,
+            std::time::Instant::now(),
+            crate::parsers::github::gh_cli_available(),
+            &mut crate::parsers::github::fetch_pr_json,
+        )
+    }
+
+    /// Injectable seam behind [`Self::refresh_stale_pr_states`]: `now`
+    /// stands in for the clock, `gh_available` for `gh` presence,
+    /// `fetch` for the `gh` spawn, so tests cover the budget cap and
+    /// the changed count without subprocesses.
+    pub fn refresh_stale_pr_states_with(
+        &mut self,
+        budget: usize,
+        now: std::time::Instant,
+        gh_available: bool,
+        fetch: &mut dyn FnMut(&str, u64) -> Option<Vec<u8>>,
+    ) -> usize {
+        use crate::parsers::github::{pr_cache_fresh, resolve_pr_state_with};
+        let mut changed = 0;
+        let mut spent = 0;
+        for session in self.sessions.iter_mut() {
+            // Snapshot the URLs: resolving borrows nothing here, but
+            // the clone keeps the loop honest if retention rules mutate.
+            let urls = session.pr_links.clone();
+            for url in &urls {
+                if pr_cache_fresh(url, now) {
+                    // Free: served from memory, spends no budget — so
+                    // fresh entries behind a spent cap still converge.
+                    let state = resolve_pr_state_with(url, now, gh_available, fetch);
+                    if session.set_pr_state(url, state) {
+                        changed += 1;
+                    }
+                } else if spent < budget {
+                    // Stale: each resolution costs at most one spawn.
+                    spent += 1;
+                    let state = resolve_pr_state_with(url, now, gh_available, fetch);
+                    if session.set_pr_state(url, state) {
+                        changed += 1;
+                    }
+                }
+                // Over budget and stale: waits for the next driver run.
+            }
+        }
+        changed
+    }
 }
 
 #[cfg(test)]
@@ -1211,6 +1359,7 @@ mod tests {
             harness: HARNESS_MUSE.into(),
             last_active,
             pr_links: vec![],
+            pr_states: Default::default(),
             related_links: vec![],
             links_truncated: false,
             transcript: vec![],
@@ -1280,6 +1429,224 @@ mod tests {
         let (shown, hidden) = visible_links(&short);
         assert_eq!(shown.len(), 3);
         assert_eq!(hidden, 0);
+    }
+
+    // Issue #115: per-link PR state storage on the session.
+    #[test]
+    fn pr_states_default_unknown_and_round_trip() {
+        let mut s = sess("a", Status::Working, 1);
+        let url = "https://github.com/acme/app/pull/42";
+        // Unseen PR URLs read Unknown; labels render the fallback glyph.
+        assert_eq!(s.pr_state_for(url), PrState::Unknown);
+        assert_eq!(s.pr_label_for(url), Some("–".to_string()));
+        // Non-PR URLs carry no label at all.
+        assert_eq!(s.pr_label_for("https://github.com/acme/app/issues/5"), None);
+        // Upsert reports change only on change; Unknown prunes.
+        assert!(s.set_pr_state(url, PrState::OpenApproved(2)));
+        assert!(!s.set_pr_state(url, PrState::OpenApproved(2)));
+        assert_eq!(s.pr_label_for(url), Some("✓2".to_string()));
+        assert!(s.set_pr_state(url, PrState::Merged));
+        assert_eq!(s.pr_label_for(url), Some("✔".to_string()));
+        assert!(s.set_pr_state(url, PrState::Unknown));
+        assert!(!s.set_pr_state(url, PrState::Unknown));
+        assert_eq!(s.pr_state_for(url), PrState::Unknown);
+        // States survive the persisted JSON form.
+        s.set_pr_state(url, PrState::OpenChangesRequested);
+        let text = serde_json::to_string(&s).expect("session serializes");
+        let back: ChatSession = serde_json::from_str(&text).expect("session loads");
+        assert_eq!(back.pr_state_for(url), PrState::OpenChangesRequested);
+        assert_eq!(back.pr_label_for(url), Some("⚠".to_string()));
+    }
+
+    // Issue #115: runs.json entries saved before pr_states load with an
+    // empty map (same serde-default pattern as the #46 harness field).
+    #[test]
+    fn pr_states_load_from_pre_115_files() {
+        let old: ChatSession = serde_json::from_str(
+            r#"{"id":"a","title":"a","project":"p","status":"Idle","last_active":1,"pr_links":[],"related_links":[]}"#,
+        )
+        .unwrap();
+        assert!(old.pr_states.is_empty());
+        assert_eq!(
+            old.pr_label_for("https://github.com/acme/app/pull/1"),
+            Some("–".to_string())
+        );
+    }
+
+    // Issue #115: refresh observes the shared TTL cache, so a fresh
+    // entry costs no spawn (no subprocess on this path at all).
+    #[test]
+    fn refresh_pr_states_uses_cache_without_spawning() {
+        use std::time::Instant;
+
+        let url = "https://github.com/acme/refresh-warm/pull/11";
+        let body = br#"{"number":11,"state":"MERGED","isDraft":false,"reviewDecision":"","mergeStateStatus":"UNKNOWN"}"#.to_vec();
+        let mut fetch = |_repo: &str, _n: u64| Some(body.clone());
+        assert_eq!(
+            crate::parsers::github::resolve_pr_state_with(url, Instant::now(), true, &mut fetch),
+            PrState::Merged
+        );
+        let mut s = sess("a", Status::Working, 1);
+        s.push_links(vec![url.to_string()], vec![]);
+        assert!(s.refresh_pr_states());
+        assert_eq!(s.pr_state_for(url), PrState::Merged);
+        // Second refresh: nothing changed (and still no spawn — the
+        // cache is fresh, so refresh never reaches a subprocess).
+        assert!(!s.refresh_pr_states());
+    }
+
+    // Issue #115 fix-loop: the budgeted driver resolves at most
+    // `budget` stale URLs per call. Three stale URLs with budget 1
+    // cost exactly one spawn-boundary invocation and store one state.
+    #[test]
+    fn refresh_stale_pr_states_caps_spawns_at_budget() {
+        use std::time::Instant;
+
+        let urls = [
+            "https://github.com/acme/prdriver-cap/pull/21",
+            "https://github.com/acme/prdriver-cap/pull/22",
+            "https://github.com/acme/prdriver-cap/pull/23",
+        ];
+        let body = br#"{"number":21,"state":"MERGED","isDraft":false,"reviewDecision":"","mergeStateStatus":"UNKNOWN"}"#.to_vec();
+        let calls = std::cell::Cell::new(0u32);
+        let mut fetch = |_repo: &str, _n: u64| {
+            calls.set(calls.get() + 1);
+            Some(body.clone())
+        };
+        let mut s = sess("a", Status::Working, 1);
+        s.push_links(urls.iter().map(|u| u.to_string()).collect(), vec![]);
+        let mut app = App::new(vec![s]);
+        let changed = app.refresh_stale_pr_states_with(1, Instant::now(), true, &mut fetch);
+        assert_eq!(calls.get(), 1, "budget 1 must spend exactly one spawn");
+        assert_eq!(changed, 1, "the one resolved URL stores Merged");
+    }
+
+    // Issue #115 fix-loop 2: budget skips no free work — a fresh-cache
+    // URL sitting *behind* the spent cap still converges with no extra
+    // spawn-boundary invocations; only stale resolutions spend budget.
+    // (Numeric display order puts the fresh URL last, past two stales.)
+    #[test]
+    fn refresh_stale_pr_states_spends_budget_on_stale_only() {
+        use std::time::{Duration, Instant};
+
+        let stale_a = "https://github.com/acme/prdriver-mix/pull/51";
+        let stale_b = "https://github.com/acme/prdriver-mix/pull/52";
+        let fresh = "https://github.com/acme/prdriver-mix/pull/53";
+        let stale_c = "https://github.com/acme/prdriver-mix/pull/54";
+        let merged = br#"{"number":51,"state":"MERGED","isDraft":false,"reviewDecision":"","mergeStateStatus":"UNKNOWN"}"#.to_vec();
+        let t0 = Instant::now();
+        // Pre-warm `fresh` so its cache entry is fresh at resolve time.
+        let mut warm = |_repo: &str, _n: u64| Some(merged.clone());
+        assert_eq!(
+            crate::parsers::github::resolve_pr_state_with(fresh, t0, true, &mut warm),
+            PrState::Merged
+        );
+        let mut s = sess("a", Status::Working, 1);
+        s.push_links(
+            vec![
+                stale_a.to_string(),
+                stale_b.to_string(),
+                fresh.to_string(),
+                stale_c.to_string(),
+            ],
+            vec![],
+        );
+        let mut app = App::new(vec![s]);
+        let calls = std::cell::Cell::new(0u32);
+        let mut fetch = |_repo: &str, _n: u64| {
+            calls.set(calls.get() + 1);
+            Some(merged.clone())
+        };
+        let changed =
+            app.refresh_stale_pr_states_with(1, t0 + Duration::from_secs(60), true, &mut fetch);
+        assert_eq!(calls.get(), 1, "only the first stale URL may spawn");
+        assert_eq!(
+            changed, 2,
+            "stale spawn + free fresh-cache resolve both converge"
+        );
+        let back = &app.sessions[0];
+        assert_eq!(back.pr_state_for(stale_a), PrState::Merged);
+        assert_eq!(back.pr_state_for(stale_b), PrState::Unknown);
+        assert_eq!(back.pr_state_for(fresh), PrState::Merged);
+        assert_eq!(back.pr_state_for(stale_c), PrState::Unknown);
+    }
+
+    // Issue #115 fix-loop: warm (fresh-cache) URLs resolve free — the
+    // driver stores their states with zero spawn-boundary invocations.
+    #[test]
+    fn refresh_stale_pr_states_skips_fresh_cache_without_spawning() {
+        use std::time::{Duration, Instant};
+
+        let urls = [
+            "https://github.com/acme/prdriver-fresh/pull/31",
+            "https://github.com/acme/prdriver-fresh/pull/32",
+        ];
+        let body = br#"{"number":31,"state":"MERGED","isDraft":false,"reviewDecision":"","mergeStateStatus":"UNKNOWN"}"#.to_vec();
+        let t0 = Instant::now();
+        let mut warm = |_repo: &str, _n: u64| Some(body.clone());
+        for url in &urls {
+            assert_eq!(
+                crate::parsers::github::resolve_pr_state_with(url, t0, true, &mut warm),
+                PrState::Merged
+            );
+        }
+        let mut sessions = Vec::new();
+        for (i, url) in urls.iter().enumerate() {
+            let mut s = sess(if i == 0 { "a" } else { "b" }, Status::Working, 1);
+            s.push_links(vec![url.to_string()], vec![]);
+            sessions.push(s);
+        }
+        let mut app = App::new(sessions);
+        let calls = std::cell::Cell::new(0u32);
+        let mut fetch = |_repo: &str, _n: u64| {
+            calls.set(calls.get() + 1);
+            Some(body.clone())
+        };
+        let changed =
+            app.refresh_stale_pr_states_with(5, t0 + Duration::from_secs(60), true, &mut fetch);
+        assert_eq!(calls.get(), 0, "fresh cache must cost no spawn");
+        assert_eq!(changed, 2, "both warm URLs store Merged for free");
+    }
+
+    // Issue #115 fix-loop: the driver returns how many stored states
+    // changed, and a second run over fresh cache changes nothing.
+    #[test]
+    fn refresh_stale_pr_states_reports_changed_count() {
+        use std::time::Instant;
+
+        let url_a = "https://github.com/acme/prdriver-count/pull/41";
+        let url_b = "https://github.com/acme/prdriver-count/pull/42";
+        let merged = br#"{"number":41,"state":"MERGED","isDraft":false,"reviewDecision":"","mergeStateStatus":"UNKNOWN"}"#.to_vec();
+        let approved = br#"{"number":42,"state":"OPEN","isDraft":false,"reviewDecision":"APPROVED","mergeStateStatus":"UNKNOWN","reviews":[{"state":"APPROVED","author":{"login":"alice"}}]}"#.to_vec();
+        let calls = std::cell::Cell::new(0u32);
+        let mut fetch = |_repo: &str, n: u64| {
+            calls.set(calls.get() + 1);
+            Some(if n == 41 {
+                merged.clone()
+            } else {
+                approved.clone()
+            })
+        };
+        let mut sa = sess("a", Status::Working, 1);
+        sa.push_links(vec![url_a.to_string()], vec![]);
+        let mut sb = sess("b", Status::Working, 2);
+        sb.push_links(vec![url_b.to_string()], vec![]);
+        let mut app = App::new(vec![sa, sb]);
+        let now = Instant::now();
+        let changed = app.refresh_stale_pr_states_with(10, now, true, &mut fetch);
+        assert_eq!(changed, 2, "two new states stored");
+        let by_id = |id: &str| app.sessions.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(by_id("a").pr_state_for(url_a), PrState::Merged);
+        assert_eq!(by_id("b").pr_state_for(url_b), PrState::OpenApproved(1));
+        // Second run: cache fresh, nothing left to change, no spawns.
+        let calls2 = std::cell::Cell::new(0u32);
+        let mut fetch2 = |_repo: &str, _n: u64| {
+            calls2.set(calls2.get() + 1);
+            None
+        };
+        let again = app.refresh_stale_pr_states_with(10, now, true, &mut fetch2);
+        assert_eq!(again, 0, "fresh cache with stored states changes nothing");
+        assert_eq!(calls2.get(), 0, "second run must not spawn");
     }
 
     #[test]

@@ -93,6 +93,11 @@ import Foundation
 @_silgen_name("staap_status") private func staap_status(
     _ core: OpaquePointer?, _ row: Int
 ) -> Int32
+// Per-link PR state icon (issue #115): owned display label for one PR
+// URL from stored core state (never spawns `gh`); null for non-PR URLs.
+@_silgen_name("staap_pr_glyph") private func staap_pr_glyph(
+    _ core: OpaquePointer?, _ row: Int, _ url: UnsafePointer<CChar>?
+) -> UnsafeMutablePointer<CChar>?
 // Run registry: spawn/restart/close/pump/write/resize/screen/exit by row
 // id, plus the shared live-count/cap/quit-confirm gates.
 @_silgen_name("staap_max_runs") private func staap_max_runs() -> Int
@@ -373,6 +378,13 @@ final class Core {
     }
 
     func status(_ row: Int) -> Int32 { staap_status(handle, row) }
+
+    /// Stored PR state label for one link URL (issue #115): the pinned
+    /// glyph with approval count, the Unknown fallback, or "" for
+    /// non-PR links. Render only — never spawns.
+    func prGlyph(row: Int, url: String) -> String {
+        url.withCString { copyOwnedString(staap_pr_glyph(handle, row, $0)) } ?? ""
+    }
 
     /// Persistence is automatic (throttled pump autosave + quit hook):
     /// no manual Save button in any shell.

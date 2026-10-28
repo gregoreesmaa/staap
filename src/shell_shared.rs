@@ -255,6 +255,16 @@ pub fn row_matches_filter(session: &ChatSession, query: &str) -> bool {
     roster_matches(&session.title, &session.project, &session.id, query)
 }
 
+/// Display label for one PR link URL from stored session state (issue
+/// #115): the pinned glyph with approval count (`✓3`), the Unknown
+/// fallback (`–`) when never refreshed or refresh failed, or `None`
+/// when the URL is not a PR link. Pure render input — never spawns
+/// `gh`. Shells prefix PR rows with this and leave other rows bare; the
+/// glyph mapping and the PR/non-PR call live in the core alone.
+pub fn pr_link_label(session: &ChatSession, url: &str) -> Option<String> {
+    session.pr_label_for(url)
+}
+
 /// Group row indices into urgency sections: idle, then working —
 /// (idle holds needs-input rows first — issue #105), then history (rows
 /// with no live PTY) last. Returns `(header, indices)` pairs, skipping
@@ -828,6 +838,7 @@ mod tests {
             harness: crate::app::HARNESS_MUSE.into(),
             last_active,
             pr_links: vec![],
+            pr_states: Default::default(),
             related_links: vec![],
             links_truncated: false,
             transcript: vec![],

@@ -5,14 +5,29 @@
 //! `gh` is unavailable, cached state to avoid excessive API calls, and text-only
 //! Unicode glyphs for display in sidebars.
 
-use std::collections::HashSet;
-use std::sync::LazyLock;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
+use serde::Deserialize;
+
+/// Refresh cadence for PR states (issue #115): one `gh` spawn per URL
+/// at most this often; fresher entries are served from memory.
+pub const PR_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Bound on the in-memory PR state cache (bounded-growth rule: no
+/// accumulate-forever store; eviction drops expired entries first).
+const PR_CACHE_MAX_URLS: usize = 256;
 
 /// PR states extracted from `gh pr view` JSON response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized into [`crate::app::ChatSession`] persistence, so old state
+/// files (without the field) still load via `#[serde(default)]` on the
+/// owning field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub enum PrState {
     /// Open and awaiting review - default open state
     OpenUnreviewed,
@@ -52,24 +67,283 @@ static GH_AVAILABLE: LazyLock<AtomicBool> = LazyLock::new(|| {
     AtomicBool::new(available)
 });
 
-/// Convert PrState to display glyph (text-only Unicode).
-pub fn pr_status_glyph(state: PrState, approval_count: Option<u32>) -> &'static str {
+/// Convert PrState to its pinned display glyph (text-only Unicode).
+/// Always a static string: the approval count rides separately in
+/// [`PrStatusIcon::approval_count`] / [`pr_status_label`], so rendering
+/// can never leak (no per-call allocation, fixing the old `Box::leak`
+/// on every approved render).
+pub fn pr_status_glyph(state: PrState) -> &'static str {
     match state {
-        PrState::OpenUnreviewed => "◴", // white circle left quarter shaded
-        PrState::OpenApproved(_n) => {
-            // Append count directly to checkmark: ✓4 means 4 approvals
-            if let Some(count) = approval_count {
-                Box::leak(format!("✓{}", count).into_boxed_str())
-            } else {
-                "✓"
+        PrState::OpenUnreviewed => "◴",  // white circle left quarter shaded
+        PrState::OpenApproved(_) => "✓", // bare checkmark; count via label
+        PrState::OpenChangesRequested => "⚠", // warning sign
+        PrState::Closed => "✕",          // X mark
+        PrState::Merged => "✔",          // heavy checkmark
+        PrState::Draft => "⋯",           // mid-line ellipsis
+        PrState::Unknown => "–",         // en dash (fallback when gh unavailable)
+    }
+}
+
+/// Approval count carried by a state, if any.
+pub fn pr_approval_count(state: PrState) -> Option<u32> {
+    match state {
+        PrState::OpenApproved(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// Single display label for a state: the pinned glyph with the approval
+/// count appended for approvals (`✓3`), bare glyph otherwise. Owned
+/// (built by the caller on demand) — the leak-free replacement for
+/// formatting inside [`pr_status_glyph`].
+pub fn pr_status_label(state: PrState) -> String {
+    match pr_approval_count(state) {
+        Some(n) => format!("✓{n}"),
+        None => pr_status_glyph(state).to_string(),
+    }
+}
+
+/// Serde helper: an explicit JSON `null` decodes as the type default.
+/// Plain `#[serde(default)]` only covers *missing* fields, so a `null`
+/// from `gh` would fail the whole document to [`PrState::Unknown`].
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Subset of `gh pr view --json` this module reads. Field names verified
+/// against the installed gh 2.92.0 (`gh pr view --help` JSON FIELDS plus
+/// live `gh pr view`/`gh pr list` probes): `state` is OPEN/CLOSED/MERGED,
+/// `reviewDecision` is `""` (none), REVIEW_REQUIRED, APPROVED, or
+/// CHANGES_REQUESTED, `reviews[].state` carries per-review verdicts with
+/// `author.login`. Unknown extra fields (e.g. `mergeStateStatus`,
+/// `number`) are ignored by construction. Every read field is
+/// null-tolerant via [`null_to_default`]: explicit JSON `null`s decode
+/// as defaults instead of failing the document.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GhPrView {
+    #[serde(default, deserialize_with = "null_to_default")]
+    state: String,
+    #[serde(rename = "isDraft", default, deserialize_with = "null_to_default")]
+    is_draft: bool,
+    #[serde(
+        rename = "reviewDecision",
+        default,
+        deserialize_with = "null_to_default"
+    )]
+    review_decision: String,
+    #[serde(default, deserialize_with = "null_to_default")]
+    reviews: Vec<GhReview>,
+}
+
+/// One entry of the `reviews` array in `gh pr view --json reviews`.
+/// `author` is already `Option` (explicit `null` → `None`); `state`
+/// needs [`null_to_default`] like the other read strings.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GhReview {
+    #[serde(default, deserialize_with = "null_to_default")]
+    state: String,
+    #[serde(default)]
+    author: Option<GhAuthor>,
+}
+
+/// Review author identity; only the login feeds the approval count.
+/// `login` is null-tolerant via [`null_to_default`]: a null login
+/// simply doesn't count toward approvals.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GhAuthor {
+    #[serde(default, deserialize_with = "null_to_default")]
+    login: String,
+}
+
+/// Map a decoded `gh pr view` document to a [`PrState`].
+fn pr_state_from_view(view: &GhPrView) -> PrState {
+    match view.state.to_ascii_uppercase().as_str() {
+        "MERGED" => return PrState::Merged,
+        "CLOSED" => return PrState::Closed,
+        "OPEN" => {}
+        _ => return PrState::Unknown,
+    }
+    if view.is_draft {
+        return PrState::Draft;
+    }
+    match view.review_decision.to_ascii_uppercase().as_str() {
+        "APPROVED" => PrState::OpenApproved(distinct_approvers(view).max(1)),
+        "CHANGES_REQUESTED" => PrState::OpenChangesRequested,
+        _ => PrState::OpenUnreviewed,
+    }
+}
+
+/// Distinct reviewer logins whose review state is APPROVED.
+fn distinct_approvers(view: &GhPrView) -> u32 {
+    let mut logins = HashSet::new();
+    for review in &view.reviews {
+        if !review.state.eq_ignore_ascii_case("APPROVED") {
+            continue;
+        }
+        if let Some(author) = review.author.as_ref() {
+            if !author.login.is_empty() {
+                logins.insert(author.login.as_str());
             }
         }
-        PrState::OpenChangesRequested => "⚠", // warning sign
-        PrState::Closed => "✕", // X mark
-        PrState::Merged => "✔", // heavy checkmark (→ also acceptable)
-        PrState::Draft => "⋯", // vertical ellipsis
-        PrState::Unknown => "–", // minus sign (fallback when gh unavailable)
     }
+    logins.len() as u32
+}
+
+/// Parse raw `gh pr view --json ...` bytes into a [`PrState`]. Pure:
+/// fixture bytes in, state out — the injected seam tests use instead of
+/// spawning `gh`. Any failure (bad JSON, missing shape) is
+/// [`PrState::Unknown`], never an error.
+pub fn pr_state_from_json_bytes(bytes: &[u8]) -> PrState {
+    serde_json::from_slice::<GhPrView>(bytes)
+        .map(|view| pr_state_from_view(&view))
+        .unwrap_or(PrState::Unknown)
+}
+
+/// One cached resolve: the state plus when `gh` produced it.
+struct PrCacheEntry {
+    state: PrState,
+    at: Instant,
+}
+
+/// In-memory PR state cache keyed by full PR URL (5-min TTL, bounded).
+static PR_CACHE: LazyLock<Mutex<HashMap<String, PrCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cache_lookup(url: &str, now: Instant) -> Option<PrState> {
+    let cache = PR_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.get(url).and_then(|entry| {
+        if now.saturating_duration_since(entry.at) < PR_CACHE_TTL {
+            Some(entry.state)
+        } else {
+            None
+        }
+    })
+}
+
+fn cache_store(url: &str, state: PrState, now: Instant) {
+    let mut cache = PR_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= PR_CACHE_MAX_URLS {
+        cache.retain(|_, entry| now.saturating_duration_since(entry.at) < PR_CACHE_TTL);
+        if cache.len() >= PR_CACHE_MAX_URLS {
+            if let Some(key) = cache.keys().next().cloned() {
+                cache.remove(&key);
+            }
+        }
+    }
+    cache.insert(url.to_string(), PrCacheEntry { state, at: now });
+}
+
+/// True when `url` holds an unexpired entry in the PR state cache at
+/// `now` (issue #115 driver seam): the budgeted refresh probes this
+/// so its spawn budget covers stale URLs only. Read-only — TTL, cap,
+/// and eviction behavior are untouched.
+pub(crate) fn pr_cache_fresh(url: &str, now: Instant) -> bool {
+    cache_lookup(url, now).is_some()
+}
+
+/// Bound on one `gh` spawn: a hung `gh` must never stall the
+/// background pump longer than this. The wait loop polls
+/// [`GH_SPAWN_POLL`] and kills on expiry, so the worst case is a bounded
+/// stall, never the full hang. No new dependencies: spawn + `try_wait`
+/// + sleep from std only.
+const GH_SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Poll quantum for the [`GH_SPAWN_TIMEOUT`] wait below.
+const GH_SPAWN_POLL: Duration = Duration::from_millis(50);
+
+/// Run `cmd` with piped stdout, bounded by `timeout`: a process still
+/// alive on expiry is killed, reaped, and reported as `None` (the same
+/// Unknown-path as any other spawn failure). Non-zero exit is also
+/// `None` (rate limits, auth errors). Only the success path returns
+/// stdout.
+fn run_bounded(mut cmd: std::process::Command, timeout: Duration) -> Option<Vec<u8>> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut waited = Duration::ZERO;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                // Exited: reap the piped stdout without blocking.
+                return child.wait_with_output().ok().map(|out| out.stdout);
+            }
+            Ok(None) => {
+                if waited >= timeout {
+                    // Hung: kill, reap (no zombie), report as failure.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(GH_SPAWN_POLL);
+                waited += GH_SPAWN_POLL;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Spawn boundary for `gh`: run
+/// `gh pr view <n> --repo <owner/repo> --json
+/// number,state,isDraft,reviewDecision,mergeStateStatus,reviews` and
+/// return stdout on success, `None` on missing binary, non-zero exit,
+/// spawn failure, or a hang past [`GH_SPAWN_TIMEOUT`] (killed — one hung
+/// `gh` never stalls the background pump for the full hang).
+/// Production only — tests inject this boundary. `pub(crate)` so the
+/// core refresh driver (`app`) can build its real spawn closure; the
+/// injected seam stays the tested path.
+pub(crate) fn fetch_pr_json(repo: &str, pr_number: u64) -> Option<Vec<u8>> {
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args([
+        "pr",
+        "view",
+        &pr_number.to_string(),
+        "--repo",
+        repo,
+        "--json",
+        "number,state,isDraft,reviewDecision,mergeStateStatus,reviews",
+    ]);
+    run_bounded(cmd, GH_SPAWN_TIMEOUT)
+}
+
+/// Resolve a PR URL to its state with injected seams: `gh_available`
+/// stands in for [`gh_cli_available`] and `fetch` for [`fetch_pr_json`],
+/// so tests cover the TTL and the `gh`-absent path without spawning.
+/// Failures at every layer (absent binary, unparsable URL, spawn
+/// failure, bad JSON, rate-limit non-zero exit) yield
+/// [`PrState::Unknown`], never an error.
+pub(crate) fn resolve_pr_state_with(
+    url: &str,
+    now: Instant,
+    gh_available: bool,
+    fetch: &mut dyn FnMut(&str, u64) -> Option<Vec<u8>>,
+) -> PrState {
+    if !gh_available {
+        return PrState::Unknown;
+    }
+    let Some((repo, number)) = parse_pr_url(url) else {
+        return PrState::Unknown;
+    };
+    if let Some(cached) = cache_lookup(url, now) {
+        return cached;
+    }
+    let state = fetch(repo, number)
+        .map(|body| pr_state_from_json_bytes(&body))
+        .unwrap_or(PrState::Unknown);
+    cache_store(url, state, now);
+    state
 }
 
 /// Parse repository owner/repo and PR number from URL.
@@ -79,68 +353,51 @@ pub fn parse_pr_url(url: &str) -> Option<(&str, u64)> {
     const HTTP_PREFIX: &str = "http://github.com/";
     const PULL_PREFIX: &str = "/pull/";
 
-    let rest = if url.starts_with(HTTPS_PREFIX) {
-        &url[HTTPS_PREFIX.len()..]
-    } else if url.starts_with(HTTP_PREFIX) {
-        &url[HTTP_PREFIX.len()..]
+    let rest = if let Some(rest) = url.strip_prefix(HTTPS_PREFIX) {
+        rest
+    } else if let Some(rest) = url.strip_prefix(HTTP_PREFIX) {
+        rest
     } else {
         return None;
     };
 
     // Extract owner/repo (up to /pull/) and get position after it
     let (repo_part, _after_repo) = rest.split_once(PULL_PREFIX)?;
+    // An empty owner/repo segment (e.g. `github.com//pull/1`) is not a PR.
+    if repo_part.is_empty() {
+        return None;
+    }
 
     // Parse PR number from rest after /pull/
     let pr_start = repo_part.len() + PULL_PREFIX.len();
     let pr_str = &rest[pr_start..];
 
     // Extract just the numeric part (URLs might have trailing query params)
-    let pr_num: u64 = String::from_utf8(pr_str.bytes()
-        .take_while(|b| b.is_ascii_digit())
-        .collect::<Vec<_>>())
-        .ok()?
-        .parse()
-        .ok()?;
+    let pr_num: u64 = String::from_utf8(
+        pr_str
+            .bytes()
+            .take_while(|b| b.is_ascii_digit())
+            .collect::<Vec<_>>(),
+    )
+    .ok()?
+    .parse()
+    .ok()?;
 
     Some((repo_part, pr_num))
 }
 
-/// Query PR state via `gh pr view` and convert to icon.
-/// Caches results with 5-minute TTL to avoid excessive API calls.
-pub fn query_pr_state(_repo: &str, _pr_number: u64) -> PrState {
-    // TODO: Implement gh CLI query with JSON parsing
-    // This is a placeholder for the full implementation
-    // Expected `gh pr view <number> --repo <owner/repo> --json state,number,isDraft,status`
-
-    // For now, return Unknown - will implement in follow-up
-    PrState::Unknown
-}
-
-/// Resolve status icon for a PR URL with caching.
-pub fn resolve_pr_icon(url: &str) -> PrStatusIcon {
-    if !gh_cli_available() {
-        return PrStatusIcon {
-            glyph: pr_status_glyph(PrState::Unknown, None),
-            approval_count: None,
-        };
-    }
-
-    match parse_pr_url(url) {
-        Some((repo, number)) => {
-            let state = query_pr_state(repo, number);
-            PrStatusIcon {
-                glyph: pr_status_glyph(state, None),
-                approval_count: match state {
-                    PrState::OpenApproved(count) => Some(count),
-                    _ => None,
-                },
-            }
-        }
-        None => PrStatusIcon {
-            glyph: pr_status_glyph(PrState::Unknown, None),
-            approval_count: None,
-        },
-    }
+/// Resolve the stored state for a PR URL (issue #115). Served from
+/// the 5-minute TTL cache when fresh; one `gh` spawn per URL per 5
+/// minutes at most; [`PrState::Unknown`] when `gh` is absent or fails.
+///
+/// Note: the sync spawn helpers `query_pr_state` + `resolve_pr_icon`
+/// that used to sit here are gone (fix-loop 2: verified zero callers —
+/// render paths use the stored-state [`crate::app::ChatSession::pr_label_for`]
+/// / `staap_pr_glyph` instead). [`resolve_pr_state`] stays as the single
+/// sync entry; tests use the injected seam, never a spawn.
+pub fn resolve_pr_state(url: &str) -> PrState {
+    let mut fetch = |r: &str, n: u64| fetch_pr_json(r, n);
+    resolve_pr_state_with(url, Instant::now(), gh_cli_available(), &mut fetch)
 }
 
 /// Compiled once: per-run-per-tick compilation was the hottest alloc in
@@ -316,8 +573,8 @@ mod tests {
     #[test]
     fn parse_pr_url_invalid_prefix() {
         let invalid_urls = [
-            "github.com/acme/app/pull/42", // missing https://
-            "https://gitlab.com/acme/app/pull/42", // wrong domain
+            "github.com/acme/app/pull/42",           // missing https://
+            "https://gitlab.com/acme/app/pull/42",   // wrong domain
             "https://github.com/acme/app/issues/42", // issues not pull
             "",
         ];
@@ -333,26 +590,187 @@ mod tests {
         assert_eq!(parse_pr_url(url), None);
     }
 
+    // Issue #115 fix-loop 2: an empty owner/repo segment is not a PR.
+    #[test]
+    fn parse_pr_url_rejects_empty_repo() {
+        assert_eq!(parse_pr_url("https://github.com//pull/1"), None);
+    }
+
     #[test]
     fn status_glyph_for_open_unreviewed() {
-        assert_eq!(pr_status_glyph(PrState::OpenUnreviewed, None), "◴");
+        assert_eq!(pr_status_glyph(PrState::OpenUnreviewed), "◴");
     }
 
     #[test]
     fn status_glyph_for_approved_with_count() {
-        assert_eq!(pr_status_glyph(PrState::OpenApproved(3), Some(3)), "✓3");
-        assert_eq!(pr_status_glyph(PrState::OpenApproved(1), Some(1)), "✓1");
+        // The glyph itself is always the static checkmark; the count
+        // rides in the label (leak-free split of the old 2-arg form).
+        assert_eq!(pr_status_glyph(PrState::OpenApproved(3)), "✓");
+        assert_eq!(pr_status_label(PrState::OpenApproved(3)), "✓3");
+        assert_eq!(pr_status_label(PrState::OpenApproved(1)), "✓1");
+        assert_eq!(pr_approval_count(PrState::OpenApproved(3)), Some(3));
+        assert_eq!(pr_approval_count(PrState::OpenUnreviewed), None);
     }
 
     #[test]
     fn status_glyph_for_closed_merged_draft() {
-        assert_eq!(pr_status_glyph(PrState::Closed, None), "✕");
-        assert_eq!(pr_status_glyph(PrState::Merged, None), "✔");
-        assert_eq!(pr_status_glyph(PrState::Draft, None), "⋯");
+        assert_eq!(pr_status_glyph(PrState::Closed), "✕");
+        assert_eq!(pr_status_glyph(PrState::Merged), "✔");
+        assert_eq!(pr_status_glyph(PrState::Draft), "⋯");
     }
 
     #[test]
     fn status_glyph_for_unknown_fallback() {
-        assert_eq!(pr_status_glyph(PrState::Unknown, None), "–");
+        assert_eq!(pr_status_glyph(PrState::Unknown), "–");
+    }
+
+    // Issue #115: `gh pr view --json` fixtures map to PrState + glyph.
+    // Shapes verified against gh 2.92.0 (`gh pr view --help` JSON FIELDS
+    // + live `gh pr view`/`gh pr list` probes on staap + cli/cli):
+    // state is OPEN/CLOSED/MERGED, reviewDecision is "" (none),
+    // REVIEW_REQUIRED, APPROVED, or CHANGES_REQUESTED.
+    #[test]
+    fn gh_json_maps_to_pr_states() {
+        let open = br#"{"number":1,"state":"OPEN","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"BLOCKED"}"#;
+        assert_eq!(pr_state_from_json_bytes(open), PrState::OpenUnreviewed);
+        assert_eq!(pr_status_glyph(PrState::OpenUnreviewed), "◴");
+
+        let approved = br#"{"number":2,"state":"OPEN","isDraft":false,"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","reviews":[{"state":"APPROVED","author":{"login":"a"}},{"state":"APPROVED","author":{"login":"b"}},{"state":"COMMENTED","author":{"login":"c"}}]}"#;
+        assert_eq!(pr_state_from_json_bytes(approved), PrState::OpenApproved(2));
+        assert_eq!(pr_status_label(PrState::OpenApproved(2)), "✓2");
+
+        // APPROVED with no reviews array still counts the decision itself.
+        let approved_bare = br#"{"number":3,"state":"OPEN","isDraft":false,"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN"}"#;
+        assert_eq!(
+            pr_state_from_json_bytes(approved_bare),
+            PrState::OpenApproved(1)
+        );
+        assert_eq!(pr_status_label(PrState::OpenApproved(1)), "✓1");
+
+        let changes = br#"{"number":4,"state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","mergeStateStatus":"DIRTY"}"#;
+        assert_eq!(
+            pr_state_from_json_bytes(changes),
+            PrState::OpenChangesRequested
+        );
+        assert_eq!(pr_status_glyph(PrState::OpenChangesRequested), "⚠");
+
+        let closed = br#"{"number":5,"state":"CLOSED","isDraft":false,"reviewDecision":"","mergeStateStatus":"UNKNOWN"}"#;
+        assert_eq!(pr_state_from_json_bytes(closed), PrState::Closed);
+        assert_eq!(pr_status_glyph(PrState::Closed), "✕");
+
+        let merged = br#"{"number":110,"state":"MERGED","isDraft":false,"reviewDecision":"","mergeStateStatus":"UNKNOWN"}"#;
+        assert_eq!(pr_state_from_json_bytes(merged), PrState::Merged);
+        assert_eq!(pr_status_glyph(PrState::Merged), "✔");
+
+        let draft = br#"{"number":6,"state":"OPEN","isDraft":true,"reviewDecision":"REVIEW_REQUIRED","mergeStateStatus":"BLOCKED"}"#;
+        assert_eq!(pr_state_from_json_bytes(draft), PrState::Draft);
+        assert_eq!(pr_status_glyph(PrState::Draft), "⋯");
+
+        // Bad JSON never becomes a state: Unknown, never an error row.
+        assert_eq!(pr_state_from_json_bytes(b"not json"), PrState::Unknown);
+        assert_eq!(pr_state_from_json_bytes(b"{}"), PrState::Unknown);
+        assert_eq!(pr_status_glyph(PrState::Unknown), "–");
+        assert_eq!(pr_status_label(PrState::Unknown), "–");
+    }
+
+    // Issue #115: refresh at most every 5 min per URL — two resolves
+    // inside the TTL cost one spawn-boundary invocation. The spawn
+    // boundary is injected (fixture bytes, never a real subprocess).
+    #[test]
+    fn pr_state_caches_five_minutes() {
+        use std::time::{Duration, Instant};
+
+        let url = "https://github.com/acme/cachetest/pull/7";
+        let body = br#"{"number":7,"state":"OPEN","isDraft":false,"reviewDecision":"","mergeStateStatus":"UNKNOWN"}"#.to_vec();
+        let calls = std::cell::Cell::new(0u32);
+        let fetch = |_repo: &str, _n: u64| {
+            calls.set(calls.get() + 1);
+            Some(body.clone())
+        };
+        let mut fetch = fetch;
+        let t0 = Instant::now();
+        assert_eq!(
+            resolve_pr_state_with(url, t0, true, &mut fetch),
+            PrState::OpenUnreviewed
+        );
+        assert_eq!(
+            resolve_pr_state_with(url, t0 + Duration::from_secs(299), true, &mut fetch),
+            PrState::OpenUnreviewed
+        );
+        assert_eq!(calls.get(), 1, "second resolve inside TTL must not spawn");
+        assert_eq!(
+            resolve_pr_state_with(url, t0 + Duration::from_secs(301), true, &mut fetch),
+            PrState::OpenUnreviewed
+        );
+        assert_eq!(calls.get(), 2, "resolve past the TTL must spawn again");
+    }
+
+    // Issue #115 fix-loop 2: `gh` may emit explicit JSON nulls where
+    // the fixtures above omit fields. Plain `#[serde(default)]` only
+    // covers *missing* fields, so nulls must default too — the document
+    // still maps to the right state instead of failing to Unknown.
+    #[test]
+    fn gh_json_tolerates_explicit_nulls() {
+        let body = br#"{"number":8,"state":"OPEN","isDraft":null,"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","reviews":[{"state":"APPROVED","author":{"login":null}},{"state":null,"author":null}]}"#;
+        assert_eq!(pr_state_from_json_bytes(body), PrState::OpenApproved(1));
+        let bare = br#"{"number":9,"state":"OPEN","isDraft":null,"reviewDecision":null,"mergeStateStatus":null,"reviews":null}"#;
+        assert_eq!(pr_state_from_json_bytes(bare), PrState::OpenUnreviewed);
+    }
+
+    // Issue #115: no `gh` on PATH (or a non-PR URL) → Unknown glyph,
+    // and the spawn boundary is never attempted.
+    #[test]
+    fn unknown_when_gh_missing() {
+        use std::time::Instant;
+
+        use crate::app::{ChatSession, Status, HARNESS_MUSE};
+
+        // Blank stored-state session: nothing refreshed yet, so every
+        // PR URL reads Unknown until a refresh stores otherwise.
+        fn blank_session() -> ChatSession {
+            ChatSession {
+                id: "blank".into(),
+                title: "blank".into(),
+                project: "proj".into(),
+                status: Status::Working,
+                harness: HARNESS_MUSE.into(),
+                last_active: 0,
+                pr_links: vec![],
+                pr_states: Default::default(),
+                related_links: vec![],
+                links_truncated: false,
+                transcript: vec![],
+                transcript_truncated: false,
+                title_locked: true,
+                pending_input: String::new(),
+                provider_session_id: None,
+                cwd: None,
+                remote: None,
+            }
+        }
+
+        let mut must_not_spawn = |_repo: &str, _n: u64| -> Option<Vec<u8>> {
+            panic!("must not attempt a spawn when gh is absent")
+        };
+        let url = "https://github.com/acme/ghmissing/pull/9";
+        assert_eq!(
+            resolve_pr_state_with(url, Instant::now(), false, &mut must_not_spawn),
+            PrState::Unknown
+        );
+        // The stored-state path serves the same Unknown fallback glyph:
+        // an unrefreshed session labels the URL `–` with no spawn.
+        let session = blank_session();
+        assert_eq!(session.pr_state_for(url), PrState::Unknown);
+        assert_eq!(session.pr_label_for(url), Some("–".to_string()));
+        // Non-PR URLs never spawn either, even with gh present.
+        assert_eq!(
+            resolve_pr_state_with(
+                "https://github.com/acme/app/issues/5",
+                Instant::now(),
+                true,
+                &mut must_not_spawn
+            ),
+            PrState::Unknown
+        );
     }
 }

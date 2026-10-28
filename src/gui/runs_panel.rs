@@ -293,7 +293,12 @@ impl ShellView {
         let mut links: Vec<SidebarMenuItem> = Vec::new();
         let (shown_prs, hidden_prs) = crate::app::visible_links(&s.pr_links);
         for (li, link) in shown_prs.iter().enumerate() {
-            let short = short_of(link);
+            // Issue #115: the stored PR state icon leads the row
+            // (render only — states refresh off the pump tick).
+            let short = match s.pr_label_for(link) {
+                Some(icon) => format!("{icon} {}", short_of(link)),
+                None => short_of(link),
+            };
             let url = link.clone();
             let focused = i == self.app.selected && self.link_cursor == Some(li);
             // Issue #49: plain click opens the exact URL in the default
@@ -543,6 +548,7 @@ mod tests {
             harness: crate::app::HARNESS_MUSE.into(),
             last_active,
             pr_links: vec![],
+            pr_states: Default::default(),
             related_links: vec![],
             links_truncated: false,
             transcript: vec![],
