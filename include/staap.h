@@ -774,14 +774,49 @@ int staap_link_count(const struct StaapCore *core, uintptr_t row);
 char *staap_pr_glyph(const struct StaapCore *core, uintptr_t row, const char *url);
 
 /**
- * Refresh stored PR states for roster row `row` (issue #115): re-query
- * `gh` for stale URLs (5-minute TTL cache) and persist the results.
- * Returns 1 when any state changed, 0 when unchanged, -1 on null
- * handle / out-of-bounds row. Absent binary, failures, and rate
- * limits resolve Unknown and prune — never an error row.
+ * Stable state code for one PR link URL on roster row `row` (issue
+ * #115b): [`crate::parsers::github::PrState::code`] from stored core
+ * state (Unknown = 0 when never refreshed or refresh failed). Lets
+ * native shells present PR state themselves instead of consuming
+ * pre-baked glyph strings; the in-process shell keeps reusing the
+ * core label. Returns -1 on null handle, out-of-bounds row, null
+ * URL, non-UTF-8 URL, or when `url` is not a PR link. Pure render
+ * input — never spawns.
  *
- * Blocking: spawns `gh` subprocesses for stale URLs. Call from a
- * background task only — never on the pump hot path.
+ * # Safety
+ * `core` must be null or a live pointer from [`staap_core_new`]; `url`
+ * must be null or a valid NUL-terminated C string.
+ */
+int staap_pr_state(const struct StaapCore *core, uintptr_t row, const char *url);
+
+/**
+ * Approval count for one PR link URL on roster row `row` (issue
+ * #115b): the stored approval count when approved, else 0. Companion
+ * to [`staap_pr_state`]; native shells present the pair while the
+ * in-process shell keeps reusing the core label. Returns 0 on null
+ * handle, out-of-bounds row, null URL, non-UTF-8 URL, or when `url`
+ * is not a PR link. Pure render input — never spawns.
+ *
+ * # Safety
+ * `core` must be null or a live pointer from [`staap_core_new`]; `url`
+ * must be null or a valid NUL-terminated C string.
+ */
+unsigned int staap_pr_approvals(const struct StaapCore *core, uintptr_t row, const char *url);
+
+/**
+ * Refresh stored PR states for roster row `row` (issue #115): re-query
+ * `gh` for stale URLs (5-minute TTL cache, each spawn bounded by the
+ * `fetch_pr_json` spawn timeout) and mutate in-memory stored state.
+ * Does NOT persist: persistence happens through the pump's throttled
+ * persist, same as other pump-observed changes. Returns 1 when any
+ * state changed, 0 when unchanged, -1 on null handle / out-of-bounds
+ * row. Absent binary, failures, and rate limits resolve Unknown and
+ * prune — never an error row.
+ *
+ * Blocking and unbudgeted: one bounded spawn per stale URL. Call from
+ * a background task only — never per-tick or per-row. (Superseded on
+ * the periodic path by the throttled budgeted core driver
+ * [`crate::app::App::refresh_stale_pr_states`], budget 1 per 60 s.)
  *
  * # Safety
  * `core` must be null or a live pointer from [`staap_core_new`].

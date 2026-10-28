@@ -265,6 +265,20 @@ pub fn pr_link_label(session: &ChatSession, url: &str) -> Option<String> {
     session.pr_label_for(url)
 }
 
+/// Structured PR state data for one PR link URL from stored session
+/// state (issue #115b): `(state code, approval count)` — the code is
+/// [`crate::parsers::github::PrState::code`], the count is the approval
+/// count when approved, else 0. `None` when the URL is not a PR link.
+/// Pure render input — never spawns. Native shells present from this
+/// data; the in-process shell reuses the core glyph label.
+pub fn pr_link_data(session: &ChatSession, url: &str) -> Option<(i32, u32)> {
+    // PR/non-PR call first: only PR links carry state data.
+    crate::parsers::github::parse_pr_url(url)?;
+    let state = session.pr_state_for(url);
+    let approvals = crate::parsers::github::pr_approval_count(state).unwrap_or(0);
+    Some((state.code(), approvals))
+}
+
 /// Group row indices into urgency sections: idle, then working —
 /// (idle holds needs-input rows first — issue #105), then history (rows
 /// with no live PTY) last. Returns `(header, indices)` pairs, skipping
@@ -877,6 +891,47 @@ mod tests {
         assert!(row_matches_filter(&s, "PROJ"));
         assert!(row_matches_filter(&s, "abc-"));
         assert!(!row_matches_filter(&s, "zzz"));
+    }
+
+    #[test]
+    fn pr_link_data_serves_codes_without_spawn() {
+        // Issue #115b: structured data mirrors the glyph labels —
+        // stored Merged is (5, 0), OpenApproved(3) is (2, 3), fresh
+        // PR URLs read Unknown (0, 0), non-PR URLs read None.
+        use crate::parsers::github::PrState;
+        let mut s = sess("pr", Status::Idle, 1);
+        s.pr_links = vec![
+            "https://github.com/acme/app/pull/42".to_string(),
+            "https://github.com/acme/app/pull/43".to_string(),
+        ];
+        s.pr_states = [
+            (
+                "https://github.com/acme/app/pull/42".to_string(),
+                PrState::Merged,
+            ),
+            (
+                "https://github.com/acme/app/pull/43".to_string(),
+                PrState::OpenApproved(3),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            pr_link_data(&s, "https://github.com/acme/app/pull/42"),
+            Some((5, 0))
+        );
+        assert_eq!(
+            pr_link_data(&s, "https://github.com/acme/app/pull/43"),
+            Some((2, 3))
+        );
+        assert_eq!(
+            pr_link_data(&s, "https://github.com/acme/app/pull/44"),
+            Some((0, 0))
+        );
+        assert_eq!(
+            pr_link_data(&s, "https://github.com/acme/app/issues/5"),
+            None
+        );
     }
 
     #[test]

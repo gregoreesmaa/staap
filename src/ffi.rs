@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_uint};
 
 use crate::app::{ChatSession, Status};
 use crate::embedded::{EmbeddedPty, SpawnKind};
@@ -2061,6 +2061,98 @@ pub unsafe extern "C" fn staap_pr_glyph(
     }
 }
 
+/// Stable state code for one PR link URL on roster row `row` (issue
+/// #115b): [`crate::parsers::github::PrState::code`] from stored core
+/// state (Unknown = 0 when never refreshed or refresh failed). Lets
+/// native shells present PR state themselves instead of consuming
+/// pre-baked glyph strings; the in-process shell keeps reusing the
+/// core label. Returns -1 on null handle, out-of-bounds row, null
+/// URL, non-UTF-8 URL, or when `url` is not a PR link. Pure render
+/// input — never spawns.
+///
+/// # Safety
+/// `core` must be null or a live pointer from [`staap_core_new`]; `url`
+/// must be null or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn staap_pr_state(
+    core: *const StaapCore,
+    row: usize,
+    url: *const c_char,
+) -> c_int {
+    if core.is_null() {
+        set_error("staap_pr_state: null core".to_string());
+        return -1;
+    }
+    if url.is_null() {
+        set_error("staap_pr_state: null url".to_string());
+        return -1;
+    }
+    let url = match CStr::from_ptr(url).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_error("staap_pr_state: url is not valid UTF-8".to_string());
+            return -1;
+        }
+    };
+    let sessions: &[ChatSession] = &(*core).reg.app.sessions;
+    match sessions.get(row) {
+        Some(session) => match crate::shell_shared::pr_link_data(session, url) {
+            Some((code, _)) => code,
+            // Non-PR URLs carry no data.
+            None => -1,
+        },
+        None => {
+            set_error(format!("staap_pr_state: row {row} out of bounds"));
+            -1
+        }
+    }
+}
+
+/// Approval count for one PR link URL on roster row `row` (issue
+/// #115b): the stored approval count when approved, else 0. Companion
+/// to [`staap_pr_state`]; native shells present the pair while the
+/// in-process shell keeps reusing the core label. Returns 0 on null
+/// handle, out-of-bounds row, null URL, non-UTF-8 URL, or when `url`
+/// is not a PR link. Pure render input — never spawns.
+///
+/// # Safety
+/// `core` must be null or a live pointer from [`staap_core_new`]; `url`
+/// must be null or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn staap_pr_approvals(
+    core: *const StaapCore,
+    row: usize,
+    url: *const c_char,
+) -> c_uint {
+    if core.is_null() {
+        set_error("staap_pr_approvals: null core".to_string());
+        return 0;
+    }
+    if url.is_null() {
+        set_error("staap_pr_approvals: null url".to_string());
+        return 0;
+    }
+    let url = match CStr::from_ptr(url).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_error("staap_pr_approvals: url is not valid UTF-8".to_string());
+            return 0;
+        }
+    };
+    let sessions: &[ChatSession] = &(*core).reg.app.sessions;
+    match sessions.get(row) {
+        Some(session) => match crate::shell_shared::pr_link_data(session, url) {
+            Some((_, approvals)) => approvals,
+            // Non-PR URLs carry no data.
+            None => 0,
+        },
+        None => {
+            set_error(format!("staap_pr_approvals: row {row} out of bounds"));
+            0
+        }
+    }
+}
+
 /// Refresh stored PR states for roster row `row` (issue #115): re-query
 /// `gh` for stale URLs (5-minute TTL cache, each spawn bounded by the
 /// `fetch_pr_json` spawn timeout) and mutate in-memory stored state.
@@ -2913,6 +3005,84 @@ mod tests {
             assert!(
                 staap_pr_glyph(&core as *const StaapCore, 0, bad.as_ptr() as *const c_char)
                     .is_null()
+            );
+            // Issue #115b: structured state data for native shells —
+            // same stored state as above, as (state code, approvals).
+            // No glyphs, no spawn; guards mirror staap_pr_glyph.
+            let mut approved_core = StaapCore {
+                reg: crate::runs::RunRegistry::new(vec![row("b", Status::Idle)]),
+            };
+            approved_core.reg.app.sessions[0].pr_links =
+                vec!["https://github.com/acme/app/pull/43".to_string()];
+            approved_core.reg.app.sessions[0].pr_states = [(
+                "https://github.com/acme/app/pull/43".to_string(),
+                PrState::OpenApproved(3),
+            )]
+            .into_iter()
+            .collect();
+            let approved = CString::new("https://github.com/acme/app/pull/43").unwrap();
+            // Stored Merged serves (5, 0); stored OpenApproved(3) serves (2, 3).
+            assert_eq!(
+                staap_pr_state(&core as *const StaapCore, 0, url.as_ptr()),
+                5
+            );
+            assert_eq!(
+                staap_pr_approvals(&core as *const StaapCore, 0, url.as_ptr()),
+                0
+            );
+            assert_eq!(
+                staap_pr_state(&approved_core as *const StaapCore, 0, approved.as_ptr()),
+                2
+            );
+            assert_eq!(
+                staap_pr_approvals(&approved_core as *const StaapCore, 0, approved.as_ptr()),
+                3
+            );
+            // Fresh PR URL (never refreshed): Unknown data (0, 0), no spawn.
+            assert_eq!(
+                staap_pr_state(&core as *const StaapCore, 0, fresh.as_ptr()),
+                0
+            );
+            assert_eq!(
+                staap_pr_approvals(&core as *const StaapCore, 0, fresh.as_ptr()),
+                0
+            );
+            // Non-PR URLs carry no data: -1 state, 0 approvals.
+            assert_eq!(
+                staap_pr_state(&core as *const StaapCore, 0, issue.as_ptr()),
+                -1
+            );
+            assert_eq!(
+                staap_pr_approvals(&core as *const StaapCore, 0, issue.as_ptr()),
+                0
+            );
+            // Guards mirror staap_pr_glyph: null core/URL, OOB row,
+            // non-UTF-8 URL.
+            assert_eq!(staap_pr_state(std::ptr::null(), 0, url.as_ptr()), -1);
+            assert_eq!(
+                staap_pr_state(&core as *const StaapCore, 7, url.as_ptr()),
+                -1
+            );
+            assert_eq!(
+                staap_pr_state(&core as *const StaapCore, 0, std::ptr::null()),
+                -1
+            );
+            assert_eq!(
+                staap_pr_state(&core as *const StaapCore, 0, bad.as_ptr() as *const c_char),
+                -1
+            );
+            assert_eq!(staap_pr_approvals(std::ptr::null(), 0, url.as_ptr()), 0);
+            assert_eq!(
+                staap_pr_approvals(&core as *const StaapCore, 7, url.as_ptr()),
+                0
+            );
+            assert_eq!(
+                staap_pr_approvals(&core as *const StaapCore, 0, std::ptr::null()),
+                0
+            );
+            assert_eq!(
+                staap_pr_approvals(&core as *const StaapCore, 0, bad.as_ptr() as *const c_char),
+                0
             );
             // A row with no links refreshes to unchanged without spawning.
             let mut bare = StaapCore {

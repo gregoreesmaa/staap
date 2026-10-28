@@ -45,6 +45,27 @@ pub enum PrState {
     Unknown,
 }
 
+/// Stable integer codes for the C ABI (issue #115b): native shells
+/// present from `staap_pr_state` / `staap_pr_approvals` data while the
+/// in-process shell reuses the core glyph label. Values are pinned —
+/// never reorder or reuse a code.
+impl PrState {
+    /// Stable C ABI code: Unknown=0, OpenUnreviewed=1, OpenApproved=2,
+    /// OpenChangesRequested=3, Closed=4, Merged=5, Draft=6. The approval
+    /// count rides separately via [`pr_approval_count`].
+    pub fn code(self) -> i32 {
+        match self {
+            PrState::Unknown => 0,
+            PrState::OpenUnreviewed => 1,
+            PrState::OpenApproved(_) => 2,
+            PrState::OpenChangesRequested => 3,
+            PrState::Closed => 4,
+            PrState::Merged => 5,
+            PrState::Draft => 6,
+        }
+    }
+}
+
 /// Display icon for a PR status. Maps PrState → Unicode glyph + optional approval count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrStatusIcon {
@@ -772,5 +793,25 @@ mod tests {
             ),
             PrState::Unknown
         );
+    }
+
+    // Issue #115b: stable C ABI codes for PR states (owner direction:
+    // state flows to native shells as data, not pre-baked glyphs).
+    // Every variant maps to its pinned code; approvals ride separately.
+    #[test]
+    fn pr_state_code_round_trip() {
+        let cases = [
+            (PrState::Unknown, 0),
+            (PrState::OpenUnreviewed, 1),
+            (PrState::OpenApproved(1), 2),
+            (PrState::OpenApproved(3), 2),
+            (PrState::OpenChangesRequested, 3),
+            (PrState::Closed, 4),
+            (PrState::Merged, 5),
+            (PrState::Draft, 6),
+        ];
+        for (state, code) in cases {
+            assert_eq!(state.code(), code, "{state:?} must map to {code}");
+        }
     }
 }
