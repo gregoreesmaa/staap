@@ -6,8 +6,8 @@
 //! Unicode glyphs for display in sidebars.
 
 use std::collections::HashSet;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -65,10 +65,10 @@ pub fn pr_status_glyph(state: PrState, approval_count: Option<u32>) -> &'static 
             }
         }
         PrState::OpenChangesRequested => "⚠", // warning sign
-        PrState::Closed => "✕", // X mark
-        PrState::Merged => "✔", // heavy checkmark (→ also acceptable)
-        PrState::Draft => "⋯", // vertical ellipsis
-        PrState::Unknown => "–", // minus sign (fallback when gh unavailable)
+        PrState::Closed => "✕",               // X mark
+        PrState::Merged => "✔",               // heavy checkmark (→ also acceptable)
+        PrState::Draft => "⋯",                // vertical ellipsis
+        PrState::Unknown => "–",              // minus sign (fallback when gh unavailable)
     }
 }
 
@@ -79,10 +79,10 @@ pub fn parse_pr_url(url: &str) -> Option<(&str, u64)> {
     const HTTP_PREFIX: &str = "http://github.com/";
     const PULL_PREFIX: &str = "/pull/";
 
-    let rest = if url.starts_with(HTTPS_PREFIX) {
-        &url[HTTPS_PREFIX.len()..]
-    } else if url.starts_with(HTTP_PREFIX) {
-        &url[HTTP_PREFIX.len()..]
+    let rest = if let Some(rest) = url.strip_prefix(HTTPS_PREFIX) {
+        rest
+    } else if let Some(rest) = url.strip_prefix(HTTP_PREFIX) {
+        rest
     } else {
         return None;
     };
@@ -95,12 +95,15 @@ pub fn parse_pr_url(url: &str) -> Option<(&str, u64)> {
     let pr_str = &rest[pr_start..];
 
     // Extract just the numeric part (URLs might have trailing query params)
-    let pr_num: u64 = String::from_utf8(pr_str.bytes()
-        .take_while(|b| b.is_ascii_digit())
-        .collect::<Vec<_>>())
-        .ok()?
-        .parse()
-        .ok()?;
+    let pr_num: u64 = String::from_utf8(
+        pr_str
+            .bytes()
+            .take_while(|b| b.is_ascii_digit())
+            .collect::<Vec<_>>(),
+    )
+    .ok()?
+    .parse()
+    .ok()?;
 
     Some((repo_part, pr_num))
 }
@@ -316,8 +319,8 @@ mod tests {
     #[test]
     fn parse_pr_url_invalid_prefix() {
         let invalid_urls = [
-            "github.com/acme/app/pull/42", // missing https://
-            "https://gitlab.com/acme/app/pull/42", // wrong domain
+            "github.com/acme/app/pull/42",           // missing https://
+            "https://gitlab.com/acme/app/pull/42",   // wrong domain
             "https://github.com/acme/app/issues/42", // issues not pull
             "",
         ];
