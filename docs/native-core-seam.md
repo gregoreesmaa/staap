@@ -174,6 +174,12 @@ can link them.
   extract_issue_links, extract_commit_links, link_sort_key}`,
   `refs::extract_file_refs`, `Parsed { title, project, pr_links,
   related_links }`.
+- PR state as data for native shells (issue #115b): `shell_shared::pr_link_data`
+  serves `(PrState::code, approvals)` from stored state (pure, never spawns) over
+  `staap_pr_state` / `staap_pr_approvals`, so each shell presents state its own
+  way; the in-process shell reuses the core glyph label (`pr_status_label` /
+  `staap_pr_glyph`).
+
 
 ### Historic discovery (`providers` + `transcript`)
 
