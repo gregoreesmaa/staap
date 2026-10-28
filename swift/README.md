@@ -62,3 +62,9 @@ the Linux/Windows shells (native look, identical behavior).
   first autodetected, with the stored per-agent flags — the core loads
   the user config, so native spawns honor it); without any CLI on PATH
   the shell shows the core's error message.
+- Option+printable composes the layout symbol: the app-global key
+  monitor sends `event.characters` straight to the view
+  (`ShellSupport.OptionKeyScoping` decides; issue #116), so Estonian
+  Option+2 types `@`. Option+arrows stay Meta via SwiftTerm
+  `optionAsMetaKey` (ESC b / ESC f word jump, matching the core key
+  table); the unmodified backtick is intercepted the same way (0x60).
