@@ -172,6 +172,10 @@ pub struct ShellView {
     /// Throttles refresh-time saves so a streaming run doesn't rewrite
     /// the file every 50 ms tick; quitting and closing always save.
     pub(crate) last_persist: Option<std::time::Instant>,
+    /// Last PR-state icon refresh (issue #115); `None` until the first
+    /// run. Throttles the budgeted `gh` refresh so the 20 Hz pump
+    /// spends at most one stale-URL spawn per minute on icons.
+    pub(crate) last_pr_refresh: Option<std::time::Instant>,
 }
 
 impl ShellView {
@@ -193,6 +197,7 @@ impl ShellView {
             launch_picker: None,
             picker_remote: super::picker::PickerRemote::default(),
             last_persist: None,
+            last_pr_refresh: None,
             runs: HashMap::new(),
             quit_armed: false,
             link_cursor: None,

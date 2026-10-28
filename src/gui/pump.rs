@@ -116,6 +116,17 @@ impl ShellView {
                 }
             }
         }
+        // PR icon refresh (issue #115): budgeted `gh` refresh off the hot
+        // path — at most one stale URL per 60 s (the TTL cache serves
+        // fresh URLs free), skipped entirely while no run holds PR links;
+        // stored-state changes repaint via the normal gate below.
+        let pr_due = self
+            .last_pr_refresh
+            .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(60));
+        if pr_due && self.app.sessions.iter().any(|s| !s.pr_links.is_empty()) {
+            self.last_pr_refresh = Some(now);
+            changed |= self.app.refresh_stale_pr_states(1) > 0;
+        }
         if changed {
             // Row order derives from status alone (last_active never moves
             // here), so a changed pump is exactly when rows could have

@@ -216,12 +216,22 @@ fn cache_store(url: &str, state: PrState, now: Instant) {
     cache.insert(url.to_string(), PrCacheEntry { state, at: now });
 }
 
+/// True when `url` holds an unexpired entry in the PR state cache at
+/// `now` (issue #115 driver seam): the budgeted refresh probes this
+/// so its spawn budget covers stale URLs only. Read-only — TTL, cap,
+/// and eviction behavior are untouched.
+pub(crate) fn pr_cache_fresh(url: &str, now: Instant) -> bool {
+    cache_lookup(url, now).is_some()
+}
+
 /// Spawn boundary for `gh`: run
 /// `gh pr view <n> --repo <owner/repo> --json
 /// number,state,isDraft,reviewDecision,mergeStateStatus,reviews` and
 /// return stdout on success, `None` on missing binary, non-zero exit, or
 /// spawn failure. Production only — tests inject this boundary.
-fn fetch_pr_json(repo: &str, pr_number: u64) -> Option<Vec<u8>> {
+/// `pub(crate)` so the core refresh driver (`app`) can build its real
+/// spawn closure; the injected seam stays the tested path.
+pub(crate) fn fetch_pr_json(repo: &str, pr_number: u64) -> Option<Vec<u8>> {
     let output = std::process::Command::new("gh")
         .args([
             "pr",
