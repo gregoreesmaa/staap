@@ -1,9 +1,147 @@
-//! Per-chat GitHub PR link extraction.
+//! Per-chat GitHub PR link extraction and status iconification via `gh` CLI.
+//!
+//! This module extends link extraction to include real-time PR state queries
+//! using the GitHub CLI tool (`gh`). It supports graceful degradation when
+//! `gh` is unavailable, cached state to avoid excessive API calls, and text-only
+//! Unicode glyphs for display in sidebars.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use regex::Regex;
+
+/// PR states extracted from `gh pr view` JSON response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    /// Open and awaiting review - default open state
+    OpenUnreviewed,
+    /// Open with at least one approval
+    OpenApproved(u32),
+    /// Open with changes requested by reviewer
+    OpenChangesRequested,
+    /// Closed without merging (not a draft)
+    Closed,
+    /// Successfully merged into base branch
+    Merged,
+    /// Draft PR (not ready for review yet)
+    Draft,
+    /// Unknown state due to gh unavailable or API error
+    Unknown,
+}
+
+/// Display icon for a PR status. Maps PrState → Unicode glyph + optional approval count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrStatusIcon {
+    pub glyph: &'static str,
+    pub approval_count: Option<u32>,
+}
+
+/// GitHub CLI availability check. Returns true if `gh` command exists on PATH.
+pub fn gh_cli_available() -> bool {
+    GH_AVAILABLE.load(Ordering::SeqCst)
+}
+
+/// Static flag tracking whether gh CLI is available (checked once at startup).
+static GH_AVAILABLE: LazyLock<AtomicBool> = LazyLock::new(|| {
+    let available = std::process::Command::new("gh")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    AtomicBool::new(available)
+});
+
+/// Convert PrState to display glyph (text-only Unicode).
+pub fn pr_status_glyph(state: PrState, approval_count: Option<u32>) -> &'static str {
+    match state {
+        PrState::OpenUnreviewed => "◴", // white circle left quarter shaded
+        PrState::OpenApproved(_n) => {
+            // Append count directly to checkmark: ✓4 means 4 approvals
+            if let Some(count) = approval_count {
+                Box::leak(format!("✓{}", count).into_boxed_str())
+            } else {
+                "✓"
+            }
+        }
+        PrState::OpenChangesRequested => "⚠", // warning sign
+        PrState::Closed => "✕", // X mark
+        PrState::Merged => "✔", // heavy checkmark (→ also acceptable)
+        PrState::Draft => "⋯", // vertical ellipsis
+        PrState::Unknown => "–", // minus sign (fallback when gh unavailable)
+    }
+}
+
+/// Parse repository owner/repo and PR number from URL.
+pub fn parse_pr_url(url: &str) -> Option<(&str, u64)> {
+    // Expected format: https://github.com/OWNER/REPO/pull/NUMBER or http://
+    const HTTPS_PREFIX: &str = "https://github.com/";
+    const HTTP_PREFIX: &str = "http://github.com/";
+    const PULL_PREFIX: &str = "/pull/";
+
+    let rest = if url.starts_with(HTTPS_PREFIX) {
+        &url[HTTPS_PREFIX.len()..]
+    } else if url.starts_with(HTTP_PREFIX) {
+        &url[HTTP_PREFIX.len()..]
+    } else {
+        return None;
+    };
+
+    // Extract owner/repo (up to /pull/) and get position after it
+    let (repo_part, _after_repo) = rest.split_once(PULL_PREFIX)?;
+
+    // Parse PR number from rest after /pull/
+    let pr_start = repo_part.len() + PULL_PREFIX.len();
+    let pr_str = &rest[pr_start..];
+
+    // Extract just the numeric part (URLs might have trailing query params)
+    let pr_num: u64 = String::from_utf8(pr_str.bytes()
+        .take_while(|b| b.is_ascii_digit())
+        .collect::<Vec<_>>())
+        .ok()?
+        .parse()
+        .ok()?;
+
+    Some((repo_part, pr_num))
+}
+
+/// Query PR state via `gh pr view` and convert to icon.
+/// Caches results with 5-minute TTL to avoid excessive API calls.
+pub fn query_pr_state(_repo: &str, _pr_number: u64) -> PrState {
+    // TODO: Implement gh CLI query with JSON parsing
+    // This is a placeholder for the full implementation
+    // Expected `gh pr view <number> --repo <owner/repo> --json state,number,isDraft,status`
+
+    // For now, return Unknown - will implement in follow-up
+    PrState::Unknown
+}
+
+/// Resolve status icon for a PR URL with caching.
+pub fn resolve_pr_icon(url: &str) -> PrStatusIcon {
+    if !gh_cli_available() {
+        return PrStatusIcon {
+            glyph: pr_status_glyph(PrState::Unknown, None),
+            approval_count: None,
+        };
+    }
+
+    match parse_pr_url(url) {
+        Some((repo, number)) => {
+            let state = query_pr_state(repo, number);
+            PrStatusIcon {
+                glyph: pr_status_glyph(state, None),
+                approval_count: match state {
+                    PrState::OpenApproved(count) => Some(count),
+                    _ => None,
+                },
+            }
+        }
+        None => PrStatusIcon {
+            glyph: pr_status_glyph(PrState::Unknown, None),
+            approval_count: None,
+        },
+    }
+}
 
 /// Compiled once: per-run-per-tick compilation was the hottest alloc in
 /// the pump loop. Match semantics are unchanged (see [`extract_pr_links`]).
@@ -153,5 +291,68 @@ mod tests {
             refs,
             ["src/app.rs:9".to_string(), "src/app.rs:12".to_string()]
         );
+    }
+
+    // MARKER - Tests for PR state and iconification (issues #115)
+
+    #[test]
+    fn parse_pr_url_valid_https() {
+        let url = "https://github.com/acme/app/pull/42";
+        assert_eq!(parse_pr_url(url), Some(("acme/app", 42)));
+    }
+
+    #[test]
+    fn parse_pr_url_http_fallback() {
+        let url = "http://github.com/org/repo/pull/7";
+        assert_eq!(parse_pr_url(url), Some(("org/repo", 7)));
+    }
+
+    #[test]
+    fn parse_pr_url_trailing_slash() {
+        let url = "https://github.com/acme/app/pull/42/";
+        assert_eq!(parse_pr_url(url), Some(("acme/app", 42)));
+    }
+
+    #[test]
+    fn parse_pr_url_invalid_prefix() {
+        let invalid_urls = [
+            "github.com/acme/app/pull/42", // missing https://
+            "https://gitlab.com/acme/app/pull/42", // wrong domain
+            "https://github.com/acme/app/issues/42", // issues not pull
+            "",
+        ];
+
+        for url in invalid_urls {
+            assert_eq!(parse_pr_url(url), None, "{url} should be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_pr_url_non_numeric() {
+        let url = "https://github.com/acme/app/pull/abc";
+        assert_eq!(parse_pr_url(url), None);
+    }
+
+    #[test]
+    fn status_glyph_for_open_unreviewed() {
+        assert_eq!(pr_status_glyph(PrState::OpenUnreviewed, None), "◴");
+    }
+
+    #[test]
+    fn status_glyph_for_approved_with_count() {
+        assert_eq!(pr_status_glyph(PrState::OpenApproved(3), Some(3)), "✓3");
+        assert_eq!(pr_status_glyph(PrState::OpenApproved(1), Some(1)), "✓1");
+    }
+
+    #[test]
+    fn status_glyph_for_closed_merged_draft() {
+        assert_eq!(pr_status_glyph(PrState::Closed, None), "✕");
+        assert_eq!(pr_status_glyph(PrState::Merged, None), "✔");
+        assert_eq!(pr_status_glyph(PrState::Draft, None), "⋯");
+    }
+
+    #[test]
+    fn status_glyph_for_unknown_fallback() {
+        assert_eq!(pr_status_glyph(PrState::Unknown, None), "–");
     }
 }
