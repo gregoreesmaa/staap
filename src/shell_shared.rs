@@ -916,6 +916,31 @@ mod tests {
     }
 
     #[test]
+    fn alt_arrows_encode_word_jumps_regardless_of_layout() {
+        // Issue #113: encode_key mirrors keystroke_to_pty for shells
+        // (Estonian Option+Left types ~: the name + alt flag decide).
+        assert_eq!(
+            encode_key("left", Some("~"), false, true),
+            KeyDecision::Forward(vec![0x1b, b'b'])
+        );
+        assert_eq!(
+            encode_key("right", Some("~"), false, true),
+            KeyDecision::Forward(vec![0x1b, b'f'])
+        );
+        assert_eq!(
+            encode_key("right", None, false, true),
+            KeyDecision::Forward(vec![0x1b, b'f'])
+        );
+        // Plain arrows and Alt+Up/Down are unchanged (CSI / unbound).
+        assert_eq!(
+            encode_key("left", None, false, false),
+            KeyDecision::Forward(b"\x1b[D".to_vec())
+        );
+        assert_eq!(encode_key("up", Some("~"), false, true), KeyDecision::Keep);
+        assert_eq!(encode_key("down", None, false, true), KeyDecision::Keep);
+    }
+
+    #[test]
     fn ansi_render_matches_swift_contract() {
         let json = r#"[[{"text":"red","fg":[205,0,0],"bg":null,"bold":false,"italic":false,"underline":false}]]"#;
         assert_eq!(
