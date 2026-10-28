@@ -268,7 +268,7 @@ pub fn animal_name(n: usize) -> String {
 /// historic by construction, and no per-tick allocation happens here.
 static ATTENTION_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r#"(?i)approval|approve|permission|needs_input|needs input|\"error\"|\(y/n\)|allow once|allow always|would you like|press enter to confirm"#,
+        r#"(?i)approval|approve|permission|needs_input|needs input|\"error\"|\(y/n\)|allow once|allow always|would you like|press enter to confirm|do you want to proceed|yes, allow|always allow|don't ask again|ask once per session"#,
     )
     .expect("static attention regex")
 });
@@ -335,13 +335,13 @@ pub fn section_title(status: Status) -> &'static str {
     }
 }
 
-/// Group already-sorted sessions into status sections: working, then
-/// idle (issue #105 folds needs-input into Idle, attention first via the
-/// sort). Returns `(status, indices)` pairs, skipping empty buckets;
+/// Group already-sorted sessions into status sections: idle, then
+/// working (issue #114: Idle sorts above Working; issue #105 folds
+/// needs-input into Idle, attention first via the sort). Returns `(status, indices)` pairs, skipping empty buckets;
 /// within a bucket the slice order is preserved.
 pub fn status_sections(sessions: &[ChatSession]) -> Vec<(Status, Vec<usize>)> {
     let mut out: Vec<(Status, Vec<usize>)> = Vec::new();
-    for status in [Status::Working, Status::Idle] {
+    for status in [Status::Idle, Status::Working] {
         let ids: Vec<usize> = sessions
             .iter()
             .enumerate()
@@ -1774,6 +1774,87 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_permission_prompts_need_attention() {
+        use std::time::Duration;
+        // Real permission-dialog excerpts from the shipping Claude Code
+        // CLI: the select component asks `Do you want to proceed?` and
+        // offers `Yes, allow …` / `Always allow` / `Don't ask again` /
+        // `Ask once per session` rows. A run parked on one is waiting
+        // for the user, never Working, however fresh its output is.
+        let fresh = Some(Duration::from_secs(5));
+        let dialog = "Do you want to proceed?\n  1. Yes\n  2. Yes, allow reading from /tmp/foo from this project\n  3. No, ask me before each command";
+        assert!(needs_attention(dialog));
+        assert_eq!(classify(dialog, fresh, false), Status::Attention);
+        let always = "Yes, and always allow access to /tmp/foo";
+        assert!(needs_attention(always));
+        assert_eq!(classify(always, fresh, false), Status::Attention);
+        let no_repeat = "Yes, and don't ask again for /tmp/foo";
+        assert!(needs_attention(no_repeat));
+        assert_eq!(classify(no_repeat, fresh, false), Status::Attention);
+        let once = "Ask once per session";
+        assert!(needs_attention(once));
+        assert_eq!(classify(once, fresh, false), Status::Attention);
+        let imports = "Yes, allow external imports\nNo, disable external imports";
+        assert!(needs_attention(imports));
+        assert_eq!(classify(imports, fresh, false), Status::Attention);
+    }
+
+    #[test]
+    fn working_chrome_is_not_attention() {
+        use std::time::Duration;
+        // Footer/status chrome visible while a run is producing output
+        // must never flip it to Attention: `esc to interrupt` marks a
+        // running task, `? for shortcuts` co-renders with the running
+        // input row, and `ctrl+o` names the transcript viewer.
+        let fresh = Some(Duration::from_secs(5));
+        let working_footer = "Churning… (12s) · esc to interrupt";
+        assert!(!needs_attention(working_footer));
+        assert_eq!(classify(working_footer, fresh, false), Status::Working);
+        let idle_footer = "? for shortcuts";
+        assert!(!needs_attention(idle_footer));
+        assert_eq!(classify(idle_footer, fresh, false), Status::Working);
+        let queued = "enter to interrupt and send · ctrl+x then enter to queue";
+        assert!(!needs_attention(queued));
+        assert_eq!(classify(queued, fresh, false), Status::Working);
+        let viewer = "Exit code 0 - stdout shown in transcript mode (ctrl+o)";
+        assert!(!needs_attention(viewer));
+        // Near-misses for the new permission markers: same words in
+        // prose that is not a dialog must not match.
+        assert!(!needs_attention("Do you want to continue?"));
+        assert!(!needs_attention("Yes, all checks passed"));
+        assert!(!needs_attention("we always review allowed paths"));
+        assert!(!needs_attention("Please don't ask me again about this"));
+        assert!(!needs_attention("ask once, then continue silently"));
+        assert!(!needs_attention("allowed tools are listed below"));
+        // Pre-existing negatives keep holding.
+        assert!(!needs_attention("Muse Code 1.4.0"));
+        assert!(!needs_attention(""));
+    }
+
+    #[test]
+    fn idle_sections_sort_above_working() {
+        // Issue #114: the roster must read Idle above Working. Sorted
+        // input is Attention, Idle, Working; sections must keep that
+        // top-down order (needs-input stays folded at the top of Idle
+        // per issue #105).
+        let mut sorted = vec![
+            sess("w1", Status::Working, 9),
+            sess("i1", Status::Idle, 1),
+            sess("a1", Status::Attention, 1),
+            sess("w2", Status::Working, 2),
+        ];
+        sort_sessions(&mut sorted);
+        assert_eq!(sorted[0].id, "a1");
+        assert_eq!(sorted[1].id, "i1");
+        let sections = status_sections(&sorted);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].0, Status::Idle);
+        assert_eq!(sections[0].1, vec![0, 1]);
+        assert_eq!(sections[1].0, Status::Working);
+        assert_eq!(sections[1].1, vec![2, 3]);
+    }
+
+    #[test]
     fn resort_keeps_selection_on_the_same_run() {
         let mut app = App::new(vec![
             sess("a", Status::Working, 5),
@@ -1789,27 +1870,27 @@ mod tests {
     }
 
     #[test]
-    fn sections_group_needs_input_into_idle_working_first() {
+    fn sections_group_needs_input_into_idle_then_working() {
         let v = vec![
             sess("w1", Status::Working, 9),
             sess("i1", Status::Idle, 1),
             sess("a1", Status::Attention, 1),
             sess("w2", Status::Working, 2),
         ];
-        // NB: not sorted; sections still bucket Working, then Idle
+        // NB: not sorted; sections still bucket Idle, then Working
         // (needs-input folds into Idle — issue #105), preserving slice
         // order within a bucket.
         let sections = status_sections(&v);
         assert_eq!(sections.len(), 2);
-        assert_eq!(sections[0].0, Status::Working);
-        assert_eq!(sections[0].1, vec![0, 3]);
-        assert_eq!(sections[1].0, Status::Idle);
-        assert_eq!(sections[1].1, vec![1, 2]);
+        assert_eq!(sections[0].0, Status::Idle);
+        assert_eq!(sections[0].1, vec![1, 2]);
+        assert_eq!(sections[1].0, Status::Working);
+        assert_eq!(sections[1].1, vec![0, 3]);
         // No standalone Needs-input section remains (glyphs + badge persist).
         assert_eq!(section_title(Status::Attention), "Needs input");
         assert_eq!(section_title(Status::Idle), "Idle");
         assert_eq!(section_title(Status::Working), "Working");
-        // Sorted input lists attention first inside the merged Idle bucket.
+        // Sorted input lists attention first inside the merged Idle bucket, Idle above Working.
         let mut sorted = vec![
             sess("w1", Status::Working, 9),
             sess("i1", Status::Idle, 1),
@@ -1818,8 +1899,10 @@ mod tests {
         ];
         sort_sessions(&mut sorted);
         let sections = status_sections(&sorted);
-        assert_eq!(sections[1].0, Status::Idle);
-        assert_eq!(sections[1].1, vec![0, 1]);
+        assert_eq!(sections[0].0, Status::Idle);
+        assert_eq!(sections[0].1, vec![0, 1]);
+        assert_eq!(sections[1].0, Status::Working);
+        assert_eq!(sections[1].1, vec![2, 3]);
         // Empty buckets are skipped.
         let only_idle = vec![sess("i", Status::Idle, 1)];
         let sections = status_sections(&only_idle);
