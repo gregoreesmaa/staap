@@ -85,10 +85,22 @@ impl ScrollbackLog {
     }
 
     /// Retained line count including the in-progress line when non-empty.
-    /// Bounds the pager window: the offset clamps to `line_count`
-    /// minus the visible rows.
+    /// Legacy total: also counts a pending lone-CR line (empty `cur`
+    /// with `cr_pending`) that contributes no sliceable row. The pager
+    /// no longer clamps against this (issue #111); see `retained_len`.
     pub fn line_count(&self) -> usize {
         self.lines.len() + usize::from(!self.cur.is_empty() || self.cr_pending)
+    }
+
+    /// Sliceable pager rows: complete lines plus the in-progress line
+    /// when non-empty. Single source of length truth for the pager: the
+    /// clamp (`scroll_by`), the position note (`pager_note`), the window
+    /// (`scroll_window`), and the slice (`pager_text_rows`) all derive
+    /// from this length, so no offset addresses a row the snapshot does
+    /// not contain (issue #111). Matches what `lines` + non-empty
+    /// `pending_line` snapshots can slice.
+    pub fn retained_len(&self) -> usize {
+        self.lines.len() + usize::from(!self.cur.is_empty())
     }
 
     /// A pending CR turned out to be lone (no LF followed): it meant
@@ -174,21 +186,35 @@ impl ScrollbackLog {
 /// Bytes to decode now: everything except a possibly incomplete UTF-8
 /// sequence at the tail, which stays in the carry for the next `feed`.
 fn strip_incomplete_tail(buf: &[u8]) -> usize {
-    let mut len = buf.len();
-    // Walk back over up to 3 continuation bytes to a lead byte.
-    let mut lead = len;
-    while lead > 0 && len - lead < 4 && is_continuation(buf[lead - 1]) {
-        lead -= 1;
+    let len = buf.len();
+    // Count trailing continuation bytes (a sequence carries at most 3).
+    let mut conts = 0;
+    while conts < 3 && conts < len && is_continuation(buf[len - 1 - conts]) {
+        conts += 1;
     }
-    if lead < len {
-        // `buf[lead]` starts a multibyte sequence: check whether it is
-        // complete within the buffer.
-        let width = utf8_width(buf[lead]);
-        if width == 0 || lead + width > len {
-            len = lead;
+    if conts == 0 {
+        // No trailing continuations: incomplete only when the last byte
+        // is a multibyte lead awaiting its continuation bytes (issue
+        // #111: a bare lead was decoded as U+FFFD instead of held back).
+        if len > 0 && utf8_width(buf[len - 1]) > 1 {
+            return len - 1;
         }
+        return len;
     }
-    len
+    if conts == len {
+        // Whole buffer is stray continuations: malformed, decode as-is.
+        return len;
+    }
+    let width = utf8_width(buf[len - conts - 1]);
+    if width > 1 && conts + 1 < width {
+        // Lead plus too few continuations: hold the partial sequence.
+        len - conts - 1
+    } else {
+        // Complete sequence, or stray continuations after a non-lead
+        // (issue #111: complete emoji/CJK tails were held back and split
+        // into U+FFFDs): decode as-is.
+        len
+    }
 }
 
 fn is_continuation(b: u8) -> bool {
@@ -289,6 +315,18 @@ mod tests {
     }
 
     #[test]
+    fn complete_multibyte_tail_decodes_cleanly() {
+        // Issue #111 review focus: a chunk ending in a complete 3- or
+        // 4-byte char must decode as-is, not held back as U+FFFD.
+        let mut log = ScrollbackLog::new();
+        log.feed("\u{2713}".as_bytes());
+        log.feed("\u{1f60a}".as_bytes());
+        log.feed(b"\n");
+        let lines: Vec<&str> = log.lines().iter().map(String::as_str).collect();
+        assert_eq!(lines, vec!["\u{2713}\u{1f60a}"]);
+    }
+
+    #[test]
     fn backspace_erases_one_char() {
         let mut log = ScrollbackLog::new();
         log.feed(b"abc\x08d\n");
@@ -316,5 +354,43 @@ mod tests {
         assert_eq!(log.pending_line(), "partial");
         log.feed(b"\n");
         assert_eq!(log.line_count(), 1);
+    }
+
+    #[test]
+    fn retained_len_counts_sliceable_rows() {
+        // Issue #111: the pager clamp, window, and slice share one
+        // length. `retained_len` counts exactly the rows a `lines` +
+        // non-empty `pending_line` snapshot can slice, including
+        // wide/multibyte rows and a multibyte pending line.
+        let mut log = ScrollbackLog::new();
+        assert_eq!(log.retained_len(), 0);
+        for n in 0..95 {
+            log.feed(format!("row {n}\n").as_bytes());
+        }
+        log.feed("h\u{e9}llo \u{2713} done\n".as_bytes());
+        assert_eq!(log.lines().len(), 96);
+        assert_eq!(log.retained_len(), 96);
+        log.feed("\u{65e5}\u{672c}\u{8a9e} pending \u{1f60a}".as_bytes());
+        assert_eq!(
+            log.pending_line(),
+            "\u{65e5}\u{672c}\u{8a9e} pending \u{1f60a}"
+        );
+        assert_eq!(log.retained_len(), 97);
+        log.feed(b"\n");
+        assert_eq!(log.retained_len(), 97);
+    }
+
+    #[test]
+    fn trailing_cr_without_content_adds_no_pager_row() {
+        // Issue #111 root cause: a trailing `\r` with an empty current
+        // line sets `cr_pending`, so `line_count` reported one row more
+        // than any snapshot could slice. Clamping against that phantom
+        // row mapped the top two offsets to the identical page.
+        let mut log = ScrollbackLog::new();
+        log.feed(b"a\nb\n\r");
+        assert_eq!(log.pending_line(), "");
+        assert_eq!(log.lines().len(), 2);
+        assert_eq!(log.line_count(), 3, "legacy total keeps the phantom row");
+        assert_eq!(log.retained_len(), 2, "pager truth has no phantom row");
     }
 }

@@ -96,6 +96,10 @@ impl ShellView {
         }
         let rows = self.retained_rows()?;
         let (start, end) = scroll_window(rows.len(), self.rows as usize, offset);
+        // Defense-in-depth (issue #111): the window already derives from
+        // this snapshot's length, so this clamp is a no-op. It stays so a
+        // future length-source split fails as a short page, never a panic.
+        let end = end.min(rows.len());
         Some(rows[start..end].to_vec())
     }
 
@@ -129,7 +133,7 @@ impl ShellView {
             .active_id()
             .as_ref()
             .and_then(|id| self.runs.get(id))
-            .map(|run| run.pty.scrollback_log().line_count())
+            .map(|run| run.pty.scrollback_log().retained_len())
             .unwrap_or(0);
         format!(" · scroll {offset}/{total}")
     }
@@ -157,7 +161,9 @@ impl ShellView {
         let Some(run) = self.runs.get_mut(&id) else {
             return;
         };
-        let total = run.pty.scrollback_log().line_count();
+        // Clamp against the sliceable length (issue #111): `line_count`
+        // can exceed it by one when a trailing CR pends with no content.
+        let total = run.pty.scrollback_log().retained_len();
         let max = max_scroll_offset(total, rows);
         let next = (run.scroll_offset as i32 + delta).clamp(0, max as i32);
         run.scroll_offset = next as usize;
@@ -259,5 +265,59 @@ mod tests {
         }
         assert_eq!(view.pager_offset(), 0);
         assert!(view.runs[&id].pty.scrollback_log().line_count() >= 120);
+    }
+
+    #[test]
+    fn pager_never_repeats_rows_with_pending_line() {
+        // Issue #111: every offset over a buffer holding numbered rows,
+        // multibyte rows, and a non-empty pending line yields a full page
+        // inside the snapshot, and consecutive offsets shift by exactly
+        // one row (no repeats, no gaps, no overruns).
+        let mut view = test_shell();
+        let id = insert_test_pty(
+            &mut view,
+            "sh",
+            &[
+                "-c",
+                "seq 1 90; printf 'h\\303\\251llo \\342\\234\\223\\n\\346\\227\\245\\346\\234\\254\\350\\252\\236\\350\\241\\214\\ntail-pending'",
+            ],
+        );
+        for _ in 0..200 {
+            view.refresh();
+            if view.runs[&id].pty.scrollback_log().retained_len() >= 93 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let total = view.runs[&id].pty.scrollback_log().retained_len();
+        assert!(total >= 93, "mirror kept rows plus pending, got {total}");
+        let visible = view.rows as usize;
+        let max = total.saturating_sub(visible.max(1));
+        assert!(max > 2, "buffer must exceed one page");
+        assert_eq!(view.pager_offset(), 0);
+        assert!(view.pager_text_rows().is_none(), "live at offset 0");
+        // The stored clamp shares the slice's length truth: pushing past
+        // the top lands on the top page, never past it.
+        view.scroll_by(100000);
+        assert_eq!(view.runs[&id].scroll_offset, max);
+        let mut prev: Option<Vec<String>> = None;
+        for offset in 1..=max {
+            view.runs.get_mut(&id).unwrap().scroll_offset = offset;
+            let page = view.pager_text_rows().expect("pager slice");
+            assert_eq!(page.len(), visible, "full page at offset {offset}");
+            if let Some(p) = prev {
+                assert_eq!(p[1..], page[..visible - 1], "offset {offset} repeats a row");
+            }
+            prev = Some(page);
+        }
+        // Bottom page ends at the last complete (multibyte) row; the top
+        // page starts at row 1. The pending line is counted in `total`.
+        view.runs.get_mut(&id).unwrap().scroll_offset = 1;
+        let bottom = view.pager_text_rows().expect("bottom page");
+        assert_eq!(bottom[visible - 1], "\u{65e5}\u{672c}\u{8a9e}\u{884c}");
+        assert!(bottom.contains(&"h\u{e9}llo \u{2713}".to_string()));
+        view.runs.get_mut(&id).unwrap().scroll_offset = max;
+        let top = view.pager_text_rows().expect("top page");
+        assert_eq!(top[0], "1");
     }
 }
