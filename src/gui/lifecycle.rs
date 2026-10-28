@@ -262,6 +262,7 @@ mod tests {
             harness: crate::app::HARNESS_MUSE.into(),
             last_active: 1,
             pr_links: vec!["https://github.com/acme/app/pull/9".into()],
+            pr_states: Default::default(),
             related_links: vec![],
             links_truncated: false,
             transcript: vec![],

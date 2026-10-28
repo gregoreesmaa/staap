@@ -25,8 +25,11 @@ struct CoreTerminalView: NSViewRepresentable {
     func makeNSView(context: Context) -> TerminalView {
         let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         let view = TerminalView(frame: .zero, font: font)
-        // Make Option act as Meta (produce ESC prefix), enabling word navigation
-        // with Option+arrow keys in terminal applications.
+        // Option acts as Meta for non-printable keys (word navigation
+        // with Option+arrows → ESC b / ESC f). Printable Option+keys
+        // never reach SwiftTerm's Meta branch: the app-global key
+        // monitor (StaapMacApp) sends the layout-composed symbol first
+        // (Estonian Option+2 → `@`, issue #116).
         view.optionAsMetaKey = true
         applyThemeColors(to: view, darkMode: darkMode)
         view.terminalDelegate = context.coordinator

@@ -72,8 +72,8 @@ struct StaapMacApp: App {
 /// activating on launch is what makes the window show.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var state: AppState?
-    /// Token for the app-global backtick monitor (see installBacktickMonitor).
-    private var backtickMonitor: Any?
+    /// Token for the app-global key monitor (see installKeyMonitor).
+    private var keyMonitor: Any?
 
     func applicationDidFinishLaunching(_: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -81,7 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The manual theme override is gone; drop the stale default.
         UserDefaults.standard.removeObject(forKey: "appearance")
         WindowPaint.sync()
-        installBacktickMonitor()
+        installKeyMonitor()
         // The WindowGroup window may not exist yet at launch, so paint
         // on every main-window change too.
         _ = NotificationCenter.default.addObserver(
@@ -95,51 +95,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated {
             self.state?.save()
         }
-        uninstallBacktickMonitor()
+        uninstallKeyMonitor()
     }
 
-    /// Backticks reach the PTY even though AppKit's `interpretKeyEvents`
-    /// path swallows a plain one (routing it to `cancelOperation` → ESC)
-    /// before SwiftTerm can insert it.
+    /// Option-composed symbols and the unmodified backtick reach the PTY
+    /// even though AppKit/SwiftTerm would otherwise eat them: a plain
+    /// backtick is swallowed by `interpretKeyEvents` (routed to
+    /// `cancelOperation` → ESC), and with `optionAsMetaKey` enabled
+    /// SwiftTerm ESC-prefixes every Option+non-arrow key (Estonian
+    /// Option+2 would emit ESC `2` instead of `@`).
     ///
     /// SwiftTerm's `keyDown` is `public`, not `open`, so it can't be
     /// overridden from this module — and the fix is the shell's byte
     /// transport to own, not the core's. An app-global local monitor
     /// therefore intercepts the key *before* it reaches any responder:
-    /// when the focused view is a terminal and the key is an *unmodified*
-    /// backtick, send byte 0x60 straight to that view and swallow the event.
-    /// With `optionAsMetaKey` disabled, Option-modified backticks
-    /// (e.g., Option+' on Estonian) and all other Option characters are
-    /// handled correctly by SwiftTerm via the normal insertText path, so
-    /// the monitor only patches the unmodified case and avoids double-send.
-    /// Command is excluded, and non-terminal first responders such as sheet
-    /// text fields pass through untouched. Sending to the focused view keeps
-    /// this a single monitor for every terminal, with no per-row state to leak.
-    private func installBacktickMonitor() {
-        guard backtickMonitor == nil else { return }
-        backtickMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            // Intercept only an unmodified backtick. The interpretKeyEvents path
-            // swallows a plain backtick (routing to cancelOperation → ESC) before
-            // SwiftTerm can insert it. With optionAsMetaKey disabled, Option-modified
-            // backticks (e.g., Option+' on Estonian) are handled correctly by SwiftTerm
-            // via insertText, so we only need to patch the unmodified case.
-            guard !event.modifierFlags.contains(.command),
-                  event.modifierFlags.intersection([.option, .control, .shift]) == [],
-                  let chars = event.characters,
-                  chars.unicodeScalars.contains(where: { $0.value == 0x60 }),
-                  let terminal = event.window?.firstResponder as? TerminalView
-            else {
+    /// when the focused view is a terminal, an *unmodified* backtick
+    /// sends byte 0x60 straight to that view, and an Option+printable
+    /// key sends its layout-composed symbol (`OptionKeyScoping`,
+    /// issue #116) instead of reaching SwiftTerm's Meta branch.
+    /// Non-printables (arrows, Escape, Tab, Backspace, Enter, function
+    /// keys) and dead-key presses pass through untouched, so Meta word
+    /// navigation (Option+arrows → ESC b / ESC f) keeps working.
+    /// Command and Control are excluded, and non-terminal first
+    /// responders such as sheet text fields pass through untouched.
+    /// Sending to the focused view keeps this a single monitor for
+    /// every terminal, with no per-row state to leak.
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard let terminal = event.window?.firstResponder as? TerminalView else {
                 return event
             }
-            terminal.send(data: [0x60][...])
-            return nil
+            let flags = event.modifierFlags
+            // Unmodified backtick: the interpretKeyEvents path swallows
+            // a plain one (routing to cancelOperation → ESC) before
+            // SwiftTerm can insert it.
+            if !flags.contains(.command),
+               flags.intersection([.option, .control, .shift]).isEmpty,
+               let chars = event.characters,
+               chars.unicodeScalars.contains(where: { $0.value == 0x60 })
+            {
+                terminal.send(data: [0x60][...])
+                return nil
+            }
+            // Option+printable (issue #116): the layout composed a
+            // symbol (Estonian Option+2 → `@`); send it straight to
+            // the view so it never reaches SwiftTerm's ESC-prefix
+            // Meta branch. `OptionKeyScoping` keeps Meta on
+            // non-printables and dead keys by returning nil for them.
+            if flags.contains(.option),
+               !flags.contains(.command),
+               !flags.contains(.control),
+               let composed = OptionKeyScoping.composedText(
+                   characters: event.characters,
+                   charactersIgnoringModifiers: event.charactersIgnoringModifiers)
+            {
+                terminal.send(data: Array(composed.utf8)[...])
+                return nil
+            }
+            return event
         }
     }
 
-    private func uninstallBacktickMonitor() {
-        if let monitor = backtickMonitor {
+    private func uninstallKeyMonitor() {
+        if let monitor = keyMonitor {
             NSEvent.removeMonitor(monitor)
-            backtickMonitor = nil
+            keyMonitor = nil
         }
     }
 }

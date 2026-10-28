@@ -306,7 +306,7 @@ mod tests {
             let page = view.pager_text_rows().expect("pager slice");
             assert_eq!(page.len(), visible, "full page at offset {offset}");
             if let Some(p) = prev {
-                assert_eq!(p[1..], page[..visible - 1], "offset {offset} repeats a row");
+                assert_eq!(page[1..], p[..visible - 1], "offset {offset} repeats a row");
             }
             prev = Some(page);
         }

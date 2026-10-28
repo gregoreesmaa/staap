@@ -1,162 +1,241 @@
 import XCTest
 @testable import ShellSupport
 
-/// Regression tests for optionAsMetaKey behavior covering both use cases:
-/// - Word navigation with Option+arrows on letter keys (enabled by optionAsMetaKey = true)
-/// - Unmodified special characters like backticks pass through without modification
+/// Regression tests for issue #116: Option+number top-row symbols
+/// (Estonian layout `@` `$` etc.) could not be typed after
+/// optionAsMetaKey was re-enabled globally (2d247f8).
 ///
-/// These scenarios were the source of issue #113 and required the fix commits:
-/// - a9177c1: app-global backtick monitor to bypass macOS interpretKeyEvents loss
-/// - 71025d0: layout-agnostic check using event.characters for any keyboard layout
-/// - ea89165: disable optionAsMetaKey for special char layouts (Estonian, etc.)
-/// - 2d247f8: enable optionAsMetaKey globally again after backtick fix is in place
+/// Root cause: with `optionAsMetaKey = true`, SwiftTerm 1.20.0 sends
+/// ESC + `charactersIgnoringModifiers` for every Option+non-arrow key,
+/// so Estonian Option+2 emits ESC `2` (`[0x1B, 0x32]`) instead of the
+/// layout-composed `@` (`event.characters`). The fix scopes Meta to
+/// non-printable keys: the app-global key monitor sends the composed
+/// symbol for Option+printable (via `OptionKeyScoping`), while
+/// SwiftTerm keeps Meta on arrows (ESC b / ESC f word jump),
+/// Escape, Tab, Backspace, Enter, and function keys.
+///
+/// The resulting contract (pinned below with real assertions, not
+/// prose):
+/// - Option+printable composes the layout symbol (Estonian Option+2
+///   types `@`, Option+' types backtick). Meta+letter is therefore
+///   unavailable, matching iTerm2 "Normal" / kitty / Ghostty; word
+///   navigation lives on Option+arrows, which are byte-identical to
+///   the shared core key table (`ESC b` / `ESC f`).
+/// - Keys that compose nothing (arrows, function keys, Escape, Tab,
+///   Backspace, Enter, dead-key presses) keep their Meta meaning.
+///
+/// History this supersedes (kept for the archaeology):
+/// - a9177c1: app-global backtick monitor to bypass macOS
+///   interpretKeyEvents loss
+/// - 71025d0: layout-agnostic check using event.characters
+/// - ea89165: disable optionAsMetaKey for special char layouts
+/// - 2d247f8: enable optionAsMetaKey globally again (regressed #116)
 final class KeyHandlingRegressionTests: XCTestCase {
 
-    // MARK: - Test Case 1: Word Navigation with Option+Arrows on Letter Keys
+    // MARK: - Case 3 (issue #116): Top-row symbols compose
 
-    /// VERIFICATION: When `optionAsMetaKey = true`, terminal applications receive:
-    /// - Option+a → ESC (0x1B) + a (0x61) → moves to beginning of word
-    /// - Option+z → ESC (0x1B) + z (0x7A) → moves to end of word
-    /// - Option+left  → ESC (0x1B) + b (0x62) → backward word
-    /// - Option+right → ESC (0x1B) + f (0x66) → forward word
-    func testOptionPlusLetterKeys_produce_word_navigation_sequences() {
-        // This documents the expected behavior: optionAsMetaKey = true
-        // causes letter keys to produce ESC prefix for word navigation
-
-        let wordNavSequences: [(key: String, escPrefix: UInt8, keyChar: UInt8)] = [
-            ("a", 0x1B, 0x61),   // Option+a → word start
-            ("z", 0x1B, 0x7A),   // Option+z → word end
-            ("b", 0x1B, 0x62),   // Option+b (left arrow) → backward word
-            ("f", 0x1B, 0x66),   // Option+f (right arrow) → forward word
+    /// Estonian Option+digit must yield the layout symbol, not an
+    /// ESC-prefixed digit. Each pair is (ignoringModifiers, composed).
+    func testEstonianTopRowOptionDigits_composeSymbols() {
+        let pairs: [(ignoring: String, composed: String)] = [
+            ("1", "©"),
+            ("2", "@"),
+            ("3", "£"),
+            ("4", "$"),
+            ("5", "§"),
         ]
-
-        for seq in wordNavSequences {
-            let sequence = [seq.escPrefix, seq.keyChar]
-
-            // Verify structure: ESC prefix + key character
-            XCTAssertEqual(sequence.count, 2, "\(seq.key) produces 2-byte sequence")
-            XCTAssertEqual(sequence[0], 0x1B, "\(seq.key) starts with ESC prefix (Meta)")
-            XCTAssertEqual(sequence[1], seq.keyChar, "\(seq.key) maps to correct terminal command")
+        for pair in pairs {
+            XCTAssertEqual(
+                OptionKeyScoping.composedText(
+                    characters: pair.composed,
+                    charactersIgnoringModifiers: pair.ignoring),
+                pair.composed,
+                "Option+\(pair.ignoring) must compose \(pair.composed), not ESC \(pair.ignoring)")
         }
+        // Wire bytes for the reported case: `@` is a single 0x40 byte,
+        // never an ESC-prefixed sequence.
+        XCTAssertEqual(Array("@".utf8), [0x40],
+            "Estonian Option+2 must send a single 0x40 byte")
     }
 
-    // MARK: - Test Case 2: Unmodified Backtick Passes Through
-
-    /// VERIFICATION: When optionAsMetaKey = true, unmodified backtick should still
-    /// produce literal ` (0x60) character. This is achieved by the app-global NSEvent
-    /// monitor in StaapMacApp.swift that intercepts before macOS interpretKeyEvents.
-    func testUnmodifiedBacktick_passes_as_literal_byte_0x60() {
-        // The fix: StaapMacApp.swift installs global key monitor that intercepts:
-        // - event.charactersIgnoringModifiers == "`" && !event.modifierFlags.contains(.command)
-        // - Sends byte 0x60 directly to TerminalView via sendDelegate.send(source:data:)
-        // - Returns nil to swallow the original event
-
-        let backtickByte: UInt8 = 0x60
-        XCTAssertEqual(backtickByte, "`" as UnicodeScalar?,
-            "Backtick character must be represented as byte 0x60")
-
-        // This test documents that unmodified backticks bypass interpretKeyEvents entirely
-        XCTAssertTrue(true, "Global NSEvent monitor in StaapMacApp.swift intercepts plain ` to send 0x60 directly")
+    /// Estonian Option+' composes a backtick (the layout-agnostic
+    /// 71025d0 case): the symbol reaches the PTY instead of ESC `'`.
+    func testEstonianOptionQuote_composesBacktick() {
+        XCTAssertEqual(
+            OptionKeyScoping.composedText(
+                characters: "`",
+                charactersIgnoringModifiers: "'"),
+            "`",
+            "Estonian Option+' must compose a backtick, not ESC '")
+        XCTAssertEqual(Array("`".utf8), [0x60],
+            "Composed backtick is the literal 0x60 byte")
     }
 
-    /// VERIFICATION: Estonian layout (and others) produce backtick via Option+' which
-    /// has a modifier applied. The global monitor uses event.characters (modifiers applied)
-    /// rather than charactersIgnoringModifiers, making it layout-agnostic.
-    func testEstonianLayoutOptionPlusQuote_produces_backtick() {
-        // Estonian: Option+' produces `
-        // This key press HAS modifiers but the resulting character is still `
-        // The fix in commit 71025d0 checks event.characters (not charactersIgnoringModifiers)
+    // MARK: - Case 1 (revised): letters compose, arrows word-jump
 
-        let estonianSequence = "Option+'" as String
-        let expectedOutput: Character = "`"
-
-        XCTAssertEqual(expectedOutput, "`",
-            "Estonian Option+' must produce literal ` regardless of modifier state")
+    /// Option+letter composes the layout character (US Option+a is `å`,
+    /// Option+s is `ß`) instead of an ESC-prefixed Meta sequence. This
+    /// is the documented iTerm2-"Normal" tradeoff: Meta+letter is
+    /// unavailable so that layouts which put symbols on letters
+    /// (Turkish Option+Q is `@`) can type them.
+    func testOptionLetter_composesInsteadOfMeta() {
+        XCTAssertEqual(
+            OptionKeyScoping.composedText(
+                characters: "å",
+                charactersIgnoringModifiers: "a"),
+            "å",
+            "Option+a must compose å, not ESC a")
+        XCTAssertEqual(
+            OptionKeyScoping.composedText(
+                characters: "ß",
+                charactersIgnoringModifiers: "s"),
+            "ß",
+            "Option+s must compose ß, not ESC s")
     }
 
-    // MARK: - Test Case 3: Top-Row Keys with Option (Estonian/macOS)
-
-    /// VERIFICATION: Top-row keys with Option modifier produce special characters that
-    /// MUST pass through terminal unmodified:
-    /// - ©@£$§{[]}\ (top-row keys 1234567890+ on Estonian layout)
-    ///
-    /// When optionAsMetaKey = true, these special chars must NOT get "Meta" prefix added.
-    /// They are literal Unicode scalars that should appear as-is in terminal input.
-    func testTopRowSpecialChars_pass_through_unmodified() {
-        // Estonian top-row keys with Option modifier:
-        let estonianTopRowChars: [(keyPosition: Int, character: Character)] = [
-            (1, "©"),  // Option+1
-            (2, "@"),  // Option+2
-            (3, "£"),  // Option+3
-            (4, "$"),  // Option+4
-            (5, "§"),  // Option+5
-            (6, "^"),  // Option+6
-            (7, "&"),  // Option+7
-            (8, "*"),  // Option+8
-            (9, "("),  // Option+9
-            (0, ")"),  // Option+0
+    /// Option+arrows keep their Meta meaning (word jump: ESC b / ESC f,
+    /// the shared core key table's bytes). The physical key is an
+    /// arrow however the layout labels `characters` (Estonian reports
+    /// `~` there), so classification keys off the ignoring-modifiers
+    /// scalar, which is a private-use function-key scalar for arrows.
+    func testArrowsAndFunctionKeys_stayMeta() {
+        let arrows: [(name: String, scalar: String)] = [
+            ("left", "\u{F702}"),
+            ("right", "\u{F703}"),
+            ("up", "\u{F700}"),
+            ("down", "\u{F701}"),
         ]
+        for arrow in arrows {
+            XCTAssertNil(
+                OptionKeyScoping.composedText(
+                    characters: "~",
+                    charactersIgnoringModifiers: arrow.scalar),
+                "Option+\(arrow.name) must stay Meta (word jump), not compose ~")
+            XCTAssertNil(
+                OptionKeyScoping.composedText(
+                    characters: arrow.scalar,
+                    charactersIgnoringModifiers: arrow.scalar),
+                "Option+\(arrow.name) must stay Meta (word jump)")
+        }
+        // Function keys carry no text either.
+        XCTAssertNil(
+            OptionKeyScoping.composedText(
+                characters: "\u{F704}",
+                charactersIgnoringModifiers: "\u{F704}"),
+            "Option+F1 must stay Meta")
+    }
 
-        for mapping in estonianTopRowChars {
-            XCTAssertNotNil(mapping.character as UnicodeScalar,
-                "Option+\(mapping.keyPosition) must produce valid Unicode scalar \(mapping.character)")
+    // MARK: - Case 2: backtick paths
 
-            // These special chars pass through terminal without ESC prefix when optionAsMetaKey = true
-            XCTAssertTrue(true,
-                "Estonian Option+\(mapping.keyPosition) (\(mapping.character)) passes through unmodified")
+    /// An unmodified backtick is not Option-scoped at all: the
+    /// classifier stays out (equal strings compose nothing) and the
+    /// monitor's dedicated backtick rule owns it.
+    func testUnmodifiedBacktick_notHandledByScoping() {
+        XCTAssertNil(
+            OptionKeyScoping.composedText(
+                characters: "`",
+                charactersIgnoringModifiers: "`"),
+            "Unmodified backtick composes nothing; the backtick monitor rule owns it")
+    }
+
+    // MARK: - Non-printables keep Meta
+
+    /// When the layout composes nothing (composed equals the bare key),
+    /// there is no symbol to preserve, so Meta applies.
+    func testNoComposition_staysMeta() {
+        XCTAssertNil(
+            OptionKeyScoping.composedText(
+                characters: "2",
+                charactersIgnoringModifiers: "2"),
+            "Option+2 with no composition must stay Meta")
+        XCTAssertNil(
+            OptionKeyScoping.composedText(
+                characters: "q",
+                charactersIgnoringModifiers: "q"),
+            "Option+q with no composition must stay Meta")
+    }
+
+    /// Escape, Tab, Backspace, and Enter report C0 control scalars;
+    /// they are functional keys, never printable symbols.
+    func testControlKeys_stayMeta() {
+        let keys: [(name: String, scalar: String)] = [
+            ("escape", "\u{1B}"),
+            ("tab", "\u{09}"),
+            ("backspace", "\u{7F}"),
+            ("enter", "\u{0D}"),
+        ]
+        for key in keys {
+            XCTAssertNil(
+                OptionKeyScoping.composedText(
+                    characters: key.scalar,
+                    charactersIgnoringModifiers: key.scalar),
+                "Option+\(key.name) must stay Meta")
         }
     }
 
-    /// VERIFICATION: Complete sequence ©@£$§{[]}\\ must all pass through as literal chars.
-    func testCompleteTopRowSequence_pass_through() {
-        // Full Estonian top-row Option sequence from commit ea89165:
-        let sequence = "©@£$§{[]}\\"
-
-        XCTAssertEqual(sequence.count, 10,
-            "Estonian top-row produces 10 special characters")
-
-        for char in sequence {
-            XCTAssertNotNil(char as UnicodeScalar,
-                "\(char) must be valid Unicode scalar passing through terminal")
-        }
-
-        XCTAssertTrue(true,
-            "Complete sequence \"\(sequence)\" passes through unmodified")
+    /// A dead-key first press (lone combining mark, or no text yet)
+    /// belongs to the input method, never to the PTY.
+    func testDeadKey_staysWithInputMethod() {
+        XCTAssertNil(
+            OptionKeyScoping.composedText(
+                characters: "\u{301}",
+                charactersIgnoringModifiers: "e"),
+            "Dead-key acute must stay with the input method")
+        XCTAssertNil(
+            OptionKeyScoping.composedText(
+                characters: nil,
+                charactersIgnoringModifiers: "e"),
+            "Missing composed text must stay Meta")
+        XCTAssertNil(
+            OptionKeyScoping.composedText(
+                characters: "",
+                charactersIgnoringModifiers: "2"),
+            "Empty composed text must stay Meta")
     }
 
-    // MARK: - Combined Verification
-
-    /// Test that both use cases are documented and can coexist:
-    /// 1. optionAsMetaKey = true enables word navigation for letter keys
-    /// 2. Global monitor intercepts backtick before it reaches interpretKeyEvents
-    func testBothUseCasesCoexist() {
-        // Requirement 1: CoreTerminalView.swift sets optionAsMetaKey = true
-        let optionAsMetaKeyValue: Bool = true
-
-        // Requirement 2: StaapMacApp.swift has global NSEvent monitor that intercepts backtick
-        let backtickInterceptionActive: Bool = true
-
-        // Both must be active simultaneously - they serve different key types:
-        // - Letter keys (a-z): flow through normally, optionAsMetaKey adds ESC prefix → word nav
-        // - Backtick (`): intercepted by NSEvent monitor before macOS processing → literal char
-        // - Special chars (©@£$§{[]}\\): pass through without modification
-
-        XCTAssertTrue(optionAsMetaKeyValue == backtickInterceptionActive,
-            "Both word navigation support and backtick interception must be active")
-
-        XCTAssertTrue(optionAsMetaKeyValue,
-            "optionAsMetaKey = true required for Option+arrow word navigation on letter keys")
-
-        XCTAssertTrue(backtickInterceptionActive,
-            "NSEvent monitor required to intercept ` before interpretKeyEvents makes it modified")
+    /// Multi-scalar bare keys cannot be classified as one typewriter
+    /// key, so Meta applies.
+    func testMulticharBareKey_staysMeta() {
+        XCTAssertNil(
+            OptionKeyScoping.composedText(
+                characters: "@",
+                charactersIgnoringModifiers: "24"),
+            "Multi-scalar bare key must stay Meta")
     }
 
-    // MARK: - Git Commit History Verification
+    // MARK: - Combined contract
 
-    /// Verify that the commit history contains all necessary fixes for both use cases.
+    /// The three mechanisms coexist, each owning disjoint key shapes:
+    /// 1. SwiftTerm `optionAsMetaKey = true` keeps Meta on
+    ///    non-printables (Option+arrows word-jump ESC b / ESC f).
+    /// 2. The app-global key monitor sends the layout-composed symbol
+    ///    for Option+printable (`OptionKeyScoping`, issue #116).
+    /// 3. The same monitor intercepts the unmodified backtick before
+    ///    macOS interpretKeyEvents swallows it (byte 0x60).
+    func testAllThreeMechanismsCoexist() {
+        // Printable composes through the scoping rule...
+        XCTAssertEqual(
+            OptionKeyScoping.composedText(
+                characters: "@",
+                charactersIgnoringModifiers: "2"),
+            "@")
+        // ...while arrows and the unmodified backtick stay out of it.
+        XCTAssertNil(
+            OptionKeyScoping.composedText(
+                characters: "~",
+                charactersIgnoringModifiers: "\u{F702}"))
+        XCTAssertNil(
+            OptionKeyScoping.composedText(
+                characters: "`",
+                charactersIgnoringModifiers: "`"))
+        XCTAssertEqual("`".utf8.count, 1,
+            "Unmodified backtick remains the single 0x60 byte")
+    }
+
+    // MARK: - Git history pinning the saga
+
+    /// The commits whose interaction produced issue #116.
     func testRequiredCommitsExist() {
-        // These commits are listed in .git log and must exist:
-
         let requiredCommits: [(hash: String, description: String)] = [
             ("a9177c1", "app-global backtick monitor to bypass macOS interpretKeyEvents"),
             ("71025d0", "layout-agnostic check using event.characters for any keyboard layout"),
@@ -165,8 +244,7 @@ final class KeyHandlingRegressionTests: XCTestCase {
         ]
 
         for commit in requiredCommits {
-            // Each commit hash should be valid (verified via git log)
-            XCTAssertTrue(commit.hash.count == 7,
+            XCTAssertEqual(commit.hash.count, 7,
                 "\(commit.hash) is valid short hash")
 
             XCTAssertFalse(commit.description.isEmpty,
@@ -174,27 +252,24 @@ final class KeyHandlingRegressionTests: XCTestCase {
         }
     }
 
-    // MARK: - Byte Sequence Verification
+    // MARK: - Byte sequence contract
 
-    /// Verify the exact byte sequences produced for various key combinations.
-    func testByteSequencesForCommonKeyCombos() {
-        let keySeqs: [(keyCombo: String, bytes: [UInt8], purpose: String)] = [
-            ("plain `", [0x60], "literal backtick, passes through"),
-            ("Option+a", [0x1B, 0x61], "word start navigation"),
-            ("Option+z", [0x1B, 0x7A], "word end navigation"),
-            ("Option+left", [0x1B, 0x62], "backward word"),
-            ("Option+right", [0x1B, 0x66], "forward word"),
-        ]
-
-        for seq in keySeqs {
-            XCTAssertFalse(seq.bytes.isEmpty,
-                "\(seq.keyCombo) produces non-empty byte sequence")
-
-            // Verify each byte is valid ASCII (0-127)
-            for byte in seq.bytes {
-                XCTAssertLessThan(byte, 128,
-                    "All bytes for \(seq.keyCombo) must be valid ASCII")
-            }
-        }
+    /// The exact wire bytes each path must produce.
+    func testByteSequencesForKeyCombos() {
+        // Issue #116: Option+2 types `@`, a single byte.
+        XCTAssertEqual(
+            Array(OptionKeyScoping.composedText(
+                characters: "@",
+                charactersIgnoringModifiers: "2")!.utf8),
+            [0x40],
+            "Option+2 sends @ as one byte")
+        // Plain backtick stays the literal 0x60 byte.
+        XCTAssertEqual(Array("`".utf8), [0x60],
+            "Plain backtick is one literal byte")
+        // Arrows keep the shared core key table's word-jump bytes.
+        XCTAssertEqual([0x1B, 0x62], [0x1B, UInt8(ascii: "b")],
+            "Option+Left word-jump prefix shape")
+        XCTAssertEqual([0x1B, 0x66], [0x1B, UInt8(ascii: "f")],
+            "Option+Right word-jump prefix shape")
     }
 }
