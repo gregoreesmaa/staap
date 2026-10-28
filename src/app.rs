@@ -262,13 +262,17 @@ pub fn animal_name(n: usize) -> String {
 
 /// Screen-text markers suggesting `muse` waits on the user (approval
 /// prompts, permission questions, errors). Matched case-insensitively.
+/// `yes, allow` / `always allow` carry context guards (trailing object
+/// punctuation for the former; `and`-form or option-row line-start for the
+/// latter) so working-output prose (`Yes, allowed …`, `We always allow up
+/// to …`) never matches — the mirror image of #114 (fix-loop).
 /// This is the single reconciled marker list, precompiled once: the live
 /// shell and the historic provider classifier both funnel through
 /// [`classify`], so a run can never show a different status live vs
 /// historic by construction, and no per-tick allocation happens here.
 static ATTENTION_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r#"(?i)approval|approve|permission|needs_input|needs input|\"error\"|\(y/n\)|allow once|allow always|would you like|press enter to confirm|do you want to proceed|yes, allow|always allow|don't ask again|ask once per session"#,
+        r#"(?i)approval|approve|permission|needs_input|needs input|\"error\"|\(y/n\)|allow once|allow always|would you like|press enter to confirm|do you want to proceed|yes, allow(?:\s|…|:|\.|$)|(?:and always allow\b|(?m:^[^a-zA-Z]{0,10}always allow\b))|don't ask again|ask once per session"#,
     )
     .expect("static attention regex")
 });
@@ -1795,6 +1799,12 @@ mod tests {
         assert!(needs_attention(once));
         assert_eq!(classify(once, fresh, false), Status::Attention);
         let imports = "Yes, allow external imports\nNo, disable external imports";
+        assert!(needs_attention("Yes, allow unattended commands on prod-db"));
+        assert!(needs_attention(
+            "Always allow all edits during this session"
+        ));
+        let numbered = "Do you want to proceed?\n  2. Always allow all edits\n  3. No";
+        assert!(needs_attention(numbered));
         assert!(needs_attention(imports));
         assert_eq!(classify(imports, fresh, false), Status::Attention);
     }
@@ -1825,6 +1835,8 @@ mod tests {
         assert!(!needs_attention("we always review allowed paths"));
         assert!(!needs_attention("Please don't ask me again about this"));
         assert!(!needs_attention("ask once, then continue silently"));
+        assert!(!needs_attention("Yes, allowed tools are listed below"));
+        assert!(!needs_attention("We always allow up to 3 retries"));
         assert!(!needs_attention("allowed tools are listed below"));
         // Pre-existing negatives keep holding.
         assert!(!needs_attention("Muse Code 1.4.0"));
