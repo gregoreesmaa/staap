@@ -266,8 +266,9 @@ impl ShellView {
     ) -> gpui::Div {
         let text = StyledText::new(full).with_runs(runs);
         // Mouse selection highlight: cell rectangles behind the text. The
-        // inner wrapper has no padding, so overlay origin == text origin and
-        // no padding constant is needed.
+        // inner wrapper has no padding, so overlay origin == text origin;
+        // both edges come from the core row-geometry source (issue #112),
+        // never a second inline pitch.
         let slot = std::rc::Rc::clone(&self.term_text_bounds);
         let mut inner = div().relative().h_full().w_full();
         for (row, sc, ec) in highlight {
@@ -277,8 +278,8 @@ impl ShellView {
             inner = inner.child(
                 div()
                     .absolute()
-                    .left(px(sc as f32 * self.char_w))
-                    .top(px(row as f32 * self.line_h))
+                    .left(px(crate::shell_shared::col_left(0.0, sc, self.char_w)))
+                    .top(px(crate::shell_shared::row_top(0.0, row, self.line_h)))
                     .w(px((ec - sc) as f32 * self.char_w))
                     .h(px(self.line_h))
                     .bg(rgb(theme.selection)),
@@ -305,7 +306,8 @@ impl ShellView {
             .p_2()
             .font(term_font)
             .text_size(px(self.term_font_size()))
-            // Rendered row pitch == mapped cell pitch (issue #59):
+            // Rendered row pitch == mapped cell pitch (issue #59; single
+            // source shell_shared::{row_top, row_at, cell_at}, pinned by #112):
             // without this the text inherits gpui's default phi (1.618x)
             // line height, so every glyph row below row 0 lands lower
             // than `mouse_cell`/highlight assume and drags snap to void.
