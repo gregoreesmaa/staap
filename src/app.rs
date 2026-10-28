@@ -331,7 +331,7 @@ pub fn section_title(status: Status) -> &'static str {
     match status {
         Status::Attention => "Needs input",
         Status::Idle => "Idle",
-        Status::Working => "Active",
+        Status::Working => "Working",
     }
 }
 
@@ -1808,7 +1808,7 @@ mod tests {
         // No standalone Needs-input section remains (glyphs + badge persist).
         assert_eq!(section_title(Status::Attention), "Needs input");
         assert_eq!(section_title(Status::Idle), "Idle");
-        assert_eq!(section_title(Status::Working), "Active");
+        assert_eq!(section_title(Status::Working), "Working");
         // Sorted input lists attention first inside the merged Idle bucket.
         let mut sorted = vec![
             sess("w1", Status::Working, 9),
