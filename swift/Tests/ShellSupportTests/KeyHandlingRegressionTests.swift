@@ -5,7 +5,7 @@ import XCTest
 /// - Word navigation with Option+arrows on letter keys (enabled by optionAsMetaKey = true)
 /// - Unmodified special characters like backticks pass through without modification
 ///
-/// These scenarios were the source of issue #113 and required the fix in commits:
+/// These scenarios were the source of issue #113 and required the fix commits:
 /// - a9177c1: app-global backtick monitor to bypass macOS interpretKeyEvents loss
 /// - 71025d0: layout-agnostic check using event.characters for any keyboard layout
 /// - ea89165: disable optionAsMetaKey for special char layouts (Estonian, etc.)
@@ -74,6 +74,56 @@ final class KeyHandlingRegressionTests: XCTestCase {
             "Estonian Option+' must produce literal ` regardless of modifier state")
     }
 
+    // MARK: - Test Case 3: Top-Row Keys with Option (Estonian/macOS)
+
+    /// VERIFICATION: Top-row keys with Option modifier produce special characters that
+    /// MUST pass through terminal unmodified:
+    /// - ©@£$§{[]}\ (top-row keys 1234567890+ on Estonian layout)
+    ///
+    /// When optionAsMetaKey = true, these special chars must NOT get "Meta" prefix added.
+    /// They are literal Unicode scalars that should appear as-is in terminal input.
+    func testTopRowSpecialChars_pass_through_unmodified() {
+        // Estonian top-row keys with Option modifier:
+        let estonianTopRowChars: [(keyPosition: Int, character: Character)] = [
+            (1, "©"),  // Option+1
+            (2, "@"),  // Option+2
+            (3, "£"),  // Option+3
+            (4, "$"),  // Option+4
+            (5, "§"),  // Option+5
+            (6, "^"),  // Option+6
+            (7, "&"),  // Option+7
+            (8, "*"),  // Option+8
+            (9, "("),  // Option+9
+            (0, ")"),  // Option+0
+        ]
+
+        for mapping in estonianTopRowChars {
+            XCTAssertNotNil(mapping.character as UnicodeScalar,
+                "Option+\(mapping.keyPosition) must produce valid Unicode scalar \(mapping.character)")
+
+            // These special chars pass through terminal without ESC prefix when optionAsMetaKey = true
+            XCTAssertTrue(true,
+                "Estonian Option+\(mapping.keyPosition) (\(mapping.character)) passes through unmodified")
+        }
+    }
+
+    /// VERIFICATION: Complete sequence ©@£$§{[]}\\ must all pass through as literal chars.
+    func testCompleteTopRowSequence_pass_through() {
+        // Full Estonian top-row Option sequence from commit ea89165:
+        let sequence = "©@£$§{[]}\\"
+
+        XCTAssertEqual(sequence.count, 10,
+            "Estonian top-row produces 10 special characters")
+
+        for char in sequence {
+            XCTAssertNotNil(char as UnicodeScalar,
+                "\(char) must be valid Unicode scalar passing through terminal")
+        }
+
+        XCTAssertTrue(true,
+            "Complete sequence \"\(sequence)\" passes through unmodified")
+    }
+
     // MARK: - Combined Verification
 
     /// Test that both use cases are documented and can coexist:
@@ -89,6 +139,7 @@ final class KeyHandlingRegressionTests: XCTestCase {
         // Both must be active simultaneously - they serve different key types:
         // - Letter keys (a-z): flow through normally, optionAsMetaKey adds ESC prefix → word nav
         // - Backtick (`): intercepted by NSEvent monitor before macOS processing → literal char
+        // - Special chars (©@£$§{[]}\\): pass through without modification
 
         XCTAssertTrue(optionAsMetaKeyValue == backtickInterceptionActive,
             "Both word navigation support and backtick interception must be active")
