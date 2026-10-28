@@ -34,6 +34,20 @@ pub fn keystroke_to_pty(p: &KeyPress) -> Option<Vec<u8>> {
         }
         return None;
     }
+    // Word-jump on Alt+arrows (issue #113): named nav keys honor `alt`
+    // by NAME, before the printable fallback, so a layout-typed char
+    // (Estonian `~` on Option+arrows) never changes the bytes.
+    // Alt+Left/Right are readline word jumps (`ESC b` / `ESC f`,
+    // what bash/zsh forward-word expects); Alt+Up/Down stay unbound:
+    // no shell emits a modified-CSI form, so None beats invented bytes.
+    if p.alt {
+        match p.key {
+            "left" => return Some(vec![0x1b, b'b']),
+            "right" => return Some(vec![0x1b, b'f']),
+            "up" | "down" => return None,
+            _ => {}
+        }
+    }
     let bytes: Vec<u8> = match p.key {
         "enter" => b"\r".to_vec(),
         "backspace" => vec![0x7f],
@@ -188,5 +202,43 @@ mod tests {
     fn unknown_multichar_keys_encode_to_nothing() {
         assert_eq!(keystroke_to_pty(&press("shift", None)), None);
         assert_eq!(keystroke_to_pty(&press("capslock", None)), None);
+    }
+
+    #[test]
+    fn alt_arrows_emit_word_jumps_regardless_of_layout() {
+        // Issue #113: Option+arrows must jump words on every layout.
+        // Estonian types `~` for Option+arrows: the bytes must key off
+        // the key NAME + alt flag and ignore `key_char` entirely.
+        for (key, want) in [("left", b'b'), ("right", b'f')] {
+            for key_char in [Some("~"), None] {
+                let p = KeyPress {
+                    key,
+                    key_char,
+                    ctrl: false,
+                    alt: true,
+                };
+                assert_eq!(keystroke_to_pty(&p), Some(vec![0x1b, want]), "key={key:?}");
+            }
+        }
+        // Plain arrows are unchanged (no word jump without alt).
+        assert_eq!(
+            keystroke_to_pty(&press("left", Some("~"))),
+            Some(b"\x1b[D".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_pty(&press("right", None)),
+            Some(b"\x1b[C".to_vec())
+        );
+        // Alt+Up/Down stay unbound: no shell emits a modified-CSI form,
+        // so inventing bytes would fork the table (None instead).
+        for key in ["up", "down"] {
+            let p = KeyPress {
+                key,
+                key_char: Some("~"),
+                ctrl: false,
+                alt: true,
+            };
+            assert_eq!(keystroke_to_pty(&p), None, "key={key:?}");
+        }
     }
 }
