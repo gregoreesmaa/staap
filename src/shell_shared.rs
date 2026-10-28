@@ -271,7 +271,7 @@ pub fn pr_link_label(session: &ChatSession, url: &str) -> Option<String> {
 /// nothing: empty groups still render headers. This is the single rule
 /// Scope (issue #114 fix-loop): core-side ordering only, currently
 /// exercised by its unit test below — no `staap_*` FFI exposes it and no
-/// native shell calls it (Swift cites it in a comment only). The gpui
+/// native shell calls it (Swift cites it in a comment only). The macOS
 /// shell orders via `status_sections` (`src/app.rs`); the native shells
 /// keep their own section order (native-parity gap, see task-4 report).
 pub fn group_sections(
