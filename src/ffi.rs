@@ -2062,13 +2062,18 @@ pub unsafe extern "C" fn staap_pr_glyph(
 }
 
 /// Refresh stored PR states for roster row `row` (issue #115): re-query
-/// `gh` for stale URLs (5-minute TTL cache) and persist the results.
-/// Returns 1 when any state changed, 0 when unchanged, -1 on null
-/// handle / out-of-bounds row. Absent binary, failures, and rate
-/// limits resolve Unknown and prune — never an error row.
+/// `gh` for stale URLs (5-minute TTL cache, each spawn bounded by the
+/// `fetch_pr_json` spawn timeout) and mutate in-memory stored state.
+/// Does NOT persist: persistence happens through the pump's throttled
+/// persist, same as other pump-observed changes. Returns 1 when any
+/// state changed, 0 when unchanged, -1 on null handle / out-of-bounds
+/// row. Absent binary, failures, and rate limits resolve Unknown and
+/// prune — never an error row.
 ///
-/// Blocking: spawns `gh` subprocesses for stale URLs. Call from a
-/// background task only — never on the pump hot path.
+/// Blocking and unbudgeted: one bounded spawn per stale URL. Call from
+/// a background task only — never per-tick or per-row. (Superseded on
+/// the periodic path by the throttled budgeted core driver
+/// [`crate::app::App::refresh_stale_pr_states`], budget 1 per 60 s.)
 ///
 /// # Safety
 /// `core` must be null or a live pointer from [`staap_core_new`].
@@ -2902,6 +2907,13 @@ mod tests {
             assert!(staap_pr_glyph(std::ptr::null(), 0, url.as_ptr()).is_null());
             assert!(staap_pr_glyph(&core as *const StaapCore, 7, url.as_ptr()).is_null());
             assert!(staap_pr_glyph(&core as *const StaapCore, 0, std::ptr::null()).is_null());
+            // Documented null-on-invalid-UTF-8 branch: non-UTF-8 bytes
+            // never become a label.
+            let bad = b"https://github.com/acme/app/pull/42\xff\0";
+            assert!(
+                staap_pr_glyph(&core as *const StaapCore, 0, bad.as_ptr() as *const c_char)
+                    .is_null()
+            );
             // A row with no links refreshes to unchanged without spawning.
             let mut bare = StaapCore {
                 reg: crate::runs::RunRegistry::new(vec![row("b", Status::Idle)]),

@@ -103,38 +103,59 @@ pub fn pr_status_label(state: PrState) -> String {
     }
 }
 
+/// Serde helper: an explicit JSON `null` decodes as the type default.
+/// Plain `#[serde(default)]` only covers *missing* fields, so a `null`
+/// from `gh` would fail the whole document to [`PrState::Unknown`].
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Subset of `gh pr view --json` this module reads. Field names verified
 /// against the installed gh 2.92.0 (`gh pr view --help` JSON FIELDS plus
 /// live `gh pr view`/`gh pr list` probes): `state` is OPEN/CLOSED/MERGED,
 /// `reviewDecision` is `""` (none), REVIEW_REQUIRED, APPROVED, or
 /// CHANGES_REQUESTED, `reviews[].state` carries per-review verdicts with
 /// `author.login`. Unknown extra fields (e.g. `mergeStateStatus`,
-/// `number`) are ignored by construction.
+/// `number`) are ignored by construction. Every read field is
+/// null-tolerant via [`null_to_default`]: explicit JSON `null`s decode
+/// as defaults instead of failing the document.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct GhPrView {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     state: String,
-    #[serde(rename = "isDraft", default)]
+    #[serde(rename = "isDraft", default, deserialize_with = "null_to_default")]
     is_draft: bool,
-    #[serde(rename = "reviewDecision", default)]
+    #[serde(
+        rename = "reviewDecision",
+        default,
+        deserialize_with = "null_to_default"
+    )]
     review_decision: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     reviews: Vec<GhReview>,
 }
 
 /// One entry of the `reviews` array in `gh pr view --json reviews`.
+/// `author` is already `Option` (explicit `null` → `None`); `state`
+/// needs [`null_to_default`] like the other read strings.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct GhReview {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     state: String,
     #[serde(default)]
     author: Option<GhAuthor>,
 }
 
 /// Review author identity; only the login feeds the approval count.
+/// `login` is null-tolerant via [`null_to_default`]: a null login
+/// simply doesn't count toward approvals.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct GhAuthor {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     login: String,
 }
 
@@ -224,30 +245,77 @@ pub(crate) fn pr_cache_fresh(url: &str, now: Instant) -> bool {
     cache_lookup(url, now).is_some()
 }
 
+/// Bound on one `gh` spawn: a hung `gh` must never stall the
+/// background pump longer than this. The wait loop polls
+/// [`GH_SPAWN_POLL`] and kills on expiry, so the worst case is a bounded
+/// stall, never the full hang. No new dependencies: spawn + `try_wait`
+/// + sleep from std only.
+const GH_SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Poll quantum for the [`GH_SPAWN_TIMEOUT`] wait below.
+const GH_SPAWN_POLL: Duration = Duration::from_millis(50);
+
+/// Run `cmd` with piped stdout, bounded by `timeout`: a process still
+/// alive on expiry is killed, reaped, and reported as `None` (the same
+/// Unknown-path as any other spawn failure). Non-zero exit is also
+/// `None` (rate limits, auth errors). Only the success path returns
+/// stdout.
+fn run_bounded(mut cmd: std::process::Command, timeout: Duration) -> Option<Vec<u8>> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut waited = Duration::ZERO;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                // Exited: reap the piped stdout without blocking.
+                return child.wait_with_output().ok().map(|out| out.stdout);
+            }
+            Ok(None) => {
+                if waited >= timeout {
+                    // Hung: kill, reap (no zombie), report as failure.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(GH_SPAWN_POLL);
+                waited += GH_SPAWN_POLL;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Spawn boundary for `gh`: run
 /// `gh pr view <n> --repo <owner/repo> --json
 /// number,state,isDraft,reviewDecision,mergeStateStatus,reviews` and
-/// return stdout on success, `None` on missing binary, non-zero exit, or
-/// spawn failure. Production only — tests inject this boundary.
-/// `pub(crate)` so the core refresh driver (`app`) can build its real
-/// spawn closure; the injected seam stays the tested path.
+/// return stdout on success, `None` on missing binary, non-zero exit,
+/// spawn failure, or a hang past [`GH_SPAWN_TIMEOUT`] (killed — one hung
+/// `gh` never stalls the background pump for the full hang).
+/// Production only — tests inject this boundary. `pub(crate)` so the
+/// core refresh driver (`app`) can build its real spawn closure; the
+/// injected seam stays the tested path.
 pub(crate) fn fetch_pr_json(repo: &str, pr_number: u64) -> Option<Vec<u8>> {
-    let output = std::process::Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr_number.to_string(),
-            "--repo",
-            repo,
-            "--json",
-            "number,state,isDraft,reviewDecision,mergeStateStatus,reviews",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(output.stdout)
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args([
+        "pr",
+        "view",
+        &pr_number.to_string(),
+        "--repo",
+        repo,
+        "--json",
+        "number,state,isDraft,reviewDecision,mergeStateStatus,reviews",
+    ]);
+    run_bounded(cmd, GH_SPAWN_TIMEOUT)
 }
 
 /// Resolve a PR URL to its state with injected seams: `gh_available`
@@ -295,6 +363,10 @@ pub fn parse_pr_url(url: &str) -> Option<(&str, u64)> {
 
     // Extract owner/repo (up to /pull/) and get position after it
     let (repo_part, _after_repo) = rest.split_once(PULL_PREFIX)?;
+    // An empty owner/repo segment (e.g. `github.com//pull/1`) is not a PR.
+    if repo_part.is_empty() {
+        return None;
+    }
 
     // Parse PR number from rest after /pull/
     let pr_start = repo_part.len() + PULL_PREFIX.len();
@@ -314,31 +386,18 @@ pub fn parse_pr_url(url: &str) -> Option<(&str, u64)> {
     Some((repo_part, pr_num))
 }
 
-/// Query PR state via `gh pr view --json` (issue #115). Served from
-/// the 5-minute TTL cache when fresh; spawns `gh` otherwise. Any
-/// failure (no binary, non-zero exit, bad JSON) is [`PrState::Unknown`].
-pub fn query_pr_state(repo: &str, pr_number: u64) -> PrState {
-    let url = format!("https://github.com/{repo}/pull/{pr_number}");
-    let mut fetch = |r: &str, n: u64| fetch_pr_json(r, n);
-    resolve_pr_state_with(url.as_str(), Instant::now(), gh_cli_available(), &mut fetch)
-}
-
 /// Resolve the stored state for a PR URL (issue #115). Served from
 /// the 5-minute TTL cache when fresh; one `gh` spawn per URL per 5
 /// minutes at most; [`PrState::Unknown`] when `gh` is absent or fails.
+///
+/// Note: the sync spawn helpers `query_pr_state` + `resolve_pr_icon`
+/// that used to sit here are gone (fix-loop 2: verified zero callers —
+/// render paths use the stored-state [`crate::app::ChatSession::pr_label_for`]
+/// / `staap_pr_glyph` instead). [`resolve_pr_state`] stays as the single
+/// sync entry; tests use the injected seam, never a spawn.
 pub fn resolve_pr_state(url: &str) -> PrState {
     let mut fetch = |r: &str, n: u64| fetch_pr_json(r, n);
     resolve_pr_state_with(url, Instant::now(), gh_cli_available(), &mut fetch)
-}
-
-/// Resolve the display icon for a PR URL (issue #115): the pinned
-/// glyph plus approval count for the state from [`resolve_pr_state`].
-pub fn resolve_pr_icon(url: &str) -> PrStatusIcon {
-    let state = resolve_pr_state(url);
-    PrStatusIcon {
-        glyph: pr_status_glyph(state),
-        approval_count: pr_approval_count(state),
-    }
 }
 
 /// Compiled once: per-run-per-tick compilation was the hottest alloc in
@@ -531,6 +590,12 @@ mod tests {
         assert_eq!(parse_pr_url(url), None);
     }
 
+    // Issue #115 fix-loop 2: an empty owner/repo segment is not a PR.
+    #[test]
+    fn parse_pr_url_rejects_empty_repo() {
+        assert_eq!(parse_pr_url("https://github.com//pull/1"), None);
+    }
+
     #[test]
     fn status_glyph_for_open_unreviewed() {
         assert_eq!(pr_status_glyph(PrState::OpenUnreviewed), "◴");
@@ -640,11 +705,49 @@ mod tests {
         assert_eq!(calls.get(), 2, "resolve past the TTL must spawn again");
     }
 
+    // Issue #115 fix-loop 2: `gh` may emit explicit JSON nulls where
+    // the fixtures above omit fields. Plain `#[serde(default)]` only
+    // covers *missing* fields, so nulls must default too — the document
+    // still maps to the right state instead of failing to Unknown.
+    #[test]
+    fn gh_json_tolerates_explicit_nulls() {
+        let body = br#"{"number":8,"state":"OPEN","isDraft":null,"reviewDecision":"APPROVED","mergeStateStatus":"CLEAN","reviews":[{"state":"APPROVED","author":{"login":null}},{"state":null,"author":null}]}"#;
+        assert_eq!(pr_state_from_json_bytes(body), PrState::OpenApproved(1));
+        let bare = br#"{"number":9,"state":"OPEN","isDraft":null,"reviewDecision":null,"mergeStateStatus":null,"reviews":null}"#;
+        assert_eq!(pr_state_from_json_bytes(bare), PrState::OpenUnreviewed);
+    }
+
     // Issue #115: no `gh` on PATH (or a non-PR URL) → Unknown glyph,
     // and the spawn boundary is never attempted.
     #[test]
     fn unknown_when_gh_missing() {
         use std::time::Instant;
+
+        use crate::app::{ChatSession, Status, HARNESS_MUSE};
+
+        // Blank stored-state session: nothing refreshed yet, so every
+        // PR URL reads Unknown until a refresh stores otherwise.
+        fn blank_session() -> ChatSession {
+            ChatSession {
+                id: "blank".into(),
+                title: "blank".into(),
+                project: "proj".into(),
+                status: Status::Working,
+                harness: HARNESS_MUSE.into(),
+                last_active: 0,
+                pr_links: vec![],
+                pr_states: Default::default(),
+                related_links: vec![],
+                links_truncated: false,
+                transcript: vec![],
+                transcript_truncated: false,
+                title_locked: true,
+                pending_input: String::new(),
+                provider_session_id: None,
+                cwd: None,
+                remote: None,
+            }
+        }
 
         let mut must_not_spawn = |_repo: &str, _n: u64| -> Option<Vec<u8>> {
             panic!("must not attempt a spawn when gh is absent")
@@ -654,12 +757,11 @@ mod tests {
             resolve_pr_state_with(url, Instant::now(), false, &mut must_not_spawn),
             PrState::Unknown
         );
-        // The icon built from that state is the Unknown fallback glyph.
-        let icon = PrStatusIcon {
-            glyph: pr_status_glyph(PrState::Unknown),
-            approval_count: None,
-        };
-        assert_eq!(icon.glyph, "–");
+        // The stored-state path serves the same Unknown fallback glyph:
+        // an unrefreshed session labels the URL `–` with no spawn.
+        let session = blank_session();
+        assert_eq!(session.pr_state_for(url), PrState::Unknown);
+        assert_eq!(session.pr_label_for(url), Some("–".to_string()));
         // Non-PR URLs never spawn either, even with gh present.
         assert_eq!(
             resolve_pr_state_with(

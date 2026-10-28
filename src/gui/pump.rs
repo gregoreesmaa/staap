@@ -116,10 +116,12 @@ impl ShellView {
                 }
             }
         }
-        // PR icon refresh (issue #115): budgeted `gh` refresh off the hot
-        // path — at most one stale URL per 60 s (the TTL cache serves
-        // fresh URLs free), skipped entirely while no run holds PR links;
-        // stored-state changes repaint via the normal gate below.
+        // PR icon refresh (issue #115): budgeted `gh` refresh on the
+        // pump task but off the per-tick hot path — at most one stale
+        // URL per 60 s window (fresh URLs resolve free from the TTL
+        // cache past the cap; each spawn bounded by the fetch timeout),
+        // skipped entirely while no run holds PR links; stored-state
+        // changes repaint via the normal gate below.
         let pr_due = self
             .last_pr_refresh
             .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(60));

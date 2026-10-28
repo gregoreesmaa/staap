@@ -269,11 +269,15 @@ impl ChatSession {
 
     /// Refresh stored PR states for every retained PR link (issue #115).
     /// Each URL costs at most one `gh` spawn per 5 minutes (shared TTL
-    /// cache); absent binary, failures, and rate limits resolve Unknown
-    /// and prune. Returns true when any stored state changed.
+    /// cache, each spawn bounded by the `fetch_pr_json` spawn timeout);
+    /// absent binary, failures, and rate limits resolve Unknown and
+    /// prune. Returns true when any stored state changed.
     ///
-    /// Blocking: spawns `gh` subprocesses for stale URLs. Call from a
-    /// background task only — never on the pump hot path.
+    /// Blocking and unbudgeted: one bounded spawn per stale URL. Call
+    /// from a background task only — never per-tick or per-row. The
+    /// pump's periodic path uses the throttled budgeted driver
+    /// ([`App::refresh_stale_pr_states`]) instead; nothing calls this
+    /// on the pump.
     pub fn refresh_pr_states(&mut self) -> bool {
         self.refresh_pr_states_with(
             std::time::Instant::now(),
@@ -1276,13 +1280,18 @@ impl App {
     }
 
     /// Budgeted PR-state refresh driver (issue #115): resolve at most
-    /// `budget` stale PR-link URLs across all sessions, fresh cache
-    /// entries resolving free without spending budget. Returns how many
-    /// stored states changed. Stops scanning once the budget is spent;
-    /// the remainder waits for the next driver run.
+    /// `budget` stale PR-link URLs across all sessions; fresh cache
+    /// entries keep resolving free past the cap (only stale resolutions
+    /// spend budget). Returns how many stored states changed. Stale URLs
+    /// past the cap wait for the next driver run.
     ///
-    /// Blocking: up to `budget` `gh` spawns. Call from a background
-    /// task only — never on the pump hot path.
+    /// Blocking: up to `budget` `gh` spawns, each bounded by the
+    /// `fetch_pr_json` spawn timeout. The pump runs this inline on its
+    /// task under a 60 s throttle (budget 1): the per-tick hot path
+    /// stays spawn-free — a throttle check, a link-list scan, and
+    /// TTL-cache lookups — and the worst case is `budget` bounded
+    /// spawns per throttle window. Never call per-tick unthrottled or
+    /// per-row.
     pub fn refresh_stale_pr_states(&mut self, budget: usize) -> usize {
         self.refresh_stale_pr_states_with(
             budget,
@@ -1311,16 +1320,22 @@ impl App {
             // the clone keeps the loop honest if retention rules mutate.
             let urls = session.pr_links.clone();
             for url in &urls {
-                if !pr_cache_fresh(url, now) {
-                    if spent >= budget {
-                        return changed;
+                if pr_cache_fresh(url, now) {
+                    // Free: served from memory, spends no budget — so
+                    // fresh entries behind a spent cap still converge.
+                    let state = resolve_pr_state_with(url, now, gh_available, fetch);
+                    if session.set_pr_state(url, state) {
+                        changed += 1;
                     }
+                } else if spent < budget {
+                    // Stale: each resolution costs at most one spawn.
                     spent += 1;
+                    let state = resolve_pr_state_with(url, now, gh_available, fetch);
+                    if session.set_pr_state(url, state) {
+                        changed += 1;
+                    }
                 }
-                let state = resolve_pr_state_with(url, now, gh_available, fetch);
-                if session.set_pr_state(url, state) {
-                    changed += 1;
-                }
+                // Over budget and stale: waits for the next driver run.
             }
         }
         changed
@@ -1500,6 +1515,56 @@ mod tests {
         let changed = app.refresh_stale_pr_states_with(1, Instant::now(), true, &mut fetch);
         assert_eq!(calls.get(), 1, "budget 1 must spend exactly one spawn");
         assert_eq!(changed, 1, "the one resolved URL stores Merged");
+    }
+
+    // Issue #115 fix-loop 2: budget skips no free work — a fresh-cache
+    // URL sitting *behind* the spent cap still converges with no extra
+    // spawn-boundary invocations; only stale resolutions spend budget.
+    // (Numeric display order puts the fresh URL last, past two stales.)
+    #[test]
+    fn refresh_stale_pr_states_spends_budget_on_stale_only() {
+        use std::time::{Duration, Instant};
+
+        let stale_a = "https://github.com/acme/prdriver-mix/pull/51";
+        let stale_b = "https://github.com/acme/prdriver-mix/pull/52";
+        let fresh = "https://github.com/acme/prdriver-mix/pull/53";
+        let stale_c = "https://github.com/acme/prdriver-mix/pull/54";
+        let merged = br#"{"number":51,"state":"MERGED","isDraft":false,"reviewDecision":"","mergeStateStatus":"UNKNOWN"}"#.to_vec();
+        let t0 = Instant::now();
+        // Pre-warm `fresh` so its cache entry is fresh at resolve time.
+        let mut warm = |_repo: &str, _n: u64| Some(merged.clone());
+        assert_eq!(
+            crate::parsers::github::resolve_pr_state_with(fresh, t0, true, &mut warm),
+            PrState::Merged
+        );
+        let mut s = sess("a", Status::Working, 1);
+        s.push_links(
+            vec![
+                stale_a.to_string(),
+                stale_b.to_string(),
+                fresh.to_string(),
+                stale_c.to_string(),
+            ],
+            vec![],
+        );
+        let mut app = App::new(vec![s]);
+        let calls = std::cell::Cell::new(0u32);
+        let mut fetch = |_repo: &str, _n: u64| {
+            calls.set(calls.get() + 1);
+            Some(merged.clone())
+        };
+        let changed =
+            app.refresh_stale_pr_states_with(1, t0 + Duration::from_secs(60), true, &mut fetch);
+        assert_eq!(calls.get(), 1, "only the first stale URL may spawn");
+        assert_eq!(
+            changed, 2,
+            "stale spawn + free fresh-cache resolve both converge"
+        );
+        let back = &app.sessions[0];
+        assert_eq!(back.pr_state_for(stale_a), PrState::Merged);
+        assert_eq!(back.pr_state_for(stale_b), PrState::Unknown);
+        assert_eq!(back.pr_state_for(fresh), PrState::Merged);
+        assert_eq!(back.pr_state_for(stale_c), PrState::Unknown);
     }
 
     // Issue #115 fix-loop: warm (fresh-cache) URLs resolve free — the
